@@ -97,6 +97,23 @@ define Device/horaco_zx-swtgw2c8f
 endef
 TARGET_DEVICES += horaco_zx-swtgw2c8f
 
+define Device/lianguo_lg-swtgw3c8f
+  SOC := rtl9303
+  UIMAGE_MAGIC := 0x83800000
+  DEVICE_VENDOR := Lianguo
+  DEVICE_MODEL := LG-SWTGW3C8F
+  IMAGE_SIZE := 12288k
+  $(Device/kernel-lzma)
+  IMAGES += factory.bix
+  IMAGE/factory.bix := \
+	append-kernel | \
+	pad-to 64k | \
+	append-rootfs | \
+	pad-rootfs | \
+	check-size
+endef
+TARGET_DEVICES += lianguo_lg-swtgw3c8f
+
 define Device/nicgiga_s100-0800s-m
   SOC := rtl9303
   UIMAGE_MAGIC := 0x93030000
