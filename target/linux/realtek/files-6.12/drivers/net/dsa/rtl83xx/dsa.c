@@ -2488,9 +2488,6 @@ static int rtl83xx_port_mdb_add(struct dsa_switch *ds, int port,
 	u64 seed = priv->r->l2_hash_seed(mac, vid);
 	int mc_group;
 
-	if (priv->id >= 0x9300)
-		return -EOPNOTSUPP;
-
 	pr_debug("In %s port %d, mac %llx, vid: %d\n", __func__, port, mac, vid);
 
 	if (priv->lag_non_primary & BIT_ULL(port)) {
