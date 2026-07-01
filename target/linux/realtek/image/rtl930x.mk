@@ -164,3 +164,14 @@ define Device/zyxel_xgs1250-12-b1
   DEVICE_VARIANT := B1
 endef
 TARGET_DEVICES += zyxel_xgs1250-12-b1
+
+define Device/lianguo_lg-swtgw3c8f
+  SOC := rtl9303
+  UIMAGE_MAGIC := 0x93000000
+  DEVICE_VENDOR := Lianguo
+  DEVICE_MODEL := LG-SWTGW3C8F
+  IMAGE_SIZE := 12288k
+  SUPPORTED_DEVICES += xikestor,sks8300-8x
+  $(Device/kernel-lzma)
+endef
+TARGET_DEVICES += lianguo_lg-swtgw3c8f
