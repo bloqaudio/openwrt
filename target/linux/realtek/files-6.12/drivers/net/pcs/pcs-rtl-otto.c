@@ -1836,6 +1836,7 @@ static int rtpcs_930x_sds_sym_err_reset(struct rtpcs_serdes *sds,
 
 	case PHY_INTERFACE_MODE_1000BASEX:
 	case PHY_INTERFACE_MODE_SGMII:
+	case PHY_INTERFACE_MODE_2500BASEX:
 	case PHY_INTERFACE_MODE_10G_QXGMII:
 		rtpcs_sds_write_bits(sds, 0x1, 24, 2, 0, 0);
 		rtpcs_sds_write_bits(sds, 0x1, 3, 15, 8, 0);
@@ -1862,6 +1863,7 @@ static u32 rtpcs_930x_sds_sym_err_get(struct rtpcs_serdes *sds,
 
 	case PHY_INTERFACE_MODE_1000BASEX:
 	case PHY_INTERFACE_MODE_SGMII:
+	case PHY_INTERFACE_MODE_2500BASEX:
 	case PHY_INTERFACE_MODE_10GBASER:
 		v = rtpcs_sds_read(sds, 5, 1);
 		return v & 0xff;
@@ -1889,6 +1891,7 @@ static int rtpcs_930x_sds_check_calibration(struct rtpcs_serdes *sds,
 	switch (phy_mode) {
 	case PHY_INTERFACE_MODE_1000BASEX:
 	case PHY_INTERFACE_MODE_SGMII:
+	case PHY_INTERFACE_MODE_2500BASEX:
 	case PHY_INTERFACE_MODE_XGMII:
 		if ((errors2 - errors1 > 100) ||
 		    (errors1 >= 0xffff00) || (errors2 >= 0xffff00)) {
