@@ -640,6 +640,9 @@ static int rtl93xx_setup(struct dsa_switch *ds)
 
 	priv->r->led_init(priv);
 
+	if (priv->family_id == RTL9300_FAMILY_ID)
+		rtl930x_storm_control_init(priv);
+
 	return 0;
 }
 

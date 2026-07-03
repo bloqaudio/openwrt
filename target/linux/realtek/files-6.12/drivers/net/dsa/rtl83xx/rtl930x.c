@@ -2609,6 +2609,42 @@ static void rtldsa_930x_qos_init(struct rtl838x_switch_priv *priv)
 	rtldsa_930x_qos_set_scheduling_queue_weights(priv);
 }
 
+/* Bring per-port storm control into a known state: PPS mode, disabled, SDK
+ * default burst size, unknown-DA-only for UC/MC. The global leaky-bucket
+ * tick/token registers are left at chip reset defaults, as the vendor SDK
+ * does; their values are logged for reference. CPU port is left untouched
+ * so trapped/injected traffic is never storm-limited.
+ */
+void rtl930x_storm_control_init(struct rtl838x_switch_priv *priv)
+{
+	u32 port_mask = GENMASK(priv->cpu_port - 1, 0);
+
+	pr_info("%s: STORM_LB_CTRL %08x, STORM_LB_PPS_CTRL %08x\n", __func__,
+		sw_r32(RTL930X_STORM_LB_CTRL), sw_r32(RTL930X_STORM_LB_PPS_CTRL));
+
+	/* All ports count packets (PPS), not bytes */
+	sw_w32(0, RTL930X_STORM_PORT_CTRL);
+
+	for (int p = 0; p < priv->cpu_port; p++) {
+		sw_w32(0, RTL930X_STORM_PORT_UC_CTRL(p));
+		sw_w32(RTL930X_STORM_DFLT_BURST_PPS, RTL930X_STORM_PORT_UC_CTRL(p) + 4);
+		sw_w32(0, RTL930X_STORM_PORT_MC_CTRL(p));
+		sw_w32(RTL930X_STORM_DFLT_BURST_PPS, RTL930X_STORM_PORT_MC_CTRL(p) + 4);
+		sw_w32(0, RTL930X_STORM_PORT_BC_CTRL(p));
+		sw_w32(RTL930X_STORM_DFLT_BURST_PPS, RTL930X_STORM_PORT_BC_CTRL(p) + 4);
+	}
+
+	/* Leaky buckets must be reset after any configuration change */
+	sw_w32(port_mask, RTL930X_STORM_PORT_UC_LB_RST);
+	sw_w32(port_mask, RTL930X_STORM_PORT_MC_LB_RST);
+	sw_w32(port_mask, RTL930X_STORM_PORT_BC_LB_RST);
+
+	/* Clear stale exceed flags (write-1-to-clear) */
+	sw_w32(port_mask, RTL930X_STORM_PORT_UC_EXCEED);
+	sw_w32(port_mask, RTL930X_STORM_PORT_MC_EXCEED);
+	sw_w32(port_mask, RTL930X_STORM_PORT_BC_EXCEED);
+}
+
 const struct rtl838x_reg rtl930x_reg = {
 	.mask_port_reg_be = rtl838x_mask_port_reg,
 	.set_port_reg_be = rtl838x_set_port_reg,

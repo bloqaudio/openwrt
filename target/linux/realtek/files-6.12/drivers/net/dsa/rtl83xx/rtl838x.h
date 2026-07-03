@@ -319,6 +319,25 @@
 #define RTL839X_STORM_CTRL_PORT_MC_1(p)		(0x1a00 + (((p) << 3)))
 #define RTL839X_STORM_CTRL_PORT_BC_0(p)		(0x1B9C + (((p) << 3)))
 #define RTL839X_STORM_CTRL_PORT_BC_1(p)		(0x1BA0 + (((p) << 3)))
+#define RTL930X_STORM_CTRL			(0x8A60)
+#define RTL930X_STORM_LB_CTRL			(0x8A64)
+#define RTL930X_STORM_LB_PPS_CTRL		(0x8A68)
+#define RTL930X_STORM_PORT_CTRL			(0x8A6C)
+/* Per-port 64-bit entries: word 0 = rate/enable/type, word 1 = burst */
+#define RTL930X_STORM_PORT_UC_CTRL(p)		(0x8A70 + (((p) << 3)))
+#define RTL930X_STORM_PORT_MC_CTRL(p)		(0x8B60 + (((p) << 3)))
+#define RTL930X_STORM_PORT_BC_CTRL(p)		(0x8C50 + (((p) << 3)))
+#define RTL930X_STORM_PORT_UC_LB_RST		(0x8B58)
+#define RTL930X_STORM_PORT_MC_LB_RST		(0x8C48)
+#define RTL930X_STORM_PORT_BC_LB_RST		(0x8D38)
+#define RTL930X_STORM_PORT_UC_EXCEED		(0x8B5C)
+#define RTL930X_STORM_PORT_MC_EXCEED		(0x8C4C)
+#define RTL930X_STORM_PORT_BC_EXCEED		(0x8D3C)
+#define RTL930X_STORM_RATE_M			GENMASK(23, 0)
+#define RTL930X_STORM_EN			BIT(24)
+#define RTL930X_STORM_TYPE_INCL_KNOWN		BIT(25)
+#define RTL930X_STORM_BURST_M			GENMASK(15, 0)
+#define RTL930X_STORM_DFLT_BURST_PPS		(255)
 #define RTL839X_TBL_ACCESS_CTRL_2		(0x611C)
 #define RTL839X_TBL_ACCESS_DATA_2(i)		(0x6120 + (((i) << 2)))
 #define RTL839X_IGR_BWCTRL_PORT_CTRL_10G_0(p)	(0x1618 + (((p) << 3)))
@@ -1311,6 +1330,7 @@ struct rtl838x_switch_priv {
 
 void rtl838x_dbgfs_init(struct rtl838x_switch_priv *priv);
 void rtl930x_dbgfs_init(struct rtl838x_switch_priv *priv);
+void rtl930x_storm_control_init(struct rtl838x_switch_priv *priv);
 
 void rtldsa_counters_lock_register(struct rtl838x_switch_priv *priv, int port)
 	__acquires(&priv->ports[port].counters.lock);

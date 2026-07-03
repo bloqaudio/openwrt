@@ -442,6 +442,104 @@ static const struct file_operations port_egress_fops = {
 	.write = port_egress_rate_write,
 };
 
+/* RTL930X per-port storm control. The debugfs value is plain packets per
+ * second (decimal or 0x-prefixed), 0 = disabled. The hardware counts in
+ * tokens of 1014/1000 packets, so the value is rescaled on the way in/out.
+ */
+static u32 rtl930x_storm_pps_to_tkn(u32 pps)
+{
+	return (pps / 1014) * 1000 + ((pps % 1014) * 1000 + 507) / 1014;
+}
+
+static u32 rtl930x_storm_tkn_to_pps(u32 tkn)
+{
+	return (tkn / 1000) * 1014 + ((tkn % 1000) * 1014 + 500) / 1000;
+}
+
+static ssize_t rtl930x_storm_rate_common_read(struct file *filp, char __user *buffer,
+					      size_t count, loff_t *ppos, u32 ctrl_base)
+{
+	struct rtl838x_port *p = filp->private_data;
+	char buf[16];
+	u32 v, pps = 0;
+
+	if (*ppos != 0)
+		return 0;
+
+	v = sw_r32(ctrl_base + (p->dp->index << 3));
+	if (v & RTL930X_STORM_EN)
+		pps = rtl930x_storm_tkn_to_pps(v & RTL930X_STORM_RATE_M);
+
+	return simple_read_from_buffer(buffer, count, ppos, buf,
+				       scnprintf(buf, sizeof(buf), "%u\n", pps));
+}
+
+static ssize_t rtl930x_storm_rate_common_write(struct file *filp, const char __user *buffer,
+					       size_t count, loff_t *ppos,
+					       u32 ctrl_base, u32 rst_reg)
+{
+	struct rtl838x_port *p = filp->private_data;
+	struct rtl838x_switch_priv *priv = p->dp->ds->priv;
+	int port = p->dp->index;
+	char b[32];
+	ssize_t len;
+	u32 pps, v;
+
+	if (*ppos != 0)
+		return -EINVAL;
+
+	if (count >= sizeof(b))
+		return -ENOSPC;
+
+	len = simple_write_to_buffer(b, sizeof(b) - 1, ppos, buffer, count);
+	if (len < 0)
+		return len;
+
+	b[len] = '\0';
+	if (kstrtouint(strim(b), 0, &pps))
+		return -EINVAL;
+
+	if (pps > RTL930X_STORM_RATE_M)
+		return -ERANGE;
+
+	mutex_lock(&priv->reg_mutex);
+	v = sw_r32(ctrl_base + (port << 3));
+	v &= ~(RTL930X_STORM_RATE_M | RTL930X_STORM_EN);
+	if (pps)
+		v |= RTL930X_STORM_EN | rtl930x_storm_pps_to_tkn(pps);
+	sw_w32(v, ctrl_base + (port << 3));
+	/* The leaky bucket keeps stale credit unless reset after a change */
+	sw_w32(BIT(port), rst_reg);
+	mutex_unlock(&priv->reg_mutex);
+
+	return len;
+}
+
+#define RTL930X_STORM_RATE_FOPS(_type, _TYPE)					\
+static ssize_t storm_rate_##_type##_read(struct file *filp, char __user *buffer, \
+					 size_t count, loff_t *ppos)		\
+{										\
+	return rtl930x_storm_rate_common_read(filp, buffer, count, ppos,	\
+					      RTL930X_STORM_PORT_##_TYPE##_CTRL(0)); \
+}										\
+static ssize_t storm_rate_##_type##_write(struct file *filp, const char __user *buffer, \
+					  size_t count, loff_t *ppos)		\
+{										\
+	return rtl930x_storm_rate_common_write(filp, buffer, count, ppos,	\
+					       RTL930X_STORM_PORT_##_TYPE##_CTRL(0), \
+					       RTL930X_STORM_PORT_##_TYPE##_LB_RST); \
+}										\
+static const struct file_operations storm_rate_##_type##_fops = {		\
+	.owner = THIS_MODULE,							\
+	.open = simple_open,							\
+	.read = storm_rate_##_type##_read,					\
+	.write = storm_rate_##_type##_write,					\
+}
+
+RTL930X_STORM_RATE_FOPS(uc, UC);
+RTL930X_STORM_RATE_FOPS(mc, MC);
+RTL930X_STORM_RATE_FOPS(bc, BC);
+
 static const struct debugfs_reg32 port_ctrl_regs[] = {
 	{ .name = "port_isolation", .offset = RTL838X_PORT_ISO_CTRL(0), },
 	{ .name = "mac_force_mode", .offset = RTL838X_MAC_FORCE_MODE_CTRL, },
@@ -703,6 +801,7 @@ err:
 void rtl930x_dbgfs_init(struct rtl838x_switch_priv *priv)
 {
 	struct dentry *dbg_dir;
+	struct dentry *port_dir;
 
 	pr_info("%s called\n", __func__);
 	dbg_dir = debugfs_lookup(RTL838X_DRIVER_NAME, NULL);
@@ -714,4 +813,30 @@ void rtl930x_dbgfs_init(struct rtl838x_switch_priv *priv)
 	debugfs_create_file("drop_counters", 0400, dbg_dir, priv, &drop_counter_fops);
 
 	debugfs_create_file("l2_table", 0400, dbg_dir, priv, &l2_table_fops);
+
+	if (priv->family_id != RTL9300_FAMILY_ID)
+		return;
+
+	/* Per-port storm-control exceed flags, one bit per port, write 1 to clear */
+	debugfs_create_x32("storm_exceed_uc", 0644, dbg_dir,
+			   (u32 *)(RTL838X_SW_BASE + RTL930X_STORM_PORT_UC_EXCEED));
+	debugfs_create_x32("storm_exceed_mc", 0644, dbg_dir,
+			   (u32 *)(RTL838X_SW_BASE + RTL930X_STORM_PORT_MC_EXCEED));
+	debugfs_create_x32("storm_exceed_bc", 0644, dbg_dir,
+			   (u32 *)(RTL838X_SW_BASE + RTL930X_STORM_PORT_BC_EXCEED));
+
+	for (int i = 0; i < priv->cpu_port; i++) {
+		if (!(priv->ports[i].phy || priv->pcs[i]) || !priv->ports[i].dp)
+			continue;
+
+		port_dir = debugfs_create_dir(priv->ports[i].dp->name, dbg_dir);
+		debugfs_create_u32("id", 0444, port_dir,
+				   (u32 *)&priv->ports[i].dp->index);
+		debugfs_create_file("storm_rate_uc", 0600, port_dir,
+				    &priv->ports[i], &storm_rate_uc_fops);
+		debugfs_create_file("storm_rate_mc", 0600, port_dir,
+				    &priv->ports[i], &storm_rate_mc_fops);
+		debugfs_create_file("storm_rate_bc", 0600, port_dir,
+				    &priv->ports[i], &storm_rate_bc_fops);
+	}
 }
