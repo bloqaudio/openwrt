@@ -1208,7 +1208,7 @@ static void rtl930x_host_route_write(int idx, struct rtl83xx_route *rt)
 		 rt->attr.dst_null);
 	pr_debug("%s: GW: %pI4, prefix_len: %d\n", __func__, &rt->dst_ip, rt->prefix_len);
 
-	v = BIT(31); /* Entry is valid */
+	v = rt->attr.valid ? BIT(31) : 0;
 	v |= (rt->attr.type & 0x3) << 29;
 	v |= rt->attr.hit ? BIT(20) : 0;
 	v |= rt->attr.dst_null ? BIT(19) : 0;
@@ -1310,6 +1310,11 @@ static int rtl930x_find_l3_slot(struct rtl83xx_route *rt, bool must_exist)
 			idx = ((addr / 8) * 6) + (addr % 8);
 			pr_debug("%s logical address %d\n", __func__, idx);
 
+			/* host_route_read returns early on invalid entries -
+			 * clear the struct so stale fields from the previous
+			 * slot cannot produce a false match.
+			 */
+			memset(&route_entry, 0, sizeof(route_entry));
 			rtl930x_host_route_read(idx, &route_entry);
 			pr_debug("%s route valid %d, route dest: %pI4, hit %d\n", __func__,
 				 route_entry.attr.valid, &route_entry.dst_ip,
@@ -1340,11 +1345,11 @@ static void rtl930x_route_write(int idx, struct rtl83xx_route *rt)
 	/* The table has a size of 11 registers (20 for MC) */
 	struct table_reg *r = rtl_table_get(RTL9300_TBL_1, 2);
 
-	pr_debug("%s: index %d is valid: %d\n", __func__, idx, rt->attr.valid);
+	pr_debug("%s: idx %d valid %d action %d dst %pI4/%d\n", __func__,
+		 idx, rt->attr.valid, rt->attr.action, &rt->dst_ip, rt->prefix_len);
 	pr_debug("%s: nexthop: %d, hit: %d, action :%d, ttl_dec %d, ttl_check %d, dst_null %d\n",
 		 __func__, rt->nh.id, rt->attr.hit, rt->attr.action,
 		 rt->attr.ttl_dec, rt->attr.ttl_check, rt->attr.dst_null);
-	pr_debug("%s: GW: %pI4, prefix_len: %d\n", __func__, &rt->dst_ip, rt->prefix_len);
 
 	v = rt->attr.valid ? BIT(31) : 0;
 	v |= (rt->attr.type & 0x3) << 29;
@@ -2272,6 +2277,11 @@ static int rtl930x_l3_setup(struct rtl838x_switch_priv *priv)
 
 	/* Trap non-ip traffic to the CPU-port (e.g. ARP so we stay reachable) */
 	sw_w32_mask(0x3 << 8, 0x1 << 8, RTL930X_L3_IP_ROUTE_CTRL);
+	/* Trap packets whose nexthop L2 entry aged out or went invalid to the
+	 * CPU (NH_AGE_OUT_ACT = TRAP2CPU) so the kernel re-resolves the
+	 * neighbour; the hardware default silently drops them.
+	 */
+	sw_w32_mask(0x7 << 4, 0x1 << 4, RTL930X_L3_IP_ROUTE_CTRL);
 	pr_debug("L3_IP_ROUTE_CTRL %08x\n", sw_r32(RTL930X_L3_IP_ROUTE_CTRL));
 
 	/* PORT_ISO_RESTRICT_ROUTE_CTRL? */

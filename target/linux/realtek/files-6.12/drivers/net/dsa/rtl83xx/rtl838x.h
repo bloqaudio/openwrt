@@ -1118,6 +1118,9 @@ struct rtl83xx_route {
 	struct in6_addr dst_ip6;
 	int prefix_len;			/* Network prefix len of the destination net */
 	bool is_host_route;
+	bool neigh_route;		/* Synthesized from a neighbour entry, not the FIB:
+					 * torn down on neighbour invalidation
+					 */
 	int id;				/* ID number of this route */
 	struct rhlist_head linkage;
 	u16 switch_mac_id;		/* Index into switch's own MACs, RTL839X only */

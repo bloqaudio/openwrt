@@ -576,8 +576,19 @@ static int rtl83xx_l2_nexthop_add(struct rtl838x_switch_priv *priv, struct rtl83
 		entry = priv->r->read_l2_entry_using_hash(key, i, &e);
 
 		if (!e.valid || ((entry & 0x0fffffffffffffffULL) == seed)) {
-			idx = i > 3 ? ((key >> 14) & 0xffff) | i >> 1
-					: ((key << 2) | i) & 0xffff;
+			/* Mirror the read accessor's addressing exactly: buckets
+			 * 4-7 live in the second hash block, addressed by the
+			 * high half of the double hash. The physical index is
+			 * (row << 2) | way - it is written back through
+			 * write_l2_entry_using_hash(idx >> 2, idx & 0x3) and
+			 * programmed into NEXTHOP.DMAC_IDX, so any other
+			 * encoding corrupts an unrelated L2 row and leaves the
+			 * nexthop pointing at garbage.
+			 */
+			if (i > 3)
+				idx = ((key >> 16) << 2) | (i - 4);
+			else
+				idx = ((key & 0xffff) << 2) | i;
 			break;
 		}
 	}
@@ -597,6 +608,13 @@ static int rtl83xx_l2_nexthop_add(struct rtl838x_switch_priv *priv, struct rtl83
 		/* If the entry is already a valid next hop entry, don't change it */
 		if (e.next_hop)
 			return 0;
+		/* A dynamically learned entry would age out underneath the
+		 * nexthop and leave the route forwarding into an invalid L2
+		 * entry (silent drops). Pin it while it serves as a nexthop;
+		 * nexthop removal deletes it and the address is re-learned
+		 * like any other.
+		 */
+		e.is_static = true;
 	} else {
 		e.valid = true;
 		e.is_static = true;
@@ -607,7 +625,12 @@ static int rtl83xx_l2_nexthop_add(struct rtl838x_switch_priv *priv, struct rtl83
 		e.block_sa = false;
 		e.suspended = false;
 		e.age = 0;			/* With port-ignore */
-		e.port = priv->port_ignore;
+		/* The SPA of this entry is the routed packet's egress port -
+		 * use the real port when the caller knows it (standalone
+		 * routed ports have hardware learning disabled, so no learned
+		 * entry ever exists to supply it).
+		 */
+		e.port = nh->port;
 		u64_to_ether_addr(nh->mac, &e.mac[0]);
 	}
 	e.next_hop = true;
@@ -626,12 +649,26 @@ static int rtl83xx_l2_nexthop_add(struct rtl838x_switch_priv *priv, struct rtl83
 static int rtl83xx_l2_nexthop_rm(struct rtl838x_switch_priv *priv, struct rtl83xx_nexthop *nh)
 {
 	struct rtl838x_l2_entry e;
-	u32 key = nh->l2_id >> 2;
-	int i = nh->l2_id & 0x3;
-	u64 entry = entry = priv->r->read_l2_entry_using_hash(key, i, &e);
+	u64 seed = priv->r->l2_hash_seed(nh->mac, nh->rvid);
+	u32 key = priv->r->l2_hash_key(priv, seed);
+	u32 row;
+	u64 entry;
+	int i;
+
+	/* Search by seed exactly like the add path: the read accessor takes
+	 * the double hash + bucket position, not the physical index stored in
+	 * nh->l2_id (decoding that as (hash, pos) reads the wrong entry for
+	 * second-block buckets).
+	 */
+	for (i = 0; i < priv->l2_bucket_size; i++) {
+		entry = priv->r->read_l2_entry_using_hash(key, i, &e);
+		if (e.valid && e.next_hop &&
+		    (entry & 0x0fffffffffffffffULL) == seed)
+			break;
+	}
 
 	pr_debug("%s: id %d, key %d, index %d\n", __func__, nh->l2_id, key, i);
-	if (!e.valid) {
+	if (i >= priv->l2_bucket_size) {
 		dev_err(priv->dev, "unknown nexthop, id %x\n", nh->l2_id);
 		return -1;
 	}
@@ -642,7 +679,8 @@ static int rtl83xx_l2_nexthop_rm(struct rtl838x_switch_priv *priv, struct rtl83x
 	e.vid = nh->vid;		/* Restore VID */
 	e.rvid = nh->rvid;
 
-	priv->r->write_l2_entry_using_hash(key, i, &e);
+	row = i > 3 ? key >> 16 : key & 0xffff;
+	priv->r->write_l2_entry_using_hash(row, i & 0x3, &e);
 
 	return 0;
 }
@@ -692,8 +730,12 @@ static int rtl83xx_l3_nexthop_update(struct rtl838x_switch_priv *priv,  __be32 i
 		pr_debug("%s: Setting up fwding: ip %pI4, GW mac %016llx\n",
 			 __func__, &ip_addr, mac);
 
-		/* Reads the ROUTING table entry associated with the route */
-		priv->r->route_read(r->id, r);
+		/* Read back the prefix-route entry. Never do this for host
+		 * routes: their IDs lie beyond the prefix table and the
+		 * aliased read clobbers dst_ip/type with garbage.
+		 */
+		if (!r->is_host_route)
+			priv->r->route_read(r->id, r);
 		pr_debug("Route with id %d to %pI4 / %d\n", r->id, &r->dst_ip, r->prefix_len);
 
 		r->nh.mac = r->nh.gw = mac;
@@ -711,15 +753,32 @@ static int rtl83xx_l3_nexthop_update(struct rtl838x_switch_priv *priv,  __be32 i
 		r->attr.action = ROUTE_ACT_FORWARD;
 		r->attr.type = 0;
 		r->attr.hit = false; /* Reset route-used indicator */
+		/* Routed packets must have their TTL decremented and checked;
+		 * expired TTL traps to the CPU (TTL_FAIL_ACT) for ICMP.
+		 */
+		r->attr.ttl_dec = true;
+		r->attr.ttl_check = true;
 
 		/* Add PIE entry with dst_ip and prefix_len */
 		r->pr.dip = r->dst_ip;
 		r->pr.dip_m = inet_make_mask(r->prefix_len);
 
 		if (r->is_host_route) {
-			int slot = priv->r->find_l3_slot(r, false);
+			/* Update the existing slot if this destination is
+			 * already programmed; only claim a free slot for a
+			 * first-time install (a plain free-slot search here
+			 * would duplicate the entry on every ARP refresh).
+			 */
+			int slot = priv->r->find_l3_slot(r, true);
 
-			pr_info("%s: Got slot for route: %d\n", __func__, slot);
+			if (slot < 0)
+				slot = priv->r->find_l3_slot(r, false);
+			pr_debug("%s: Got slot for route: %d\n", __func__, slot);
+			if (slot < 0) {
+				pr_err("%s: no free host-route slot for %pI4\n",
+				       __func__, &r->dst_ip);
+				continue;
+			}
 			priv->r->host_route_write(slot, r);
 		} else {
 			priv->r->route_write(r->id, r);
@@ -731,10 +790,17 @@ static int rtl83xx_l3_nexthop_update(struct rtl838x_switch_priv *priv,  __be32 i
 		if (priv->r->set_l3_nexthop)
 			priv->r->set_l3_nexthop(r->nh.id, r->nh.l2_id, r->nh.if_id);
 
+		/* PIE rules only serve the prefix-route path. Host routes must
+		 * not allocate one: every ARP refresh would leak another rule
+		 * and packet counter.
+		 */
+		if (r->is_host_route)
+			continue;
+
 		if (r->pr.id < 0) {
 			r->pr.packet_cntr = rtl83xx_packet_cntr_alloc(priv);
 			if (r->pr.packet_cntr >= 0) {
-				pr_info("Using packet counter %d\n", r->pr.packet_cntr);
+				pr_debug("Using packet counter %d\n", r->pr.packet_cntr);
 				r->pr.log_sel = true;
 				r->pr.log_data = r->pr.packet_cntr;
 			}
@@ -923,12 +989,29 @@ static void rtl83xx_route_rm(struct rtl838x_switch_priv *priv, struct rtl83xx_ro
 		}
 		clear_bit(r->id - MAX_ROUTES, priv->host_route_use_bm);
 	} else {
-		/* If there is a HW representation of the route, delete it */
-		if (priv->r->route_lookup_hw) {
+		/* If there is a HW representation of the route, delete it.
+		 * route_lookup_hw is a longest-prefix-match search: for a route
+		 * that was never written to the prefix table it returns the
+		 * covering entry instead (e.g. the 0/0 catch-all). Verify the
+		 * entry found really is this route before invalidating it, and
+		 * never write back a miss (-1).
+		 */
+		if (priv->r->route_lookup_hw && priv->r->route_read) {
+			struct rtl83xx_route chk;
+
 			id = priv->r->route_lookup_hw(r);
-			pr_info("%s: Got id for prefix route: %d\n", __func__, id);
-			r->attr.valid = false;
-			priv->r->route_write(id, r);
+			pr_debug("%s: Got id for prefix route: %d\n", __func__, id);
+			if (id >= 0) {
+				memset(&chk, 0, sizeof(chk));
+				priv->r->route_read(id, &chk);
+				if (!chk.attr.valid || chk.dst_ip != r->dst_ip ||
+				    chk.prefix_len != r->prefix_len)
+					id = -1;
+			}
+			if (id >= 0) {
+				r->attr.valid = false;
+				priv->r->route_write(id, r);
+			}
 		}
 		clear_bit(r->id, priv->route_use_bm);
 	}
@@ -965,7 +1048,7 @@ static int rtldsa_fib4_del(struct rtl838x_switch_priv *priv,
 {
 	struct fib_nh *nh = fib_info_nh(info->fi, 0);
 	struct rhlist_head *tmp, *list;
-	struct rtl83xx_route *route;
+	struct rtl83xx_route *route, *entry;
 
 	if (rtldsa_fib4_check(priv, info, FIB_EVENT_ENTRY_DEL))
 		return 0;
@@ -977,20 +1060,32 @@ static int rtldsa_fib4_del(struct rtl838x_switch_priv *priv,
 		dev_err(priv->dev, "no such gateway: %pI4\n", &nh->fib_nh_gw4);
 		return -ENOENT;
 	}
-	rhl_for_each_entry_rcu(route, tmp, list, linkage) {
-		if (route->dst_ip == info->dst && route->prefix_len == info->dst_len) {
+	route = NULL;
+	rhl_for_each_entry_rcu(entry, tmp, list, linkage) {
+		if (entry->dst_ip == info->dst && entry->prefix_len == info->dst_len) {
 			dev_info(priv->dev, "found a route with id %d, nh-id %d\n",
-				 route->id, route->nh.id);
+				 entry->id, entry->nh.id);
+			route = entry;
 			break;
 		}
 	}
 	rcu_read_unlock();
 
+	/* All connected routes share the gateway key 0.0.0.0 - without an
+	 * exact match this used to proceed with the LAST examined entry and
+	 * tear down an unrelated route.
+	 */
+	if (!route)
+		return -ENOENT;
+
 	rtl83xx_l2_nexthop_rm(priv, &route->nh);
 
-	dev_info(priv->dev, "releasing packet counter %d\n", route->pr.packet_cntr);
-	set_bit(route->pr.packet_cntr, priv->packet_cntr_use_bm);
-	priv->r->pie_rule_rm(priv, &route->pr);
+	if (route->pr.packet_cntr >= 0) {
+		pr_debug("releasing packet counter %d\n", route->pr.packet_cntr);
+		set_bit(route->pr.packet_cntr, priv->packet_cntr_use_bm);
+	}
+	if (route->pr.id >= 0)
+		priv->r->pie_rule_rm(priv, &route->pr);
 
 	rtl83xx_route_rm(priv, route);
 
@@ -1045,7 +1140,7 @@ static int rtl83xx_alloc_router_mac(struct rtl838x_switch_priv *priv, u64 mac)
 static int rtl83xx_alloc_egress_intf(struct rtl838x_switch_priv *priv, u64 mac, int vlan)
 {
 	int free_mac = -1;
-	struct rtl838x_l3_intf intf;
+	struct rtl838x_l3_intf *intf;
 	u64 m;
 
 	mutex_lock(&priv->reg_mutex);
@@ -1055,7 +1150,13 @@ static int rtl83xx_alloc_egress_intf(struct rtl838x_switch_priv *priv, u64 mac, 
 			free_mac = i;
 			continue;
 		}
-		if (m == mac) {
+		/* An egress interface is a (SMAC, VID) pair: the same router
+		 * MAC on two VLANs needs two interfaces. Deduplicating on the
+		 * MAC alone handed every VLAN the first VLAN's interface, so
+		 * routed frames egressed with the wrong VID.
+		 */
+		if (m == mac && priv->interfaces[i] &&
+		    priv->interfaces[i]->vid == vlan) {
 			mutex_unlock(&priv->reg_mutex);
 			return i;
 		}
@@ -1063,25 +1164,161 @@ static int rtl83xx_alloc_egress_intf(struct rtl838x_switch_priv *priv, u64 mac, 
 
 	if (free_mac < 0) {
 		pr_err("No free egress interface, cannot offload\n");
+		mutex_unlock(&priv->reg_mutex);
 		return -1;
 	}
 
-	/* Set up default egress interface 1 */
-	intf.vid = vlan;
-	intf.smac_idx = free_mac;
-	intf.ip4_mtu_id = 1;
-	intf.ip6_mtu_id = 1;
-	intf.ttl_scope = 1; /* TTL */
-	intf.hl_scope = 1;  /* Hop Limit */
-	intf.ip4_icmp_redirect = intf.ip6_icmp_redirect = 2;  /* FORWARD */
-	intf.ip4_pbr_icmp_redirect = intf.ip6_pbr_icmp_redirect = 2; /* FORWARD; */
-	priv->r->set_l3_egress_intf(free_mac, &intf);
+	intf = kzalloc(sizeof(*intf), GFP_KERNEL);
+	if (!intf) {
+		mutex_unlock(&priv->reg_mutex);
+		return -1;
+	}
+
+	intf->vid = vlan;
+	intf->smac_idx = free_mac;
+	intf->ip4_mtu_id = 1;
+	intf->ip6_mtu_id = 1;
+	intf->ttl_scope = 1; /* TTL */
+	intf->hl_scope = 1;  /* Hop Limit */
+	intf->ip4_icmp_redirect = intf->ip6_icmp_redirect = 2;  /* FORWARD */
+	intf->ip4_pbr_icmp_redirect = intf->ip6_pbr_icmp_redirect = 2; /* FORWARD; */
+	priv->r->set_l3_egress_intf(free_mac, intf);
 
 	priv->r->set_l3_egress_mac(L3_EGRESS_DMACS + free_mac, mac);
+
+	priv->interfaces[free_mac] = intf;
 
 	mutex_unlock(&priv->reg_mutex);
 
 	return free_mac;
+}
+
+/* Install a /32 host route for a resolved neighbour on a directly connected
+ * subnet. The FIB only notifies about routes; hosts on connected subnets are
+ * only ever visible as neighbour entries, so without this every packet to
+ * them takes the CPU slow path via the catch-all trap entry - inter-VLAN
+ * routing would never actually be offloaded.
+ */
+static int rtl83xx_l3_neigh_route_add(struct rtl838x_switch_priv *priv,
+				      __be32 ip, u64 mac, u64 intf_mac,
+				      int vlan, int port)
+{
+	struct rtl83xx_route *r;
+	int slot, if_id;
+
+	if (!priv->r->host_route_write || !priv->r->set_l3_router_mac)
+		return -EOPNOTSUPP;
+
+	/* Only neighbours behind a VLAN upper (SVI) can be offloaded today.
+	 * A bare routed port has no valid egress VLAN context: VLAN 0 has no
+	 * member ports, the stale pvid's VLAN dropped the port on bridge
+	 * leave, and hardware-forwarded frames are checked by the egress VLAN
+	 * filter (CPU-injected frames bypass it, which is why the software
+	 * path works). Offloading routed ports needs the driver to maintain
+	 * VLAN membership for standalone ports first - until then they stay
+	 * on the CPU path via the catch-all trap, which is correct, just not
+	 * accelerated.
+	 */
+	if (!vlan)
+		return -EOPNOTSUPP;
+
+	pr_debug("%s: ip %pI4 mac %016llx vlan %d port %d\n",
+		 __func__, &ip, mac, vlan, port);
+
+	r = rtl83xx_host_route_alloc(priv, ip);
+	if (!r)
+		return -ENOSPC;
+
+	r->neigh_route = true;
+	r->dst_ip = ip;
+	r->prefix_len = 32;
+	r->nh.rvid = vlan;
+
+	if (rtl83xx_alloc_router_mac(priv, intf_mac))
+		goto out_free;
+
+	if_id = rtl83xx_alloc_egress_intf(priv, intf_mac, vlan);
+	if (if_id < 0)
+		goto out_free;
+	r->nh.if_id = if_id;
+
+	r->nh.mac = r->nh.gw = mac;
+	r->nh.port = priv->port_ignore;
+	r->nh.id = r->id;
+
+	if (priv->r->set_l3_egress_mac)
+		priv->r->set_l3_egress_mac(r->id, mac);
+
+	rtl83xx_l2_nexthop_add(priv, &r->nh);
+
+	r->attr.valid = true;
+	r->attr.action = ROUTE_ACT_FORWARD;
+	r->attr.type = 0;
+	r->attr.hit = false;
+	r->attr.ttl_dec = true;
+	r->attr.ttl_check = true;
+
+	slot = priv->r->find_l3_slot(r, false);
+	if (slot < 0) {
+		pr_err("%s: no free host-route slot for %pI4\n", __func__, &ip);
+		rtl83xx_l2_nexthop_rm(priv, &r->nh);
+		goto out_free;
+	}
+	priv->r->host_route_write(slot, r);
+
+	if (priv->r->set_l3_nexthop)
+		priv->r->set_l3_nexthop(r->nh.id, r->nh.l2_id, r->nh.if_id);
+
+	pr_debug("%s: %pI4 -> %016llx VLAN %d l2_id %d if_id %d slot %d\n",
+		 __func__, &ip, mac, vlan, r->nh.l2_id, r->nh.if_id, slot);
+
+	return 0;
+
+out_free:
+	mutex_lock(&priv->reg_mutex);
+	if (rhltable_remove(&priv->routes, &r->linkage, route_ht_params))
+		dev_warn(priv->dev, "%s: could not remove route\n", __func__);
+	clear_bit(r->id - MAX_ROUTES, priv->host_route_use_bm);
+	mutex_unlock(&priv->reg_mutex);
+	kfree(r);
+
+	return -ENOSPC;
+}
+
+/* Tear down a neighbour-synthesized host route once the neighbour is gone.
+ * FIB-owned routes are never touched here - those are removed by fib4_del.
+ */
+static void rtl83xx_l3_neigh_route_del(struct rtl838x_switch_priv *priv, __be32 ip)
+{
+	struct rtl83xx_route *r = NULL, *entry;
+	struct rhlist_head *tmp, *list;
+	struct rtl83xx_nexthop nh;
+
+	rcu_read_lock();
+	list = rhltable_lookup(&priv->routes, &ip, route_ht_params);
+	if (!list) {
+		rcu_read_unlock();
+		return;
+	}
+	rhl_for_each_entry_rcu(entry, tmp, list, linkage) {
+		if (entry->neigh_route && entry->dst_ip == ip) {
+			r = entry;
+			break;
+		}
+	}
+	rcu_read_unlock();
+
+	if (!r)
+		return;
+
+	pr_debug("%s: removing offloaded neighbour %pI4\n", __func__, &ip);
+	/* Invalidate the host route first so no window exists where it still
+	 * forwards into a dead L2 nexthop entry. route_rm frees r, so keep a
+	 * copy of the nexthop for the L2 cleanup.
+	 */
+	nh = r->nh;
+	rtl83xx_route_rm(priv, r);
+	rtl83xx_l2_nexthop_rm(priv, &nh);
 }
 
 static int rtldsa_fib4_add(struct rtl838x_switch_priv *priv,
@@ -1096,7 +1333,12 @@ static int rtldsa_fib4_add(struct rtl838x_switch_priv *priv,
 	if (rtldsa_fib4_check(priv, info, FIB_EVENT_ENTRY_ADD))
 		return 0;
 
-	port = rtl83xx_port_dev_lower_find(ndev, priv);
+	/* ndev may be one of our user ports itself (bare routed port) or an
+	 * upper (SVI/bridge) with a user port below.
+	 */
+	port = rtl83xx_port_is_under(ndev, priv);
+	if (port < 0)
+		port = rtl83xx_port_dev_lower_find(ndev, priv);
 	if (port < 0) {
 		dev_err(priv->dev, "lower interface %s not found\n", ndev->name);
 		return -ENODEV;
@@ -1188,7 +1430,11 @@ struct net_event_work {
 	struct work_struct work;
 	struct rtl838x_switch_priv *priv;
 	u64 mac;
+	u64 intf_mac;
 	u32 gw_addr;
+	int vlan;
+	int port;	/* >= 0 only when the neighbour sits on a bare routed port */
+	bool valid;
 };
 
 static void rtl83xx_net_event_work_do(struct work_struct *work)
@@ -1197,7 +1443,17 @@ static void rtl83xx_net_event_work_do(struct work_struct *work)
 		container_of(work, struct net_event_work, work);
 	struct rtl838x_switch_priv *priv = net_work->priv;
 
-	rtl83xx_l3_nexthop_update(priv, net_work->gw_addr, net_work->mac);
+	if (!net_work->valid) {
+		rtl83xx_l3_neigh_route_del(priv, net_work->gw_addr);
+	} else if (rtl83xx_l3_nexthop_update(priv, net_work->gw_addr,
+					     net_work->mac) == -ENOENT) {
+		/* Not the gateway of any FIB route: a plain host on a
+		 * connected subnet, offload it as a /32 host route.
+		 */
+		rtl83xx_l3_neigh_route_add(priv, net_work->gw_addr,
+					   net_work->mac, net_work->intf_mac,
+					   net_work->vlan, net_work->port);
+	}
 
 	kfree(net_work);
 }
@@ -1221,10 +1477,29 @@ static int rtl83xx_netevent_event(struct notifier_block *this,
 
 		if (n->tbl != &arp_tbl)
 			return NOTIFY_DONE;
+		/* Never touch broadcast/multicast neighbours - no route for
+		 * them ever exists in the ASIC.
+		 */
+		if (ipv4_is_multicast(*(__be32 *)n->primary_key) ||
+		    ipv4_is_lbcast(*(__be32 *)n->primary_key))
+			return NOTIFY_DONE;
+		/* A valid neighbour with a non-unicast MAC (e.g. the subnet
+		 * broadcast entry resolving to ff:ff:ff:ff:ff:ff) must not be
+		 * offloaded; invalid-state events still pass for teardown.
+		 */
+		if ((n->nud_state & NUD_VALID) && !is_valid_ether_addr(n->ha))
+			return NOTIFY_DONE;
 		dev = n->dev;
-		port = rtl83xx_port_dev_lower_find(dev, priv);
-		if (port < 0 || !(n->nud_state & NUD_VALID)) {
-			pr_debug("%s: Neigbour invalid, not updating\n", __func__);
+		/* The device is either one of our user ports itself (a bare
+		 * routed port - it has no lower devices except the conduit,
+		 * so the lower walk cannot find it) or an upper (SVI/bridge)
+		 * with a user port somewhere below.
+		 */
+		port = rtl83xx_port_is_under(dev, priv);
+		if (port < 0)
+			port = rtl83xx_port_dev_lower_find(dev, priv);
+		if (port < 0) {
+			pr_debug("%s: neighbour not on our ports, ignoring\n", __func__);
 			return NOTIFY_DONE;
 		}
 
@@ -1237,9 +1512,18 @@ static int rtl83xx_netevent_event(struct notifier_block *this,
 
 		net_work->mac = ether_addr_to_u64(n->ha);
 		net_work->gw_addr = *(__be32 *)n->primary_key;
+		net_work->intf_mac = ether_addr_to_u64(dev->dev_addr);
+		net_work->vlan = is_vlan_dev(dev) ? vlan_dev_vlan_id(dev) : 0;
+		/* Distinguish a neighbour on a bare routed port (dev IS one of
+		 * our user ports) from one behind a bridge/SVI, where the
+		 * walk-derived port is just the first bridge member.
+		 */
+		net_work->port = rtl83xx_port_is_under(dev, priv);
+		net_work->valid = !!(n->nud_state & NUD_VALID);
 
-		pr_debug("%s: updating neighbour on port %d, mac %016llx\n",
-			 __func__, port, net_work->mac);
+		pr_debug("%s: neighbour %s on port %d, mac %016llx\n",
+			 __func__, net_work->valid ? "update" : "invalidate",
+			 port, net_work->mac);
 		queue_work(priv->wq, &net_work->work);
 		break;
 	}

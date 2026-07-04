@@ -2309,7 +2309,16 @@ static int rtl83xx_find_l2_hash_entry(struct rtl838x_switch_priv *priv, u64 seed
 		if (must_exist && !e->valid)
 			continue;
 		if (!e->valid || ((entry & 0x0fffffffffffffffULL) == seed)) {
-			idx = i > 3 ? ((key >> 14) & 0xffff) | i >> 1 : ((key << 2) | i) & 0xffff;
+			/* Physical index is (row << 2) | way, mirroring the
+			 * read accessor: buckets 4-7 live in the second hash
+			 * block addressed by the high half of the double hash.
+			 * The old encoding wrote second-block entries to
+			 * garbage locations, corrupting unrelated L2 rows.
+			 */
+			if (i > 3)
+				idx = ((key >> 16) << 2) | (i - 4);
+			else
+				idx = ((key & 0xffff) << 2) | i;
 			break;
 		}
 	}
