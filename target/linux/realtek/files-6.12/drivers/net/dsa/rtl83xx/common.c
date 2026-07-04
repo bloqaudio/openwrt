@@ -911,10 +911,16 @@ static void rtl83xx_route_rm(struct rtl838x_switch_priv *priv, struct rtl83xx_ro
 		dev_warn(priv->dev, "Could not remove route\n");
 
 	if (r->is_host_route) {
-		id = priv->r->find_l3_slot(r, false);
+		/* Find the slot actually holding this destination - a free-slot
+		 * search (must_exist = false) could invalidate an unrelated
+		 * neighbour's entry.
+		 */
+		id = priv->r->find_l3_slot(r, true);
 		pr_debug("%s: Got id for host route: %d\n", __func__, id);
-		r->attr.valid = false;
-		priv->r->host_route_write(id, r);
+		if (id >= 0) {
+			r->attr.valid = false;
+			priv->r->host_route_write(id, r);
+		}
 		clear_bit(r->id - MAX_ROUTES, priv->host_route_use_bm);
 	} else {
 		/* If there is a HW representation of the route, delete it */
@@ -1115,15 +1121,17 @@ static int rtldsa_fib4_add(struct rtl838x_switch_priv *priv,
 
 	if (priv->r->set_l3_router_mac) {
 		u64 mac = ether_addr_to_u64(ndev->dev_addr);
+		int if_id;
 
 		pr_debug("Local route and router MAC %pM\n", ndev->dev_addr);
 		if (rtl83xx_alloc_router_mac(priv, mac))
 			goto out_free_rt;
 
 		/* vid = 0: Do not care about VID */
-		route->nh.if_id = rtl83xx_alloc_egress_intf(priv, mac, vlan);
-		if (route->nh.if_id < 0)
-			goto out_free_rmac;
+		if_id = rtl83xx_alloc_egress_intf(priv, mac, vlan);
+		if (if_id < 0)
+			goto out_free_rt;
+		route->nh.if_id = if_id;
 
 		if (!nh->fib_nh_gw4) {
 			int slot;
@@ -1148,9 +1156,23 @@ static int rtldsa_fib4_add(struct rtl838x_switch_priv *priv,
 
 	return 0;
 
-out_free_rmac:
 out_free_rt:
-	return 0;
+	/* Nothing has been written to the hardware tables yet - undo the
+	 * software state so the route is not falsely accounted as offloaded.
+	 * The router MAC stays allocated: it is deduplicated by MAC and may
+	 * be shared with other routes.
+	 */
+	mutex_lock(&priv->reg_mutex);
+	if (rhltable_remove(&priv->routes, &route->linkage, route_ht_params))
+		dev_warn(priv->dev, "%s: could not remove route\n", __func__);
+	if (route->is_host_route)
+		clear_bit(route->id - MAX_ROUTES, priv->host_route_use_bm);
+	else
+		clear_bit(route->id, priv->route_use_bm);
+	mutex_unlock(&priv->reg_mutex);
+	kfree(route);
+
+	return -ENOSPC;
 }
 
 static int rtl83xx_fib6_add(struct rtl838x_switch_priv *priv,
@@ -1186,7 +1208,7 @@ static int rtl83xx_netevent_event(struct notifier_block *this,
 	struct rtl838x_switch_priv *priv;
 	struct net_device *dev;
 	struct neighbour *n = ptr;
-	int err, port;
+	int port;
 	struct net_event_work *net_work;
 
 	priv = container_of(this, struct rtl838x_switch_priv, ne_nb);
@@ -1219,8 +1241,6 @@ static int rtl83xx_netevent_event(struct notifier_block *this,
 		pr_debug("%s: updating neighbour on port %d, mac %016llx\n",
 			 __func__, port, net_work->mac);
 		queue_work(priv->wq, &net_work->work);
-		if (err)
-			netdev_warn(dev, "failed to handle neigh update (err %d)\n", err);
 		break;
 	}
 

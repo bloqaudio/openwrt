@@ -1312,10 +1312,16 @@ static int rtl930x_find_l3_slot(struct rtl83xx_route *rt, bool must_exist)
 
 			rtl930x_host_route_read(idx, &route_entry);
 			pr_debug("%s route valid %d, route dest: %pI4, hit %d\n", __func__,
-				 rt->attr.valid, &rt->dst_ip, rt->attr.hit);
-			if (!must_exist && rt->attr.valid)
+				 route_entry.attr.valid, &route_entry.dst_ip,
+				 route_entry.attr.hit);
+			/* A free-slot search must test the slot read from hardware,
+			 * not the route we are trying to place: otherwise every
+			 * route lands in slot 0 of its row, clobbering colliders.
+			 */
+			if (!must_exist && !route_entry.attr.valid)
 				return idx;
-			if (must_exist && route_entry.dst_ip == rt->dst_ip)
+			if (must_exist && route_entry.attr.valid &&
+			    route_entry.dst_ip == rt->dst_ip)
 				return idx;
 		}
 	}
@@ -1349,8 +1355,8 @@ static void rtl930x_route_write(int idx, struct rtl83xx_route *rt)
 	v |= (rt->nh.id & 0x7ff) << 7;
 	v |= rt->attr.ttl_dec ? BIT(6) : 0;
 	v |= rt->attr.ttl_check ? BIT(5) : 0;
-	v |= rt->attr.dst_null ? BIT(6) : 0;
-	v |= rt->attr.qos_as ? BIT(6) : 0;
+	v |= rt->attr.dst_null ? BIT(4) : 0;
+	v |= rt->attr.qos_as ? BIT(3) : 0;
 	v |= rt->attr.qos_prio & 0x7;
 	v |= rt->prefix_len == 0 ? BIT(20) : 0; /* set default route bit */
 
@@ -2208,8 +2214,16 @@ static void rtl930x_set_l3_egress_mac(u32 idx, u64 mac)
  * - The router's MAC address on which routed packets are expected
  * - MAC addresses used as source macs of routed packets
  */
+/* Reserved prefix-route indices for the trap-to-CPU catch-all entries.
+ * Lowest matching index wins, so these sit at the very top of the table.
+ */
+#define RTL930X_ROUTE_IDX_CATCHALL_IP4	(MAX_ROUTES - 1)
+#define RTL930X_ROUTE_IDX_CATCHALL_IP6	(MAX_ROUTES - 2)
+
 static int rtl930x_l3_setup(struct rtl838x_switch_priv *priv)
 {
+	struct rtl83xx_route rt;
+
 	/* Setup MTU with id 0 for default interface */
 	for (int i = 0; i < MAX_INTF_MTUS; i++)
 		priv->intf_mtu_count[i] = priv->intf_mtus[i] = 0;
@@ -2243,7 +2257,11 @@ static int rtl930x_l3_setup(struct rtl838x_switch_priv *priv)
 	sw_w32_mask(0, 1, RTL930X_L3_IPMC_ROUTE_CTRL);
 	sw_w32_mask(0, 1, RTL930X_L3_IP6MC_ROUTE_CTRL);
 
-	sw_w32(0x00002001, RTL930X_L3_IPUC_ROUTE_CTRL);
+	/* GLB_EN, HDR_OPT_ACT=FORWARD, TTL_FAIL/MTU_FAIL/DMAC_BC_ACT=TRAP2CPU:
+	 * expired-TTL and over-MTU packets must reach the CPU so Linux can send
+	 * ICMP time-exceeded / fragmentation-needed (traceroute, PMTUD).
+	 */
+	sw_w32(0x0002a081, RTL930X_L3_IPUC_ROUTE_CTRL);
 	sw_w32(0x00014581, RTL930X_L3_IP6UC_ROUTE_CTRL);
 	sw_w32(0x00000501, RTL930X_L3_IPMC_ROUTE_CTRL);
 	sw_w32(0x00012881, RTL930X_L3_IP6MC_ROUTE_CTRL);
@@ -2260,6 +2278,26 @@ static int rtl930x_l3_setup(struct rtl838x_switch_priv *priv)
 
 	/* Do not use prefix route 0 because of HW limitations */
 	set_bit(0, priv->route_use_bm);
+
+	/* Install catch-all default entries that trap route-lookup misses to
+	 * the CPU. A router-MAC-matched packet that misses both the host and
+	 * prefix tables is otherwise silently dropped: RTL930x has no unicast
+	 * lookup-miss action (only IPMC/IP6MC have LU_MIS_ACT). The hardware
+	 * returns the lowest matching prefix index, so the catch-alls live at
+	 * the top of the table where they can never shadow a specific route.
+	 */
+	memset(&rt, 0, sizeof(rt));
+	rt.attr.valid = true;
+	rt.attr.action = ROUTE_ACT_TRAP2CPU;
+	rt.prefix_len = 0;
+
+	rt.attr.type = 0; /* IPv4 */
+	rtl930x_route_write(RTL930X_ROUTE_IDX_CATCHALL_IP4, &rt);
+	set_bit(RTL930X_ROUTE_IDX_CATCHALL_IP4, priv->route_use_bm);
+
+	rt.attr.type = 2; /* IPv6 */
+	rtl930x_route_write(RTL930X_ROUTE_IDX_CATCHALL_IP6, &rt);
+	set_bit(RTL930X_ROUTE_IDX_CATCHALL_IP6, priv->route_use_bm);
 
 	return 0;
 }
