@@ -616,14 +616,19 @@ static int rtl83xx_l2_nexthop_add(struct rtl838x_switch_priv *priv, struct rtl83
 		 */
 		e.is_static = true;
 	} else {
+		/* The probe reads above leave stale fields (is_trunk,
+		 * stack_dev, ...) in the entry when the slot is free; any
+		 * nonzero leftover encodes a trunk/remote-device SPA and the
+		 * ASIC drops every routed packet into this nexthop (counted
+		 * as STACK_PORT_NOT_FOUND). Start from a clean entry like
+		 * the FDB write paths do.
+		 */
+		memset(&e, 0, sizeof(e));
+		e.type = L2_UNICAST;
+		u64_to_ether_addr(nh->mac, &e.mac[0]);
 		e.valid = true;
 		e.is_static = true;
 		e.rvid = nh->rvid;
-		e.is_ip_mc = false;
-		e.is_ipv6_mc = false;
-		e.block_da = false;
-		e.block_sa = false;
-		e.suspended = false;
 		e.age = 0;			/* With port-ignore */
 		/* The SPA of this entry is the routed packet's egress port -
 		 * use the real port when the caller knows it (standalone
@@ -631,7 +636,6 @@ static int rtl83xx_l2_nexthop_add(struct rtl838x_switch_priv *priv, struct rtl83
 		 * entry ever exists to supply it).
 		 */
 		e.port = nh->port;
-		u64_to_ether_addr(nh->mac, &e.mac[0]);
 	}
 	e.next_hop = true;
 	e.nh_route_id = nh->id;			/* NH route ID takes place of VID */
@@ -1209,18 +1213,20 @@ static int rtl83xx_l3_neigh_route_add(struct rtl838x_switch_priv *priv,
 	if (!priv->r->host_route_write || !priv->r->set_l3_router_mac)
 		return -EOPNOTSUPP;
 
-	/* Only neighbours behind a VLAN upper (SVI) can be offloaded today.
-	 * A bare routed port has no valid egress VLAN context: VLAN 0 has no
-	 * member ports, the stale pvid's VLAN dropped the port on bridge
-	 * leave, and hardware-forwarded frames are checked by the egress VLAN
-	 * filter (CPU-injected frames bypass it, which is why the software
-	 * path works). Offloading routed ports needs the driver to maintain
-	 * VLAN membership for standalone ports first - until then they stay
-	 * on the CPU path via the catch-all trap, which is correct, just not
-	 * accelerated.
+	/* A neighbour behind a VLAN upper (SVI) carries its VID. A bare
+	 * routed port has none, but owns a reserved internal L3 VLAN (see
+	 * rtldsa_l3_port_vlan_set()) that provides the egress VLAN context
+	 * hardware forwarding needs - the egress VLAN filter checks
+	 * hardware-forwarded frames against VLAN membership (CPU-injected
+	 * frames bypass it, which is why the software path never needed
+	 * this). Anything else, e.g. a VLAN-unaware bridge, cannot be
+	 * offloaded and stays on the CPU path via the catch-all trap.
 	 */
-	if (!vlan)
-		return -EOPNOTSUPP;
+	if (!vlan) {
+		if (port < 0)
+			return -EOPNOTSUPP;
+		vlan = RTLDSA_L3_PORT_VID(port);
+	}
 
 	pr_debug("%s: ip %pI4 mac %016llx vlan %d port %d\n",
 		 __func__, &ip, mac, vlan, port);
@@ -1243,7 +1249,10 @@ static int rtl83xx_l3_neigh_route_add(struct rtl838x_switch_priv *priv,
 	r->nh.if_id = if_id;
 
 	r->nh.mac = r->nh.gw = mac;
-	r->nh.port = priv->port_ignore;
+	/* On a bare routed port the egress port is known; behind an SVI it
+	 * comes from the learned L2 entry for the neighbour.
+	 */
+	r->nh.port = port >= 0 ? port : priv->port_ignore;
 	r->nh.id = r->id;
 
 	if (priv->r->set_l3_egress_mac)
@@ -1321,6 +1330,74 @@ static void rtl83xx_l3_neigh_route_del(struct rtl838x_switch_priv *priv, __be32 
 	rtl83xx_l2_nexthop_rm(priv, &nh);
 }
 
+struct l3_flush_work {
+	struct work_struct work;
+	struct rtl838x_switch_priv *priv;
+	u16 rvid;
+};
+
+/* Remove every neighbour-synthesized host route egressing via the given
+ * VLAN. Runs on the same single-threaded workqueue as the neighbour event
+ * work, so it cannot race with concurrent route mutation. The walk is
+ * restarted after each removal because entries may be missed if the
+ * hashtable resizes mid-walk.
+ */
+static void rtl83xx_l3_flush_work_do(struct work_struct *work)
+{
+	struct l3_flush_work *fw =
+		container_of(work, struct l3_flush_work, work);
+	struct rtl838x_switch_priv *priv = fw->priv;
+	struct rhashtable_iter iter;
+	struct rtl83xx_route *r;
+	bool found;
+
+	do {
+		__be32 ip = 0;
+
+		found = false;
+		rhltable_walk_enter(&priv->routes, &iter);
+		rhashtable_walk_start(&iter);
+		while ((r = rhashtable_walk_next(&iter)) != NULL) {
+			if (IS_ERR(r))
+				continue;
+			if (r->neigh_route && r->nh.rvid == fw->rvid) {
+				ip = r->dst_ip;
+				found = true;
+				break;
+			}
+		}
+		rhashtable_walk_stop(&iter);
+		rhashtable_walk_exit(&iter);
+
+		if (found)
+			rtl83xx_l3_neigh_route_del(priv, ip);
+	} while (found);
+
+	kfree(fw);
+}
+
+/* Called when a port joins a bridge and loses its internal L3 VLAN: any
+ * host route still egressing through it would silently blackhole in the
+ * ASIC (the egress VLAN filter drops the frames), so flush them now
+ * instead of waiting for the neighbours to fail.
+ */
+void rtl83xx_l3_flush_neigh_routes(struct rtl838x_switch_priv *priv, int port)
+{
+	struct l3_flush_work *fw;
+
+	if (!priv->r->host_route_write)
+		return;
+
+	fw = kzalloc(sizeof(*fw), GFP_KERNEL);
+	if (!fw)
+		return;
+
+	INIT_WORK(&fw->work, rtl83xx_l3_flush_work_do);
+	fw->priv = priv;
+	fw->rvid = RTLDSA_L3_PORT_VID(port);
+	queue_work(priv->wq, &fw->work);
+}
+
 static int rtldsa_fib4_add(struct rtl838x_switch_priv *priv,
 			   struct fib_entry_notifier_info *info)
 {
@@ -1337,6 +1414,8 @@ static int rtldsa_fib4_add(struct rtl838x_switch_priv *priv,
 	 * upper (SVI/bridge) with a user port below.
 	 */
 	port = rtl83xx_port_is_under(ndev, priv);
+	if (port >= 0 && !vlan)
+		vlan = RTLDSA_L3_PORT_VID(port); /* bare routed port */
 	if (port < 0)
 		port = rtl83xx_port_dev_lower_find(ndev, priv);
 	if (port < 0) {

@@ -447,6 +447,44 @@ static void rtl83xx_vlan_set_pvid(struct rtl838x_switch_priv *priv,
 	priv->ports[port].pvid = pvid;
 }
 
+/* A standalone (non-bridged) port needs a VLAN context for L3 offload:
+ * hardware-forwarded frames are subject to the egress VLAN filter, so a
+ * routed port must be an egress member of the VLAN its nexthops point to
+ * (CPU-injected frames bypass the filter, which is why the software path
+ * works without this). Give every standalone port a reserved internal
+ * VLAN with only the port itself (untagged) and the CPU port as members
+ * and classify its ingress traffic into it via the PVID.
+ */
+static void rtldsa_l3_port_vlan_set(struct rtl838x_switch_priv *priv,
+				    int port, bool enable)
+{
+	struct rtl838x_vlan_info info;
+	int vid = RTLDSA_L3_PORT_VID(port);
+
+	/* Only SoCs whose L3 offload handles host routes need this */
+	if (!priv->r->host_route_write)
+		return;
+
+	priv->r->vlan_tables_read(vid, &info);
+
+	if (enable) {
+		info.fid = 0;
+		info.hash_mc_fid = false;
+		info.hash_uc_fid = false;
+		info.profile_id = 0;
+		info.member_ports = BIT_ULL(port) | BIT_ULL(priv->cpu_port);
+		info.untagged_ports = BIT_ULL(port);
+	} else {
+		info.member_ports = 0;
+		info.untagged_ports = 0;
+	}
+
+	priv->r->vlan_set_untagged(vid, info.untagged_ports);
+	priv->r->vlan_set_tagged(vid, &info);
+
+	rtl83xx_vlan_set_pvid(priv, port, enable ? vid : 0);
+}
+
 /* Initialize all VLANS */
 static void rtl83xx_vlan_setup(struct rtl838x_switch_priv *priv)
 {
@@ -490,6 +528,13 @@ static void rtl83xx_vlan_setup(struct rtl838x_switch_priv *priv)
 	/* Set forwarding action based on inner VLAN tag */
 	for (int i = 0; i < priv->cpu_port; i++)
 		priv->r->vlan_fwd_on_inner(i, true);
+
+	/* All user ports start out standalone: give each its internal L3
+	 * VLAN so routed traffic can be hardware-forwarded from the start.
+	 */
+	for (int i = 0; i < priv->cpu_port; i++)
+		if (dsa_is_user_port(priv->ds, i))
+			rtldsa_l3_port_vlan_set(priv, i, true);
 }
 
 static void rtldsa_setup_bpdu_traps(struct rtl838x_switch_priv *priv)
@@ -1839,6 +1884,11 @@ static int rtldsa_port_bridge_join(struct dsa_switch *ds, int port, struct dsa_b
 
 	rtldsa_update_port_member(priv, port, bridge.dev, true);
 
+	/* The bridge owns the port's VLAN state now: drop the internal L3
+	 * VLAN of the standalone port and reset the PVID.
+	 */
+	rtldsa_l3_port_vlan_set(priv, port, false);
+
 	if (priv->r->set_static_move_action)
 		priv->r->set_static_move_action(port, false);
 
@@ -1847,6 +1897,9 @@ static int rtldsa_port_bridge_join(struct dsa_switch *ds, int port, struct dsa_b
 		rtldsa_port_xstp_state_set(priv, port, BR_STATE_DISABLED, i);
 
 	mutex_unlock(&priv->reg_mutex);
+
+	/* Host routes still egressing via the dropped VLAN would blackhole */
+	rtl83xx_l3_flush_neigh_routes(priv, port);
 
 	return 0;
 }
@@ -1861,6 +1914,9 @@ static void rtldsa_port_bridge_leave(struct dsa_switch *ds, int port, struct dsa
 	mutex_lock(&priv->reg_mutex);
 
 	rtldsa_update_port_member(priv, port, bridge.dev, false);
+
+	/* Standalone again: restore the port's internal L3 VLAN */
+	rtldsa_l3_port_vlan_set(priv, port, true);
 
 	if (priv->r->set_static_move_action)
 		priv->r->set_static_move_action(port, true);
@@ -2111,6 +2167,13 @@ static int rtl83xx_vlan_add(struct dsa_switch *ds, int port,
 		return -ENOTSUPP;
 	}
 
+	if (priv->r->host_route_write &&
+	    vlan->vid >= RTLDSA_L3_PORT_VID(priv->cpu_port - 1)) {
+		NL_SET_ERR_MSG_MOD(extack,
+				   "VLAN reserved for L3 offload on standalone ports");
+		return -EBUSY;
+	}
+
 	err = rtl83xx_vlan_prepare(ds, port, vlan);
 	if (err)
 		return err;
@@ -2182,6 +2245,13 @@ static int rtl83xx_vlan_del(struct dsa_switch *ds, int port,
 		dev_err(priv->dev, "VLAN out of range: %d", vlan->vid);
 		return -ENOTSUPP;
 	}
+
+	/* Internal L3 VLANs are never added via switchdev, so there is
+	 * nothing to delete; refusing keeps them intact.
+	 */
+	if (priv->r->host_route_write &&
+	    vlan->vid >= RTLDSA_L3_PORT_VID(priv->cpu_port - 1))
+		return 0;
 
 	mutex_lock(&priv->reg_mutex);
 	pvid = priv->ports[port].pvid;

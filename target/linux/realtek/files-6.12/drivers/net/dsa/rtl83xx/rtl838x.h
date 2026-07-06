@@ -673,6 +673,12 @@ typedef enum {
 #define RTL931X_LED_SET_LEDX_SHIFT(x) (16 * (x % 2))
 
 #define MAX_VLANS 4096
+/* Reserved internal VLANs giving standalone (routed) ports an egress VLAN
+ * context for L3 offload, one per possible user port, counting down from
+ * 4094 (4095 is reserved by 802.1Q). Only used when the SoC offloads host
+ * routes; see rtldsa_l3_port_vlan_set().
+ */
+#define RTLDSA_L3_PORT_VID(port) (4094 - (port))
 #define MAX_LAGS 16
 #define MAX_PRIOS 8
 #define RTL930X_PORT_IGNORE 0x3f
