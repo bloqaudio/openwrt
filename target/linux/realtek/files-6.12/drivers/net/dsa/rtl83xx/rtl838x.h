@@ -219,6 +219,7 @@
 #define RTL838X_L2_PORT_LRN_CONSTRT		(0x32A0)
 #define RTL839X_L2_PORT_LRN_CONSTRT		(0x3914)
 #define RTL930X_L2_LRN_PORT_CONSTRT_CTRL	(0x90A4)
+#define RTL930X_L2_LRN_TRK_CONSTRT_CTRL		(0x918C)
 #define RTL931X_L2_LRN_PORT_CONSTRT_CTRL	(0xC96C)
 
 #define RTL838X_L2_PORT_NEW_SALRN(p)		(0x328c + (((p >> 4) << 2)))
@@ -384,6 +385,11 @@
 
 #define RTL930X_TRK_MBR_CTRL			(0xA41C)
 #define RTL930X_TRK_HASH_CTRL			(0x9F80)
+#define RTL930X_TRK_LOCAL_TBL_REFRESH		(0x9F90)
+#define RTL930X_TRK_ID_CTRL			(0xA3A8)
+#define RTL930X_LOCAL_PORT_TRK_MAP		(0xD0C8)
+#define RTL930X_TRK_CTRL			(0x9F88)
+#define RTL930X_TRK_SHFT_CTRL			(0x9F8C)
 
 #define RTL931X_TRK_MBR_CTRL			(0xB8D0)
 #define RTL931X_TRK_HASH_CTRL			(0xBA70)
@@ -1227,6 +1233,12 @@ struct rtl838x_reg {
 	u64 (*read_cam)(int idx, struct rtl838x_l2_entry *e);
 	void (*write_cam)(int idx, struct rtl838x_l2_entry *e);
 	int (*trk_mbr_ctr)(int group);
+	/* Optional extra trunk programming beyond the member mask: the
+	 * RTL930x additionally needs the per-source-port trunk mapping and
+	 * the egress candidate list the TX hash indexes into.
+	 */
+	void (*trunk_srcmap_set)(int port, bool valid, int group);
+	void (*trunk_egr_ports_set)(int group, u64 members);
 	int rma_bpdu_fld_pmask;
 	int spcl_trap_eapol_ctrl;
 	void (*init_eee)(struct rtl838x_switch_priv *priv, bool enable);

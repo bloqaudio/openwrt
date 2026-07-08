@@ -2878,8 +2878,47 @@ static bool rtl83xx_lag_can_offload(struct dsa_switch *ds,
 
 static int rtl83xx_port_lag_change(struct dsa_switch *ds, int port)
 {
+	struct rtl838x_switch_priv *priv = ds->priv;
+	struct dsa_port *dp = dsa_to_port(ds, port);
+	u64 tx_members = 0;
+	int group;
+
 	pr_debug("%s: %d\n", __func__, port);
-	/* Nothing to be done... */
+
+	/* SoCs with an egress candidate list must shrink it to the
+	 * tx-enabled members, or the hardware keeps hashing flows onto a
+	 * dead member and they blackhole until the port recovers.
+	 */
+	if (!priv->r->trunk_egr_ports_set || !dp->lag)
+		return 0;
+
+	group = dsa_lag_id(ds->dst, dp->lag->dev);
+	if (group < 0 || group >= ds->num_lag_ids)
+		return 0;
+
+	mutex_lock(&priv->reg_mutex);
+
+	for (int p = 0; p < priv->cpu_port; p++)
+		if ((priv->lags_port_members[group] & BIT_ULL(p)) &&
+		    dsa_to_port(ds, p)->lag_tx_enabled)
+			tx_members |= BIT_ULL(p);
+
+	/* All members down: leave the full set programmed - everything
+	 * drops anyway until a member returns.
+	 */
+	if (!tx_members)
+		tx_members = priv->lags_port_members[group];
+
+	/* The member register feeds the local-table regeneration which
+	 * the unicast egress selection actually uses - it must shrink
+	 * along with the egress candidate list or flows keep resolving
+	 * to the dead member.
+	 */
+	priv->r->mask_port_reg_be(priv->lags_port_members[group] & ~tx_members,
+				  tx_members, priv->r->trk_mbr_ctr(group));
+	priv->r->trunk_egr_ports_set(group, tx_members);
+
+	mutex_unlock(&priv->reg_mutex);
 
 	return 0;
 }
@@ -2908,19 +2947,23 @@ static int rtl83xx_port_lag_join(struct dsa_switch *ds,
 
 	pr_info("port_lag_join: group %d, port %d\n", group, port);
 
-	if (priv->lag_primary[group] == -1)
-		priv->lag_primary[group] = port;
-	else
-		priv->lag_non_primary |= BIT_ULL(port);
-
-	priv->lagmembers |= BIT_ULL(port);
-
 	pr_debug("lag_members = %llX\n", priv->lagmembers);
 	err = rtl83xx_lag_add(priv->ds, group, port, info);
 	if (err) {
 		err = -EINVAL;
 		goto out;
 	}
+
+	/* Only track state once the hardware add succeeded - a failed join
+	 * must not leave the port marked as a member or every later join
+	 * fails against the stale entry.
+	 */
+	if (priv->lag_primary[group] == -1)
+		priv->lag_primary[group] = port;
+	else
+		priv->lag_non_primary |= BIT_ULL(port);
+
+	priv->lagmembers |= BIT_ULL(port);
 
 out:
 	mutex_unlock(&priv->reg_mutex);
@@ -2936,10 +2979,17 @@ static int rtl83xx_port_lag_leave(struct dsa_switch *ds, int port,
 
 	mutex_lock(&priv->reg_mutex);
 
-	group = dsa_lag_id(ds->dst, lag.dev);
-	if (group == -1) {
-		pr_info("port_lag_leave: group %d not set\n", port);
-		err = -EINVAL;
+	/* Find the group by actual membership - the DSA lag ID may already
+	 * be released (or never assigned, after a failed join) by the time
+	 * the leave runs, and bailing out here would leave stale state
+	 * behind that blocks any future join of this port.
+	 */
+	for (group = 0; group < ds->num_lag_ids; group++)
+		if (priv->lags_port_members[group] & BIT_ULL(port))
+			break;
+	if (group == ds->num_lag_ids) {
+		pr_info("port_lag_leave: port %d not in any LAG\n", port);
+		err = 0;
 		goto out;
 	}
 

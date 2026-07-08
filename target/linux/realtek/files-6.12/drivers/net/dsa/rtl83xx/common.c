@@ -465,6 +465,15 @@ int rtl83xx_lag_add(struct dsa_switch *ds, int group, int port, struct netdev_la
 	priv->r->mask_port_reg_be(0, BIT_ULL(port), priv->r->trk_mbr_ctr(group));
 	priv->lags_port_members[group] |= BIT_ULL(port);
 
+	/* SoCs with a separate source-port map and egress candidate list
+	 * (RTL930x) need those programmed as well - the member mask alone
+	 * only covers learning/filtering, not TX hashing.
+	 */
+	if (priv->r->trunk_srcmap_set)
+		priv->r->trunk_srcmap_set(port, true, group);
+	if (priv->r->trunk_egr_ports_set)
+		priv->r->trunk_egr_ports_set(group, priv->lags_port_members[group]);
+
 	pr_info("%s: Added port %d to LAG %d. Members now %016llx.\n",
 		__func__, port, group, priv->lags_port_members[group]);
 
@@ -489,6 +498,11 @@ int rtl83xx_lag_del(struct dsa_switch *ds, int group, int port)
 	/* 0x7f algo mask all */
 	priv->r->mask_port_reg_be(BIT_ULL(port), 0, priv->r->trk_mbr_ctr(group));
 	priv->lags_port_members[group] &= ~BIT_ULL(port);
+
+	if (priv->r->trunk_srcmap_set)
+		priv->r->trunk_srcmap_set(port, false, 0);
+	if (priv->r->trunk_egr_ports_set)
+		priv->r->trunk_egr_ports_set(group, priv->lags_port_members[group]);
 
 	pr_info("%s: Removed port %d from LAG %d. Members now %016llx.\n",
 		__func__, port, group, priv->lags_port_members[group]);

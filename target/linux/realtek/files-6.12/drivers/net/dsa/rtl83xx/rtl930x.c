@@ -2430,42 +2430,134 @@ static void rtl930x_set_egr_filter(int port,  enum egr_filter state)
 
 static void rtl930x_set_distribution_algorithm(int group, int algoidx, u32 algomsk)
 {
-	u32 l3shift = 0;
-	u32 newmask = 0;
+	u32 l2msk = 0, l3msk = 0;
 
-	/* TODO: for now we set algoidx to 0 */
-	algoidx = 0;
-	if (algomsk & TRUNK_DISTRIBUTION_ALGO_SIP_BIT) {
-		l3shift = 4;
-		newmask |= TRUNK_DISTRIBUTION_ALGO_L3_SIP_BIT;
+	/* The L2 mask (bits 3-0) hashes bridged/non-IP frames, the L3 mask
+	 * (bits 13-4) IP frames. Both must be populated: an empty L2 mask
+	 * hashes every bridged frame identically and the trunk degenerates
+	 * to a single member.
+	 */
+	if (algomsk & TRUNK_DISTRIBUTION_ALGO_SMAC_BIT) {
+		l2msk |= TRUNK_DISTRIBUTION_ALGO_L2_SMAC_BIT;
+		l3msk |= TRUNK_DISTRIBUTION_ALGO_L3_SMAC_BIT;
 	}
-	if (algomsk & TRUNK_DISTRIBUTION_ALGO_DIP_BIT) {
-		l3shift = 4;
-		newmask |= TRUNK_DISTRIBUTION_ALGO_L3_DIP_BIT;
+	if (algomsk & TRUNK_DISTRIBUTION_ALGO_DMAC_BIT) {
+		l2msk |= TRUNK_DISTRIBUTION_ALGO_L2_DMAC_BIT;
+		l3msk |= TRUNK_DISTRIBUTION_ALGO_L3_DMAC_BIT;
 	}
-	if (algomsk & TRUNK_DISTRIBUTION_ALGO_SRC_L4PORT_BIT) {
-		l3shift = 4;
-		newmask |= TRUNK_DISTRIBUTION_ALGO_L3_SRC_L4PORT_BIT;
-	}
-	if (algomsk & TRUNK_DISTRIBUTION_ALGO_SRC_L4PORT_BIT) {
-		l3shift = 4;
-		newmask |= TRUNK_DISTRIBUTION_ALGO_L3_SRC_L4PORT_BIT;
-	}
+	if (algomsk & TRUNK_DISTRIBUTION_ALGO_SIP_BIT)
+		l3msk |= TRUNK_DISTRIBUTION_ALGO_L3_SIP_BIT;
+	if (algomsk & TRUNK_DISTRIBUTION_ALGO_DIP_BIT)
+		l3msk |= TRUNK_DISTRIBUTION_ALGO_L3_DIP_BIT;
+	if (algomsk & TRUNK_DISTRIBUTION_ALGO_SRC_L4PORT_BIT)
+		l3msk |= TRUNK_DISTRIBUTION_ALGO_L3_SRC_L4PORT_BIT;
+	if (algomsk & TRUNK_DISTRIBUTION_ALGO_DST_L4PORT_BIT)
+		l3msk |= TRUNK_DISTRIBUTION_ALGO_L3_DST_L4PORT_BIT;
 
-	if (l3shift == 4) {
-		if (algomsk & TRUNK_DISTRIBUTION_ALGO_SMAC_BIT)
-			newmask |= TRUNK_DISTRIBUTION_ALGO_L3_SMAC_BIT;
+	/* Program both hash-mask sets identically (the per-trunk mask-set
+	 * selectors all point at set 0, but leave no all-zero set behind),
+	 * neutral per-field shifts, and plain hash member selection - the
+	 * LOCAL_FIRST stacking preference in TRK_CTRL must be off or the
+	 * selection ignores the hash and pins one designated member.
+	 */
+	sw_w32(l2msk | (l3msk << 4), RTL930X_TRK_HASH_CTRL);
+	sw_w32(l2msk | (l3msk << 4), RTL930X_TRK_HASH_CTRL + 4);
+	sw_w32(0, RTL930X_TRK_SHFT_CTRL);
+	sw_w32_mask(BIT(4), 0, RTL930X_TRK_CTRL);
 
-		if (algomsk & TRUNK_DISTRIBUTION_ALGO_DMAC_BIT)
-			newmask |= TRUNK_DISTRIBUTION_ALGO_L3_DMAC_BIT;
-	} else  {
-		if (algomsk & TRUNK_DISTRIBUTION_ALGO_SMAC_BIT)
-			newmask |= TRUNK_DISTRIBUTION_ALGO_L2_SMAC_BIT;
-		if (algomsk & TRUNK_DISTRIBUTION_ALGO_DMAC_BIT)
-			newmask |= TRUNK_DISTRIBUTION_ALGO_L2_DMAC_BIT;
+}
+
+/* Map a source port to a trunk group (SRC_TRK_MAP table, one entry per
+ * port): ingress traffic on the port is then attributed to the trunk for
+ * L2 learning, source-port filtering and non-unicast forwarding.
+ */
+static void rtl930x_trunk_srcmap_set(int port, bool valid, int group)
+{
+	/* Access SRC_TRK_MAP table (8) via register RTL9300_TBL_0 */
+	struct table_reg *r = rtl_table_get(RTL9300_TBL_0, 8);
+	u32 v = 0;
+
+	if (WARN_ON(!r))
+		return;
+
+	if (valid)
+		v = BIT(31) | (group & 0x3f) << 25;
+
+	sw_w32(v, rtl_table_data(r, 0));
+	rtl_table_write(r, port);
+	rtl_table_release(r);
+
+	/* The local (same-unit) forwarding logic keeps its own per-port
+	 * map with the same information.
+	 */
+	sw_w32(valid ? BIT(6) | (group & 0x3f) : 0,
+	       RTL930X_LOCAL_PORT_TRK_MAP + (port << 2));
+}
+
+/* Helper for the 96 bit LAG table entry: bit 0 is the LSB of the last
+ * data word, bit 95 the MSB of the first.
+ */
+static void rtl930x_lag_entry_set(u32 w[3], int lsp, int len, u32 val)
+{
+	for (int i = 0; i < len; i++)
+		if (val & BIT(i))
+			w[2 - ((lsp + i) >> 5)] |= BIT((lsp + i) & 0x1f);
+}
+
+/* Program the egress candidate list of a trunk (LAG table): NUM_TX_CANDI
+ * members, each a {devID, port} pair the TX hash result indexes into.
+ * Without this the hash selects from an empty list and unicast towards
+ * the trunk is not forwarded. Unused slots carry the invalid port 0x3f.
+ */
+static void rtl930x_trunk_egr_ports_set(int group, u64 members)
+{
+	/* Access LAG table (7) via register RTL9300_TBL_0 */
+	struct table_reg *r = rtl_table_get(RTL9300_TBL_0, 7);
+	u32 w[3] = { 0 };
+	int n = 0;
+
+	if (WARN_ON(!r))
+		return;
+
+	for (int p = 0; p < RTL930X_CPU_PORT && n < 8; p++) {
+		if (members & BIT_ULL(p)) {
+			/* TRK_PORTn at bit 10n+4, TRK_DEVn (0) at 10n+10 */
+			rtl930x_lag_entry_set(w, 10 * n + 4, 6, p);
+			n++;
+		}
 	}
+	for (int s = n; s < 8; s++)
+		rtl930x_lag_entry_set(w, 10 * s + 4, 6, 0x3f);
 
-	sw_w32(newmask << l3shift, RTL930X_TRK_HASH_CTRL + (algoidx << 2));
+	rtl930x_lag_entry_set(w, 89, 4, n);	/* NUM_TX_CANDI */
+
+	for (int i = 0; i < 3; i++)
+		sw_w32(w[i], rtl_table_data(r, i));
+
+	rtl_table_write(r, group);
+	rtl_table_release(r);
+
+	/* Allow SA learning for trunk-attributed traffic - the per-trunk
+	 * learning constraint powers up at zero, which suppresses all
+	 * learning on the trunk (same 0x7ffe limit the ports use).
+	 */
+	sw_w32(0x7ffe << 3, RTL930X_L2_LRN_TRK_CONSTRT_CTRL + (group << 2));
+
+	/* Bind the local trunk slot to the trunk ID. TRK_MBR_CTRL and the
+	 * local table are indexed by local slot, not by trunk ID; without
+	 * a valid binding the local-table refresh generates nothing and
+	 * TX hashing degenerates to the first LAG candidate. We use the
+	 * identity mapping slot == group.
+	 */
+	sw_w32(members ? BIT(6) | (group & 0x3f) : 0,
+	       RTL930X_TRK_ID_CTRL + (group << 2));
+
+	/* Regenerate the internal local trunk table - membership changes
+	 * (including source-port attribution for learning) only take
+	 * effect after this self-clearing refresh.
+	 */
+	sw_w32(BIT(0), RTL930X_TRK_LOCAL_TBL_REFRESH);
+	do { } while (sw_r32(RTL930X_TRK_LOCAL_TBL_REFRESH) & BIT(0));
 }
 
 static void rtldsa_930x_led_get_forced(const struct device_node *node,
@@ -2753,6 +2845,8 @@ const struct rtl838x_reg rtl930x_reg = {
 	.vlan_port_pvid_set = rtl930x_vlan_port_pvid_set,
 	.vlan_port_fast_age = rtldsa_930x_vlan_port_fast_age,
 	.trk_mbr_ctr = rtl930x_trk_mbr_ctr,
+	.trunk_srcmap_set = rtl930x_trunk_srcmap_set,
+	.trunk_egr_ports_set = rtl930x_trunk_egr_ports_set,
 	.rma_bpdu_fld_pmask = RTL930X_RMA_BPDU_FLD_PMSK,
 	.init_eee = rtl930x_init_eee,
 	.set_mac_eee = rtldsa_930x_set_mac_eee,
