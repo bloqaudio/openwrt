@@ -255,7 +255,11 @@ static int rtldsa_930x_port_rate_police_del(struct dsa_switch *ds, int port,
 
 static inline int rtl930x_trk_mbr_ctr(int group)
 {
-	return RTL930X_TRK_MBR_CTRL + (group << 2);
+	/* DSA LAG ids are 1-based; hardware trunks start at 0. Map them so
+	 * the first bond uses hardware trunk 0, the path every vendor
+	 * implementation exercises.
+	 */
+	return RTL930X_TRK_MBR_CTRL + ((group - 1) << 2);
 }
 
 static void rtl930x_vlan_tables_read(u32 vlan, struct rtl838x_vlan_info *info)
@@ -2455,16 +2459,27 @@ static void rtl930x_set_distribution_algorithm(int group, int algoidx, u32 algom
 		l3msk |= TRUNK_DISTRIBUTION_ALGO_L3_DST_L4PORT_BIT;
 
 	/* Program both hash-mask sets identically (the per-trunk mask-set
-	 * selectors all point at set 0, but leave no all-zero set behind),
-	 * neutral per-field shifts, and plain hash member selection - the
-	 * LOCAL_FIRST stacking preference in TRK_CTRL must be off or the
-	 * selection ignores the hash and pins one designated member.
+	 * selectors all point at set 0, but leave no all-zero set behind)
+	 * and neutral per-field shifts.
 	 */
 	sw_w32(l2msk | (l3msk << 4), RTL930X_TRK_HASH_CTRL);
 	sw_w32(l2msk | (l3msk << 4), RTL930X_TRK_HASH_CTRL + 4);
 	sw_w32(0, RTL930X_TRK_SHFT_CTRL);
-	sw_w32_mask(BIT(4), 0, RTL930X_TRK_CTRL);
 
+	/* Bit 0 selects the trunk hash source for non-terminated (plain
+	 * bridged) traffic - the vendor register list marks it reserved,
+	 * but without it the TX hash never varies and every flow exits
+	 * the first member. Stand-alone trunk mode and local-first member
+	 * preference match other working implementations.
+	 */
+	sw_w32(BIT(0) | BIT(2) | BIT(4), RTL930X_TRK_CTRL);
+
+	/* The local trunk table generator matches LAG-table slots against
+	 * this box's stacking device ID; our slots carry devID 0, so the
+	 * box's own ID must be 0 as well or the generator finds no local
+	 * members at all.
+	 */
+	sw_w32_mask(0xf << 4, 0, RTL930X_STK_GLB_CTRL);
 }
 
 /* Map a source port to a trunk group (SRC_TRK_MAP table, one entry per
@@ -2479,6 +2494,8 @@ static void rtl930x_trunk_srcmap_set(int port, bool valid, int group)
 
 	if (WARN_ON(!r))
 		return;
+
+	group -= 1;	/* 1-based DSA LAG id -> hardware trunk */
 
 	if (valid)
 		v = BIT(31) | (group & 0x3f) << 25;
@@ -2519,6 +2536,8 @@ static void rtl930x_trunk_egr_ports_set(int group, u64 members)
 	if (WARN_ON(!r))
 		return;
 
+	group -= 1;	/* 1-based DSA LAG id -> hardware trunk */
+
 	for (int p = 0; p < RTL930X_CPU_PORT && n < 8; p++) {
 		if (members & BIT_ULL(p)) {
 			/* TRK_PORTn at bit 10n+4, TRK_DEVn (0) at 10n+10 */
@@ -2558,6 +2577,7 @@ static void rtl930x_trunk_egr_ports_set(int group, u64 members)
 	 */
 	sw_w32(BIT(0), RTL930X_TRK_LOCAL_TBL_REFRESH);
 	do { } while (sw_r32(RTL930X_TRK_LOCAL_TBL_REFRESH) & BIT(0));
+
 }
 
 static void rtldsa_930x_led_get_forced(const struct device_node *node,
