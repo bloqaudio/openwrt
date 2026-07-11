@@ -2521,6 +2521,18 @@ static void rtl930x_lag_entry_set(u32 w[3], int lsp, int len, u32 val)
 			w[2 - ((lsp + i) >> 5)] |= BIT((lsp + i) & 0x1f);
 }
 
+/* Bit offset of each 6 bit TRK_PORTn field in the 96 bit LAG entry. The
+ * {port,dev} slots do not straddle the 32 bit word boundaries, so there
+ * are 2 bit reserved gaps at bits 30-31 and 62-63 - slots 0-2 sit at
+ * 10n, slots 3-5 at 10n+2, slots 6-7 at 10n+4. Encoding them at a flat
+ * 10n stride (the previous bug) shifted every port field into the
+ * neighbouring dev field, so the ASIC saw bogus remote-device egress
+ * candidates and could not distribute.
+ */
+static const u8 rtl930x_lag_trk_port_lsp[8] = {
+	0, 10, 20, 32, 42, 52, 64, 74,
+};
+
 /* Program the egress candidate list of a trunk (LAG table): NUM_TX_CANDI
  * members, each a {devID, port} pair the TX hash result indexes into.
  * Without this the hash selects from an empty list and unicast towards
@@ -2540,13 +2552,13 @@ static void rtl930x_trunk_egr_ports_set(int group, u64 members)
 
 	for (int p = 0; p < RTL930X_CPU_PORT && n < 8; p++) {
 		if (members & BIT_ULL(p)) {
-			/* TRK_PORTn at bit 10n+4, TRK_DEVn (0) at 10n+10 */
-			rtl930x_lag_entry_set(w, 10 * n + 4, 6, p);
+			/* TRK_PORTn at its slot offset, TRK_DEVn (0) above it */
+			rtl930x_lag_entry_set(w, rtl930x_lag_trk_port_lsp[n], 6, p);
 			n++;
 		}
 	}
 	for (int s = n; s < 8; s++)
-		rtl930x_lag_entry_set(w, 10 * s + 4, 6, 0x3f);
+		rtl930x_lag_entry_set(w, rtl930x_lag_trk_port_lsp[s], 6, 0x3f);
 
 	rtl930x_lag_entry_set(w, 89, 4, n);	/* NUM_TX_CANDI */
 
