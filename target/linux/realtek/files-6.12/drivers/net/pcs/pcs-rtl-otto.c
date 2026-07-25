@@ -135,6 +135,7 @@ struct rtpcs_serdes {
 	u8 id;
 	enum rtpcs_sds_mode mode;
 	bool first_start;
+	phy_interface_t configured_mode;
 
 	bool rx_pol_inv;
 	bool tx_pol_inv;
@@ -2953,11 +2954,17 @@ static int rtpcs_pcs_config(struct phylink_pcs *pcs, unsigned int neg_mode,
 	mutex_lock(&ctrl->lock);
 
 	if (ctrl->cfg->setup_serdes) {
-		ret = ctrl->cfg->setup_serdes(link->sds, interface);
-		if (ret < 0)
-			goto out;
+		if (interface == link->sds->configured_mode) {
+			dev_dbg(ctrl->dev, "sds %d already in mode %s, no change\n",
+				link->sds->id, phy_modes(interface));
+		} else {
+			ret = ctrl->cfg->setup_serdes(link->sds, interface);
+			if (ret < 0)
+				goto out;
 
-		link->sds->first_start = false;
+			link->sds->first_start = false;
+			link->sds->configured_mode = interface;
+		}
 	}
 
 	if (ctrl->cfg->set_autoneg) {
