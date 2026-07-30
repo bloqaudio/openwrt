@@ -6,6 +6,7 @@
 #include <linux/cacheflush.h>
 #include <linux/dma-mapping.h>
 #include <linux/etherdevice.h>
+#include <linux/if_vlan.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/platform_device.h>
@@ -49,6 +50,12 @@ int rtl83xx_setup_tc(struct net_device *dev, enum tc_setup_type type, void *type
 #define TX_DO		0x2
 #define WRAP		0x2
 #define RING_BUFFER	1600
+/* RX (and TX) ring buffers are fixed at RING_BUFFER bytes, one buffer per
+ * descriptor, so a frame must fit into a single buffer. Until scatter-gather
+ * RX or sized buffers land, the interface MTU must stay within that limit.
+ */
+#define RTETH_FRAME_OVERHEAD	(ETH_HLEN + 2 * VLAN_HLEN + ETH_FCS_LEN)
+#define RTETH_MAX_MTU		(RING_BUFFER - RTETH_FRAME_OVERHEAD)
 
 struct p_hdr {
 	u8	*buf;
@@ -1708,7 +1715,7 @@ static int rtl838x_eth_probe(struct platform_device *pdev)
 
 	dev->ethtool_ops = &rtl838x_ethtool_ops;
 	dev->min_mtu = ETH_ZLEN;
-	dev->max_mtu = DEFAULT_MTU;
+	dev->max_mtu = RTETH_MAX_MTU;
 	dev->features = NETIF_F_RXCSUM | NETIF_F_HW_CSUM;
 	dev->hw_features = NETIF_F_RXCSUM;
 
