@@ -1325,6 +1325,7 @@ struct rtl838x_switch_priv {
 	unsigned long mc_group_bm[MAX_MC_GROUPS >> 5];
 	int n_pie_blocks;
 	struct rhashtable tc_ht;
+	bool tc_ht_initialized;
 	unsigned long pie_use_bm[MAX_PIE_ENTRIES >> 5];
 	int n_counters;
 	unsigned long octet_cntr_use_bm[MAX_COUNTERS >> 5];

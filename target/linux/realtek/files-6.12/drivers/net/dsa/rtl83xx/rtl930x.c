@@ -1981,6 +1981,16 @@ static int rtl930x_pie_verify_template(struct rtl838x_switch_priv *priv,
 	if (pr->dport_m && !rtl930x_pie_templ_has(t, TEMPLATE_FIELD_L4_DPORT))
 		return -1;
 
+	/* Same for the source port mask used to scope per-port rules:
+	 * without the SPM fields the rule would match on all ports.
+	 * SPM0 covers ports 0-15, SPM1 ports 16-31.
+	 */
+	if ((pr->spm_m & 0xffff) && !rtl930x_pie_templ_has(t, TEMPLATE_FIELD_SPM0))
+		return -1;
+
+	if ((pr->spm_m >> 16) && !rtl930x_pie_templ_has(t, TEMPLATE_FIELD_SPM1))
+		return -1;
+
 	/* TODO: Check more */
 
 	i = find_first_zero_bit(&priv->pie_use_bm[block * 4], PIE_BLOCK_SIZE);

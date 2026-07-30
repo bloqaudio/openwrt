@@ -3097,13 +3097,16 @@ static int rtldsa_cls_flower_add(struct dsa_switch *ds, int port,
 	const struct flow_action_entry *act;
 	int ret;
 
-	if (!priv->r->port_rate_police_add)
-		return -EOPNOTSUPP;
-
-	/* the single action must be a rate/bandwidth limiter */
+	/* A simple rate/bandwidth limiter goes to the port policers */
 	act = rtldsa_rate_policy_extract(cls);
+	if (!rtldsa_port_rate_police_validate(act)) {
+		/* Anything else is handled by the PIE flower engine,
+		 * scoped to the port the rule was added on.
+		 */
+		return rtl83xx_port_cls_flower_add(priv, port, cls, ingress);
+	}
 
-	if (!rtldsa_port_rate_police_validate(act))
+	if (!priv->r->port_rate_police_add)
 		return -EOPNOTSUPP;
 
 	mutex_lock(&priv->reg_mutex);
@@ -3142,6 +3145,13 @@ static int rtldsa_cls_flower_del(struct dsa_switch *ds, int port,
 	struct rtl838x_port *p = &priv->ports[port];
 	int ret;
 
+	/* PIE flower rules are keyed by cookie; if the cookie is known
+	 * there, this is not a police rule.
+	 */
+	ret = rtl83xx_port_cls_flower_del(priv, port, cls, ingress);
+	if (ret != -ENOENT)
+		return ret;
+
 	if (!priv->r->port_rate_police_del)
 		return -EOPNOTSUPP;
 
@@ -3160,6 +3170,15 @@ unlock:
 	mutex_unlock(&priv->reg_mutex);
 
 	return ret;
+}
+
+static int rtldsa_cls_flower_stats(struct dsa_switch *ds, int port,
+				   struct flow_cls_offload *cls,
+				   bool ingress)
+{
+	struct rtl838x_switch_priv *priv = ds->priv;
+
+	return rtl83xx_port_cls_flower_stats(priv, cls);
 }
 
 const struct dsa_switch_ops rtl83xx_switch_ops = {
@@ -3282,4 +3301,5 @@ const struct dsa_switch_ops rtl93xx_switch_ops = {
 
 	.cls_flower_add		= rtldsa_cls_flower_add,
 	.cls_flower_del		= rtldsa_cls_flower_del,
+	.cls_flower_stats	= rtldsa_cls_flower_stats,
 };

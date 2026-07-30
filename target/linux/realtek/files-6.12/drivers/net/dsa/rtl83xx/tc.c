@@ -247,7 +247,28 @@ static const struct rhashtable_params tc_ht_params = {
 	.automatic_shrinking = true,
 };
 
-static int rtl83xx_configure_flower(struct rtl838x_switch_priv *priv,
+/* Idempotent initializer for the flow hashtable, shared by the conduit
+ * ndo_setup_tc path and the DSA per-port cls_flower path.
+ */
+static int rtl83xx_tc_init(struct rtl838x_switch_priv *priv)
+{
+	int err;
+
+	if (priv->tc_ht_initialized)
+		return 0;
+
+	err = rhashtable_init(&priv->tc_ht, &tc_ht_params);
+	if (err) {
+		pr_err("%s: Could not initialize hash table\n", __func__);
+		return err;
+	}
+
+	priv->tc_ht_initialized = true;
+
+	return 0;
+}
+
+static int rtl83xx_configure_flower(struct rtl838x_switch_priv *priv, int port,
 				    struct flow_cls_offload *f)
 {
 	struct rtl83xx_flow *flow;
@@ -288,6 +309,14 @@ rcu_unlock:
 	err = rtl83xx_add_flow(priv, f, flow);
 	if (err)
 		goto out_remove;
+
+	/* Rules added on a DSA port must only match traffic ingressing on
+	 * that port; the conduit path (port < 0) stays global.
+	 */
+	if (port >= 0) {
+		flow->rule.spm = BIT_ULL(port);
+		flow->rule.spm_m = BIT_ULL(port);
+	}
 
 	/* Add log action to flow */
 	flow->rule.packet_cntr = rtl83xx_packet_cntr_alloc(priv);
@@ -369,7 +398,7 @@ static int rtl83xx_setup_tc_cls_flower(struct rtl838x_switch_priv *priv,
 	pr_debug("%s: %d\n", __func__, cls_flower->command);
 	switch (cls_flower->command) {
 	case FLOW_CLS_REPLACE:
-		return rtl83xx_configure_flower(priv, cls_flower);
+		return rtl83xx_configure_flower(priv, -1, cls_flower);
 	case FLOW_CLS_DESTROY:
 		return rtl83xx_delete_flower(priv, cls_flower);
 	case FLOW_CLS_STATS:
@@ -399,7 +428,6 @@ int rtl83xx_setup_tc(struct net_device *dev, enum tc_setup_type type, void *type
 {
 	struct rtl838x_switch_priv *priv;
 	struct flow_block_offload *f = type_data;
-	static bool first_time = true;
 	int err;
 
 	pr_debug("%s: %d\n", __func__, type);
@@ -412,12 +440,9 @@ int rtl83xx_setup_tc(struct net_device *dev, enum tc_setup_type type, void *type
 
 	switch (type) {
 	case TC_SETUP_BLOCK:
-		if (first_time) {
-			first_time = false;
-			err = rhashtable_init(&priv->tc_ht, &tc_ht_params);
-			if (err)
-				pr_err("%s: Could not initialize hash table\n", __func__);
-		}
+		err = rtl83xx_tc_init(priv);
+		if (err)
+			return err;
 
 		f->unlocked_driver_cb = true;
 		return flow_block_cb_setup_simple(type_data,
@@ -429,4 +454,56 @@ int rtl83xx_setup_tc(struct net_device *dev, enum tc_setup_type type, void *type
 	}
 
 	return 0;
+}
+
+/* DSA per-port cls_flower entry points. Rules installed here are scoped to
+ * the ingress port they were added on via the PIE source-port-mask template
+ * fields, unlike the conduit path above which programs global rules.
+ */
+int rtl83xx_port_cls_flower_add(struct rtl838x_switch_priv *priv, int port,
+				struct flow_cls_offload *cls, bool ingress)
+{
+	int err;
+
+	if (!priv->r->pie_rule_add)
+		return -EOPNOTSUPP;
+
+	/* Only ingress rules are supported through the PIE engine so far */
+	if (!ingress)
+		return -EOPNOTSUPP;
+
+	if (cls->command != FLOW_CLS_REPLACE)
+		return -EOPNOTSUPP;
+
+	err = rtl83xx_tc_init(priv);
+	if (err)
+		return err;
+
+	return rtl83xx_configure_flower(priv, port, cls);
+}
+
+int rtl83xx_port_cls_flower_del(struct rtl838x_switch_priv *priv, int port,
+				struct flow_cls_offload *cls, bool ingress)
+{
+	struct rtl83xx_flow *flow;
+
+	if (!priv->tc_ht_initialized)
+		return -ENOENT;
+
+	rcu_read_lock();
+	flow = rhashtable_lookup_fast(&priv->tc_ht, &cls->cookie, tc_ht_params);
+	rcu_read_unlock();
+	if (!flow)
+		return -ENOENT;
+
+	return rtl83xx_delete_flower(priv, cls);
+}
+
+int rtl83xx_port_cls_flower_stats(struct rtl838x_switch_priv *priv,
+				  struct flow_cls_offload *cls)
+{
+	if (!priv->tc_ht_initialized)
+		return -ENOENT;
+
+	return rtl83xx_stats_flower(priv, cls);
 }
