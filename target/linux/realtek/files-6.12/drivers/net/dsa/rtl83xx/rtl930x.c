@@ -406,6 +406,28 @@ static void rtldsa_930x_enable_flood(int port, bool enable)
 		    RTL930X_L2_LRN_PORT_CONSTRT_CTRL + port * 4);
 }
 
+static void rtldsa_930x_enable_mcast_flood(int port, bool enable)
+{
+	/* Unknown-multicast flooding has no global portmask register on
+	 * RTL930x: the L2, IPv4 and IPv6 masks live in the VLAN profiles
+	 * (profile entry words 2, 3 and 4). The bridge flag is per-port
+	 * while profiles are per-VLAN, so update the port bit in all 8
+	 * profiles to cover every profile the port's VLANs might use.
+	 * These registers are independent of the learn-limit/action
+	 * registers used by enable_learning/enable_flood.
+	 */
+	for (int profile = 0; profile < 8; profile++)
+		for (int word = 2; word <= 4; word++)
+			sw_w32_mask(BIT(port), enable ? BIT(port) : 0,
+				    RTL930X_VLAN_PROFILE_SET(profile) + word * 4);
+}
+
+static void rtldsa_930x_enable_bcast_flood(int port, bool enable)
+{
+	sw_w32_mask(BIT(port), enable ? BIT(port) : 0,
+		    RTL930X_L2_BC_FLD_PMSK);
+}
+
 static void rtl930x_stp_get(struct rtl838x_switch_priv *priv, u16 msti, u32 port_state[])
 {
 	u32 cmd = 1 << 17 | /* Execute cmd */
@@ -2923,6 +2945,8 @@ const struct rtl838x_reg rtl930x_reg = {
 	.led_init = rtl930x_led_init,
 	.enable_learning = rtldsa_930x_enable_learning,
 	.enable_flood = rtldsa_930x_enable_flood,
+	.enable_mcast_flood = rtldsa_930x_enable_mcast_flood,
+	.enable_bcast_flood = rtldsa_930x_enable_bcast_flood,
 	.set_receive_management_action = rtldsa_930x_set_receive_management_action,
 	.qos_init = rtldsa_930x_qos_init,
 };
