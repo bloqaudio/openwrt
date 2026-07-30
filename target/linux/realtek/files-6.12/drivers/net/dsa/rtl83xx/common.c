@@ -1686,9 +1686,13 @@ static int rtl83xx_fib_event(struct notifier_block *this, unsigned long event, v
 	struct rtl838x_switch_priv *priv;
 	struct rtl83xx_fib_event_work *fib_work;
 
-	if ((info->family != AF_INET && info->family != AF_INET6 &&
-	     info->family != RTNL_FAMILY_IPMR &&
-	     info->family != RTNL_FAMILY_IP6MR))
+	/* Only admit IPv4/IPv6 unicast FIB events. Multicast routing events
+	 * (RTNL_FAMILY_IPMR/IP6MR) carry a different notifier info layout;
+	 * letting them through would run the fib4/fib6 paths on zeroed or
+	 * mismatched data (NULL fib_info deref) until real IPMR support
+	 * exists.
+	 */
+	if (info->family != AF_INET && info->family != AF_INET6)
 		return NOTIFY_DONE;
 
 	priv = container_of(this, struct rtl838x_switch_priv, fib_nb);
