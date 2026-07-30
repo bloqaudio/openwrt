@@ -2891,7 +2891,9 @@ static bool rtl83xx_lag_can_offload(struct dsa_switch *ds,
 	if (info->tx_type != NETDEV_LAG_TX_TYPE_HASH)
 		return false;
 
-	if (info->hash_type != NETDEV_LAG_HASH_L2 && info->hash_type != NETDEV_LAG_HASH_L23)
+	if (info->hash_type != NETDEV_LAG_HASH_L2 &&
+	    info->hash_type != NETDEV_LAG_HASH_L23 &&
+	    info->hash_type != NETDEV_LAG_HASH_L34)
 		return false;
 
 	return true;
