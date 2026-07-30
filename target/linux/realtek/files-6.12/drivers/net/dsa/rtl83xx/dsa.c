@@ -2160,6 +2160,8 @@ static int rtl83xx_vlan_add(struct dsa_switch *ds, int port,
 {
 	struct rtl838x_vlan_info info;
 	struct rtl838x_switch_priv *priv = ds->priv;
+	struct net_device *bridge_dev;
+	u16 proto;
 	int err;
 
 	pr_debug("%s port %d, vid %d, flags %x\n",
@@ -2172,6 +2174,18 @@ static int rtl83xx_vlan_add(struct dsa_switch *ds, int port,
 	if (vlan->vid > 4095) {
 		dev_err(priv->dev, "VLAN out of range: %d", vlan->vid);
 		return -ENOTSUPP;
+	}
+
+	/* 802.1ad (QinQ) is not supported yet. Reject it explicitly:
+	 * programming an 802.1ad bridge VLAN as 802.1Q without an error
+	 * would silently misconfigure the network. The switchdev VLAN
+	 * object does not carry the protocol, so ask the bridge.
+	 */
+	bridge_dev = dsa_port_bridge_dev_get(dsa_to_port(ds, port));
+	if (bridge_dev && !br_vlan_get_proto(bridge_dev, &proto) &&
+	    proto != ETH_P_8021Q) {
+		NL_SET_ERR_MSG_MOD(extack, "802.1ad QinQ is not supported");
+		return -EOPNOTSUPP;
 	}
 
 	if (priv->r->host_route_write &&
