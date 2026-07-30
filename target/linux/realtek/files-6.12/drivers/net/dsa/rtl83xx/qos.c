@@ -365,8 +365,8 @@ static void rtl839x_config_qos(struct rtl838x_switch_priv *priv)
 	 */
 	for (int q = 0; q < 8; q++) {
 		sw_w32(255 << 24 | 78 << 12 | 68, RTL839X_WRED_QUEUE_THR_CTRL(q, 0));
-		sw_w32(255 << 24 | 74 << 12 | 64, RTL839X_WRED_QUEUE_THR_CTRL(q, 0));
-		sw_w32(255 << 24 | 70 << 12 | 60, RTL839X_WRED_QUEUE_THR_CTRL(q, 0));
+		sw_w32(255 << 24 | 74 << 12 | 64, RTL839X_WRED_QUEUE_THR_CTRL(q, 1));
+		sw_w32(255 << 24 | 70 << 12 | 60, RTL839X_WRED_QUEUE_THR_CTRL(q, 2));
 	}
 }
 
