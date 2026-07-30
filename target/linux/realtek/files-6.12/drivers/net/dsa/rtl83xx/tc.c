@@ -147,7 +147,9 @@ static int rtl83xx_add_flow(struct rtl838x_switch_priv *priv, struct flow_cls_of
 
 	pr_debug("%s\n", __func__);
 
-	rtl83xx_parse_flow_rule(priv, rule, flow);
+	err = rtl83xx_parse_flow_rule(priv, rule, flow);
+	if (err)
+		return err;
 
 	flow_action_for_each(i, act, &rule->action) {
 		switch (act->id) {
@@ -269,7 +271,9 @@ rcu_unlock:
 		goto out_free;
 	}
 
-	rtl83xx_add_flow(priv, f, flow); /* TODO: check error */
+	err = rtl83xx_add_flow(priv, f, flow);
+	if (err)
+		goto out_remove;
 
 	/* Add log action to flow */
 	flow->rule.packet_cntr = rtl83xx_packet_cntr_alloc(priv);
@@ -280,8 +284,13 @@ rcu_unlock:
 	}
 
 	err = priv->r->pie_rule_add(priv, &flow->rule);
-	return err;
+	if (err)
+		goto out_remove;
 
+	return 0;
+
+out_remove:
+	rhashtable_remove_fast(&priv->tc_ht, &flow->node, tc_ht_params);
 out_free:
 	kfree(flow);
 out:
