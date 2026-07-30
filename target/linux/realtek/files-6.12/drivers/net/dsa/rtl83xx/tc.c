@@ -61,8 +61,6 @@ static int rtl83xx_parse_flow_rule(struct rtl838x_switch_priv *priv,
 				flow->rule.frame_type_l4 = 1;
 			if (match.key->ip_proto == IPPROTO_ICMP || match.key->ip_proto == IPPROTO_ICMPV6)
 				flow->rule.frame_type_l4 = 2;
-			if (match.key->ip_proto == IPPROTO_TCP)
-				flow->rule.frame_type_l4 = 3;
 			if ((match.key->ip_proto == IPPROTO_UDP) || flow->rule.frame_type_l4)
 				flow->rule.frame_type_l4_m = 7;
 		}
