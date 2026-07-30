@@ -25,6 +25,22 @@ static int rtl83xx_parse_flow_rule(struct rtl838x_switch_priv *priv,
 		return -EOPNOTSUPP;
 	}
 
+	/* Reject rules with match keys we cannot program into the PIE
+	 * template. Silently ignoring them would install a rule that
+	 * matches more traffic than userspace asked for.
+	 */
+	if (dissector->used_keys & ~(BIT_ULL(FLOW_DISSECTOR_KEY_CONTROL) |
+				     BIT_ULL(FLOW_DISSECTOR_KEY_BASIC) |
+				     BIT_ULL(FLOW_DISSECTOR_KEY_ETH_ADDRS) |
+				     BIT_ULL(FLOW_DISSECTOR_KEY_VLAN) |
+				     BIT_ULL(FLOW_DISSECTOR_KEY_IPV4_ADDRS) |
+				     BIT_ULL(FLOW_DISSECTOR_KEY_IPV6_ADDRS) |
+				     BIT_ULL(FLOW_DISSECTOR_KEY_PORTS))) {
+		pr_err("Unsupported TC match keys: used_keys = 0x%llx\n",
+		       dissector->used_keys);
+		return -EOPNOTSUPP;
+	}
+
 	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_BASIC)) {
 		struct flow_match_basic match;
 
