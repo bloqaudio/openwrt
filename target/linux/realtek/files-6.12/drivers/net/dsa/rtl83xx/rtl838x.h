@@ -3,6 +3,8 @@
 #ifndef _RTL838X_H
 #define _RTL838X_H
 
+#include <linux/etherdevice.h>
+#include <linux/if_vlan.h>
 #include <net/dsa.h>
 
 /* Register definition */
@@ -13,6 +15,23 @@
 
 #define RTL930X_MAC_L2_PORT_CTRL(port)		(0x3268 + (((port) << 6)))
 #define RTL931X_MAC_L2_PORT_CTRL		(0x6000)
+
+/* Maximum accepted frame length, one register per port (Longan):
+ * bit 28: count VLAN tag bytes towards the limit
+ * bits 27:14: limit when linked at 10M/100M
+ * bits 13:0:  limit when linked at 1G/2.5G/5G/10G
+ * Measured on RTL9303 rev B: resets to 12288 in both speed fields with
+ * the global IOL max-len check disabled (MAC_L2_GLOBAL_CTRL0 bit 15 = 0),
+ * which is how the stock firmware passes 12 KB frames without ever
+ * writing these registers.
+ */
+#define RTL930X_MAC_L2_PORT_MAX_LEN_CTRL(port)	(0x326C + (((port) << 6)))
+
+/* Silicon maximum frame length (Longan capacity: 12 KB) */
+#define RTL930X_MAX_FRAME_LEN			12288
+
+/* Header + up to two VLAN tags + FCS, counted towards the frame limit */
+#define RTL83XX_FRAME_OVERHEAD			(ETH_HLEN + 2 * VLAN_HLEN + ETH_FCS_LEN)
 
 #define RTL838X_RST_GLB_CTRL_0			(0x003c)
 
@@ -1355,6 +1374,7 @@ struct rtl838x_switch_priv {
 void rtl838x_dbgfs_init(struct rtl838x_switch_priv *priv);
 void rtl930x_dbgfs_init(struct rtl838x_switch_priv *priv);
 void rtl930x_storm_control_init(struct rtl838x_switch_priv *priv);
+void rtl930x_port_max_frame_set(int port, int frame_len);
 
 void rtldsa_counters_lock_register(struct rtl838x_switch_priv *priv, int port)
 	__acquires(&priv->ports[port].counters.lock);

@@ -691,6 +691,28 @@ static int rtl93xx_setup(struct dsa_switch *ds)
 	return 0;
 }
 
+static int rtldsa_93xx_port_change_mtu(struct dsa_switch *ds, int port, int new_mtu)
+{
+	struct rtl838x_switch_priv *priv = ds->priv;
+
+	if (priv->family_id != RTL9300_FAMILY_ID)
+		return -EOPNOTSUPP;
+
+	rtl930x_port_max_frame_set(port, new_mtu + RTL83XX_FRAME_OVERHEAD);
+
+	return 0;
+}
+
+static int rtldsa_93xx_port_max_mtu(struct dsa_switch *ds, int port)
+{
+	struct rtl838x_switch_priv *priv = ds->priv;
+
+	if (priv->family_id != RTL9300_FAMILY_ID)
+		return ETH_DATA_LEN;
+
+	return RTL930X_MAX_FRAME_LEN - RTL83XX_FRAME_OVERHEAD;
+}
+
 static struct phylink_pcs *rtldsa_phylink_mac_select_pcs(struct dsa_switch *ds,
 							 int port,
 							 phy_interface_t interface)
@@ -3291,6 +3313,9 @@ const struct dsa_switch_ops rtl93xx_switch_ops = {
 
 	.port_mirror_add	= rtldsa_port_mirror_add,
 	.port_mirror_del	= rtldsa_port_mirror_del,
+
+	.port_change_mtu	= rtldsa_93xx_port_change_mtu,
+	.port_max_mtu		= rtldsa_93xx_port_max_mtu,
 
 	.port_lag_change	= rtl83xx_port_lag_change,
 	.port_lag_join		= rtl83xx_port_lag_join,

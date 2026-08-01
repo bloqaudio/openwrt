@@ -2863,6 +2863,23 @@ void rtl930x_storm_control_init(struct rtl838x_switch_priv *priv)
 	sw_w32(port_mask, RTL930X_STORM_PORT_BC_EXCEED);
 }
 
+/* Program the maximum accepted frame length of a port with a field-level
+ * read-modify-write of both link-speed fields, preserving all other bits
+ * (TAG_INC, reserved). This is the vendor firmware's jumbo-frame sequence
+ * (KT-NOS: ski.ko rsd_switch_maxFrameSize_set() ->
+ * rtk_switch_portMaxPktLenLinkSpeed_set() for both speed types,
+ * dal_longan_switch.c). The global IOL_MAX_LEN_EN check is deliberately
+ * left alone: on RTL9303 rev B it resets to disabled with all ports
+ * permitting 12 KB, which is how the stock firmware passes jumbo without
+ * ever writing these registers.
+ */
+void rtl930x_port_max_frame_set(int port, int frame_len)
+{
+	frame_len = min(frame_len, RTL930X_MAX_FRAME_LEN);
+	sw_w32_mask(0x0fffffff, (frame_len << 14) | frame_len,
+		    RTL930X_MAC_L2_PORT_MAX_LEN_CTRL(port));
+}
+
 const struct rtl838x_reg rtl930x_reg = {
 	.mask_port_reg_be = rtl838x_mask_port_reg,
 	.set_port_reg_be = rtl838x_set_port_reg,
