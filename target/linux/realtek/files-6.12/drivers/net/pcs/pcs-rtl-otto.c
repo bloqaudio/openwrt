@@ -896,9 +896,10 @@ static int rtpcs_930x_sds_init_state_machine(struct rtpcs_serdes *sds,
 	return ret;
 }
 
-static void rtpcs_930x_sds_force_mode(struct rtpcs_serdes *sds,
-				      phy_interface_t interface)
+static int rtpcs_930x_sds_force_mode(struct rtpcs_serdes *sds,
+				     phy_interface_t interface)
 {
+	int ret = 0;
 	int mode;
 
 	/*
@@ -927,32 +928,40 @@ static void rtpcs_930x_sds_force_mode(struct rtpcs_serdes *sds,
 	default:
 		pr_err("%s: SDS %d does not support %s\n", __func__,
 		       sds->id, phy_modes(interface));
-		return;
+		return -EINVAL;
 	}
 
 	rtpcs_930x_sds_set_power(sds, false);
 	rtpcs_930x_sds_set_internal_mode(sds, RTL930X_SDS_OFF);
 	if (interface == PHY_INTERFACE_MODE_NA)
-		return;
+		return 0;
 
-	if (rtpcs_930x_sds_config_pll(sds, interface))
+	if (rtpcs_930x_sds_config_pll(sds, interface)) {
 		pr_err("%s: SDS %d could not configure PLL for %s\n", __func__,
 		       sds->id, phy_modes(interface));
+		ret = -EIO;
+	}
 
 	rtpcs_930x_sds_set_internal_mode(sds, mode);
-	if (rtpcs_930x_sds_wait_clock_ready(sds))
+	if (rtpcs_930x_sds_wait_clock_ready(sds)) {
 		pr_err("%s: SDS %d could not sync clock\n", __func__, sds->id);
+		ret = -EIO;
+	}
 
-	if (rtpcs_930x_sds_init_state_machine(sds, interface))
+	if (rtpcs_930x_sds_init_state_machine(sds, interface)) {
 		pr_err("%s: SDS %d could not reset state machine\n", __func__,
 		       sds->id);
+		ret = -EIO;
+	}
 
 	rtpcs_930x_sds_set_power(sds, true);
 	rtpcs_930x_sds_rx_reset(sds, interface);
+
+	return ret;
 }
 
-static void rtpcs_930x_sds_mode_set(struct rtpcs_serdes *sds,
-				    phy_interface_t phy_mode)
+static int rtpcs_930x_sds_mode_set(struct rtpcs_serdes *sds,
+				   phy_interface_t phy_mode)
 {
 	u32 mode;
 	u32 submode;
@@ -962,15 +971,14 @@ static void rtpcs_930x_sds_mode_set(struct rtpcs_serdes *sds,
 	case PHY_INTERFACE_MODE_1000BASEX:
 	case PHY_INTERFACE_MODE_2500BASEX:
 	case PHY_INTERFACE_MODE_10GBASER:
-		rtpcs_930x_sds_force_mode(sds, phy_mode);
-		return;
+		return rtpcs_930x_sds_force_mode(sds, phy_mode);
 	case PHY_INTERFACE_MODE_10G_QXGMII:
 		mode = RTL930X_SDS_MODE_USXGMII;
 		submode = RTL930X_SDS_SUBMODE_USXGMII_QX;
 		break;
 	default:
 		pr_warn("%s: unsupported mode %s\n", __func__, phy_modes(phy_mode));
-		return;
+		return -EINVAL;
 	}
 
 	/* SerDes off first. */
@@ -982,6 +990,8 @@ static void rtpcs_930x_sds_mode_set(struct rtpcs_serdes *sds,
 	/* Set the submode if needed. */
 	if (phy_mode == PHY_INTERFACE_MODE_10G_QXGMII)
 		rtpcs_930x_sds_submode_set(sds, submode);
+
+	return 0;
 }
 
 static void rtpcs_930x_sds_tx_config(struct rtpcs_serdes *sds,
@@ -2226,6 +2236,8 @@ static int rtpcs_930x_setup_serdes(struct rtpcs_serdes *sds,
 				   phy_interface_t phy_mode)
 {
 	int calib_tries = 0;
+	bool calib_ok;
+	int ret;
 
 	/* Rely on setup from U-boot for some modes, e.g. USXGMII */
 	switch (phy_mode) {
@@ -2257,7 +2269,7 @@ static int rtpcs_930x_setup_serdes(struct rtpcs_serdes *sds,
 	rtpcs_930x_sds_set_polarity(sds, sds->tx_pol_inv, sds->rx_pol_inv);
 
 	/* Enable SDS in desired mode */
-	rtpcs_930x_sds_mode_set(sds, phy_mode);
+	ret = rtpcs_930x_sds_mode_set(sds, phy_mode);
 
 	/* Enable Fiber RX */
 	rtpcs_sds_write_bits(sds, 0x20, 2, 12, 12, 0);
@@ -2268,14 +2280,17 @@ static int rtpcs_930x_setup_serdes(struct rtpcs_serdes *sds,
 		rtpcs_930x_sds_do_rx_calibration(sds, phy_mode);
 		calib_tries++;
 		mdelay(50);
-	} while (rtpcs_930x_sds_check_calibration(sds, phy_mode) && calib_tries < 3);
-	if (calib_tries >= 3)
+		calib_ok = !rtpcs_930x_sds_check_calibration(sds, phy_mode);
+	} while (!calib_ok && calib_tries < 3);
+	if (!calib_ok) {
 		pr_warn("%s: SerDes RX calibration failed\n", __func__);
+		ret = -EIO;
+	}
 
 	/* Leave loopback mode */
 	rtpcs_930x_sds_tx_config(sds, phy_mode);
 
-	return 0;
+	return ret;
 }
 
 /* RTL931X */
