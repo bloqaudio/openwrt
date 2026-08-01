@@ -50,12 +50,24 @@ int rtl83xx_setup_tc(struct net_device *dev, enum tc_setup_type type, void *type
 #define TX_DO		0x2
 #define WRAP		0x2
 #define RING_BUFFER	1600
-/* RX (and TX) ring buffers are fixed at RING_BUFFER bytes, one buffer per
- * descriptor, so a frame must fit into a single buffer. Until scatter-gather
- * RX or sized buffers land, the interface MTU must stay within that limit.
+/* Frame overhead counted against a ring buffer: header + up to two VLAN
+ * tags + FCS.
  */
 #define RTETH_FRAME_OVERHEAD	(ETH_HLEN + 2 * VLAN_HLEN + ETH_FCS_LEN)
-#define RTETH_MAX_MTU		(RING_BUFFER - RTETH_FRAME_OVERHEAD)
+/* On RTL9300 the CPU port must handle full-size jumbo frames: the DSA
+ * conduit MTU follows the largest user-port MTU and the silicon accepts
+ * frames up to 12 KB. RX/TX uses one buffer per descriptor and a frame
+ * must fit into a single buffer, so size the buffers for the maximum
+ * frame and shrink the ring depths to keep the coherent DMA memory
+ * footprint close to the previous ~4.2 MiB on this 128 MB board:
+ *   RX: 32 rings x 12 x 12304 = 4.51 MiB (was 32 x 75 x 1600 = 3.66 MiB)
+ *   TX:  2 rings x 20 x 12304 = 0.47 MiB (was  2 x 160 x 1600 = 0.49 MiB,
+ *        still fits the fixed 500 KiB tx_space in struct ring_b)
+ * Total delta: +0.83 MiB of coherent memory.
+ */
+#define RTL930X_RING_BUFFER	12304
+#define RTL930X_RXRINGLEN	12
+#define RTL930X_TXRINGLEN	20
 
 struct p_hdr {
 	u8	*buf;
@@ -207,6 +219,8 @@ struct rtl838x_eth_priv {
 	u32 lastEvent;
 	u16 rxrings;
 	u16 rxringlen;
+	u16 txringlen;
+	u32 ring_buffer;
 };
 
 /* On the RTL93XX, the RTL93XX_DMA_IF_RX_RING_CNTR track the fill level of
@@ -706,8 +720,11 @@ static void rtl839x_hw_en_rxtx(struct rtl838x_eth_priv *priv)
 
 static void rtl93xx_hw_en_rxtx(struct rtl838x_eth_priv *priv)
 {
-	/* Setup CPU-Port: RX Buffer truncated at DEFAULT_MTU Bytes */
-	sw_w32((DEFAULT_MTU << 16) | RX_TRUNCATE_EN_93XX, priv->r->dma_if_ctrl);
+	/* Setup CPU-Port: truncate RX frames at the ring buffer size. The
+	 * buffer is sized to hold any frame the ASIC accepts, so this only
+	 * guards against buffer overruns, never against valid frames.
+	 */
+	sw_w32((priv->ring_buffer << 16) | RX_TRUNCATE_EN_93XX, priv->r->dma_if_ctrl);
 
 	for (int i = 0; i < priv->rxrings; i++) {
 		int cnt = min(priv->rxringlen - 2, 0x3ff);
@@ -753,9 +770,9 @@ static void rtl838x_setup_ring_buffer(struct rtl838x_eth_priv *priv, struct ring
 			h = &ring->rx_header[i][j];
 			memset(h, 0, sizeof(struct p_hdr));
 			h->buf = (u8 *)KSEG1ADDR(ring->rx_space +
-						 i * priv->rxringlen * RING_BUFFER +
-						 j * RING_BUFFER);
-			h->size = RING_BUFFER;
+						 i * priv->rxringlen * priv->ring_buffer +
+						 j * priv->ring_buffer);
+			h->size = priv->ring_buffer;
 			/* All rings owned by switch, last one wraps */
 			ring->rx_r[i][j] = KSEG1ADDR(h) | 1 | (j == (priv->rxringlen - 1) ?
 					   WRAP :
@@ -768,13 +785,13 @@ static void rtl838x_setup_ring_buffer(struct rtl838x_eth_priv *priv, struct ring
 		struct p_hdr *h;
 		int j;
 
-		for (j = 0; j < TXRINGLEN; j++) {
+		for (j = 0; j < priv->txringlen; j++) {
 			h = &ring->tx_header[i][j];
 			memset(h, 0, sizeof(struct p_hdr));
 			h->buf = (u8 *)KSEG1ADDR(ring->tx_space +
-						 i * TXRINGLEN * RING_BUFFER +
-						 j * RING_BUFFER);
-			h->size = RING_BUFFER;
+						 i * priv->txringlen * priv->ring_buffer +
+						 j * priv->ring_buffer);
+			h->size = priv->ring_buffer;
 			ring->tx_r[i][j] = KSEG1ADDR(&ring->tx_header[i][j]);
 		}
 		/* Last header is wrapping around */
@@ -809,7 +826,7 @@ static int rtl838x_eth_open(struct net_device *ndev)
 	struct ring_b *ring = priv->membase;
 
 	pr_debug("%s called: RX rings %d(length %d), TX rings %d(length %d)\n",
-		 __func__, priv->rxrings, priv->rxringlen, TXRINGS, TXRINGLEN);
+		 __func__, priv->rxrings, priv->rxringlen, TXRINGS, priv->txringlen);
 
 	spin_lock_irqsave(&priv->lock, flags);
 	rtl838x_hw_reset(priv);
@@ -1082,6 +1099,16 @@ static int rtl838x_eth_tx(struct sk_buff *skb, struct net_device *dev)
 		goto txdone;
 	}
 
+	/* A frame must fit into a single TX buffer */
+	if (len > priv->ring_buffer) {
+		if (net_ratelimit())
+			dev_warn(&dev->dev, "frame of %d bytes exceeds TX buffer, dropped\n", len);
+		dev->stats.tx_dropped++;
+		dev_kfree_skb(skb);
+		ret = NETDEV_TX_OK;
+		goto txdone;
+	}
+
 	/* We can send this packet if CPU owns the descriptor */
 	if (!(ring->tx_r[q][ring->c_tx[q]] & 0x1)) {
 		/* Set descriptor for tx */
@@ -1129,7 +1156,7 @@ static int rtl838x_eth_tx(struct sk_buff *skb, struct net_device *dev)
 		dev->stats.tx_packets++;
 		dev->stats.tx_bytes += len;
 		dev_kfree_skb(skb);
-		ring->c_tx[q] = (ring->c_tx[q] + 1) % TXRINGLEN;
+		ring->c_tx[q] = (ring->c_tx[q] + 1) % priv->txringlen;
 		ret = NETDEV_TX_OK;
 	} else {
 		dev_warn(&priv->pdev->dev, "Data is owned by switch\n");
@@ -1257,7 +1284,7 @@ static int rtl838x_hw_receive(struct net_device *dev, int r, int budget)
 		/* Reset header structure */
 		memset(h, 0, sizeof(struct p_hdr));
 		h->buf = data;
-		h->size = RING_BUFFER;
+		h->size = priv->ring_buffer;
 
 		ring->rx_r[r][ring->c_rx[r]] = KSEG1ADDR(h) | 0x1 | (ring->c_rx[r] == (priv->rxringlen - 1) ?
 					       WRAP :
@@ -1658,7 +1685,8 @@ static int rtl838x_eth_probe(struct platform_device *pdev)
 	phy_interface_t phy_mode;
 	struct phylink *phylink;
 	u8 mac_addr[ETH_ALEN] = {0};
-	int err = 0, rxrings, rxringlen;
+	int err = 0, rxrings, rxringlen, txringlen;
+	u32 ring_buffer = RING_BUFFER;
 	struct ring_b *ring;
 
 	pr_info("Probing RTL838X eth device pdev: %x, dev: %x\n",
@@ -1674,12 +1702,22 @@ static int rtl838x_eth_probe(struct platform_device *pdev)
 	rxrings = rxrings > MAX_RXRINGS ? MAX_RXRINGS : rxrings;
 	rxringlen = MAX_ENTRIES / rxrings;
 	rxringlen = rxringlen > MAX_RXLEN ? MAX_RXLEN : rxringlen;
+	txringlen = TXRINGLEN;
+
+	/* RTL9300: jumbo-sized ring buffers at reduced ring depths */
+	if (soc_info.family == RTL9300_FAMILY_ID) {
+		ring_buffer = RTL930X_RING_BUFFER;
+		rxringlen = RTL930X_RXRINGLEN;
+		txringlen = RTL930X_TXRINGLEN;
+	}
 
 	dev = devm_alloc_etherdev_mqs(&pdev->dev, sizeof(struct rtl838x_eth_priv), TXRINGS, rxrings);
 	if (!dev)
 		return -ENOMEM;
 	SET_NETDEV_DEV(dev, &pdev->dev);
 	priv = netdev_priv(dev);
+	priv->ring_buffer = ring_buffer;
+	priv->txringlen = txringlen;
 
 	/* obtain buffer memory space */
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
@@ -1699,7 +1737,7 @@ static int rtl838x_eth_probe(struct platform_device *pdev)
 	}
 
 	/* Allocate buffer memory */
-	priv->membase = dmam_alloc_coherent(&pdev->dev, rxrings * rxringlen * RING_BUFFER +
+	priv->membase = dmam_alloc_coherent(&pdev->dev, rxrings * rxringlen * ring_buffer +
 					    sizeof(struct ring_b) + sizeof(struct notify_b),
 					    (void *)&dev->mem_start, GFP_KERNEL);
 	if (!priv->membase) {
@@ -1715,7 +1753,7 @@ static int rtl838x_eth_probe(struct platform_device *pdev)
 
 	dev->ethtool_ops = &rtl838x_ethtool_ops;
 	dev->min_mtu = ETH_ZLEN;
-	dev->max_mtu = RTETH_MAX_MTU;
+	dev->max_mtu = ring_buffer - RTETH_FRAME_OVERHEAD;
 	dev->features = NETIF_F_RXCSUM | NETIF_F_HW_CSUM;
 	dev->hw_features = NETIF_F_RXCSUM;
 
