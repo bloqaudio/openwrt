@@ -615,6 +615,21 @@ typedef enum {
 #define RTL930X_EGBW_Q_RATE_M			GENMASK(19, 0)
 #define RTL930X_EGBW_Q_EN			BIT(20)
 #define RTL930X_EGBW_Q_BURST_M			GENMASK(15, 0)
+/* SWRED (simple WRED): per-port congestion avoidance algorithm select,
+ * one bit per port (0 = tail drop, 1 = SWRED). Thresholds and drop
+ * probability are per queue and drop precedence in units of 256-byte
+ * pages, global to the switch
+ * (SDK dal_longan_qos_portCongAvoidAlgo_set and
+ * dal_longan_qos_congAvoidGlobalQueueConfig_set).
+ */
+#define RTL930X_SWRED_PORT_CTRL			(0x7A04)
+#define RTL930X_SWRED_QUEUE_DROP_CTRL(q, dp)	(0x7A08 + ((q) * 12) + ((dp) * 4))
+#define RTL930X_SWRED_PROB_M			GENMASK(31, 24)
+#define RTL930X_SWRED_THR_MAX_M			GENMASK(23, 12)
+#define RTL930X_SWRED_THR_MIN_M			GENMASK(11, 0)
+#define RTL930X_SWRED_PAGE_BYTES		256
+#define RTL930X_SWRED_THR_MAX_PAGES		4095
+#define RTL930X_SWRED_DROP_PRECEDENCES		3
 /* port: 0-51, index: 0-7 */
 #define RTL931X_SCHED_PORT_Q_CTRL_SET0(port, index) \
 						(0x2888 + ((port) << 5) + ((index) * 4))
@@ -1421,6 +1436,9 @@ int rtl930x_qos_queue_shaper_set(struct rtl838x_switch_priv *priv, int port,
 				 int queue, u64 rate_bytes_ps, u32 burst);
 int rtl930x_qos_port_shaper_set(struct rtl838x_switch_priv *priv, int port,
 				u64 rate_bytes_ps, u32 burst);
+int rtl930x_qos_swred_set(struct rtl838x_switch_priv *priv, int port, int queue,
+			  u32 min_pages, u32 max_pages, u8 probability);
+void rtl930x_qos_swred_disable(struct rtl838x_switch_priv *priv, int port);
 
 void rtldsa_counters_lock_register(struct rtl838x_switch_priv *priv, int port)
 	__acquires(&priv->ports[port].counters.lock);

@@ -876,6 +876,67 @@ static int rtldsa_930x_tc_setup_qdisc_tbf(struct dsa_switch *ds, int port,
 	}
 }
 
+/* RED offloads onto the SWRED engine: tail drop is replaced by early
+ * drop on the offloaded queues. RED at the root applies to all eight
+ * queues of the port, RED on an ETS band to the band's queue (band b =
+ * queue 7 - b, so parent classid minor m means queue 8 - m). ECN
+ * marking cannot be offloaded, the engine only drops.
+ */
+static int rtldsa_930x_tc_setup_qdisc_red(struct dsa_switch *ds, int port,
+					  struct tc_red_qopt_offload *qopt)
+{
+	struct rtl838x_switch_priv *priv = ds->priv;
+	struct tc_red_qopt_offload_params *p = &qopt->set;
+	u32 min_pages, max_pages;
+	u8 probability;
+	int queue = -1;
+
+	if (qopt->parent != TC_H_ROOT) {
+		unsigned int minor = TC_H_MIN(qopt->parent);
+
+		if (!minor || minor > MAX_PRIOS)
+			return -EOPNOTSUPP;
+		queue = MAX_PRIOS - minor;
+	}
+
+	switch (qopt->command) {
+	case TC_RED_REPLACE:
+		break;
+	case TC_RED_DESTROY:
+		rtl930x_qos_swred_disable(priv, port);
+		return 0;
+	default:
+		return -EOPNOTSUPP;
+	}
+
+	if (p->is_ecn)
+		return -EOPNOTSUPP;
+
+	if (p->is_nodrop) {
+		rtl930x_qos_swred_disable(priv, port);
+		return 0;
+	}
+
+	if (!p->min || !p->max || p->min > p->max)
+		return -EINVAL;
+
+	/* Thresholds are programmed in units of 256-byte pages, the
+	 * 2^32 fixed-point drop probability maps onto a rate of 0-255.
+	 */
+	min_pages = DIV_ROUND_UP(p->min, RTL930X_SWRED_PAGE_BYTES);
+	max_pages = p->max / RTL930X_SWRED_PAGE_BYTES;
+	if (!min_pages || !max_pages || max_pages > RTL930X_SWRED_THR_MAX_PAGES)
+		return -EINVAL;
+
+	probability = ((u64)p->probability * 255 +
+		       BIT_ULL(32) - 1) >> 32;
+	if (!probability)
+		return -EINVAL;
+
+	return rtl930x_qos_swred_set(priv, port, queue, min_pages, max_pages,
+				     probability);
+}
+
 static int rtldsa_93xx_port_setup_tc(struct dsa_switch *ds, int port,
 				     enum tc_setup_type type, void *type_data)
 {
@@ -889,6 +950,8 @@ static int rtldsa_93xx_port_setup_tc(struct dsa_switch *ds, int port,
 		return rtldsa_930x_tc_setup_qdisc_ets(ds, port, type_data);
 	case TC_SETUP_QDISC_TBF:
 		return rtldsa_930x_tc_setup_qdisc_tbf(ds, port, type_data);
+	case TC_SETUP_QDISC_RED:
+		return rtldsa_930x_tc_setup_qdisc_red(ds, port, type_data);
 	default:
 		return -EOPNOTSUPP;
 	}

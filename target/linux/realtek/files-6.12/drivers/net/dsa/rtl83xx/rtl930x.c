@@ -2900,6 +2900,51 @@ int rtl930x_qos_port_shaper_set(struct rtl838x_switch_priv *priv, int port,
 	return rtl930x_qos_shaper_set(priv, port, -1, rate_bytes_ps, burst);
 }
 
+/* Program the SWRED thresholds and drop probability of a queue (all
+ * queues if queue is negative) and switch the port from tail drop to
+ * SWRED. The threshold table is global to the switch and shared by all
+ * SWRED-enabled ports, so the queues that are not being configured are
+ * explicitly set to a never-drop configuration (maximum thresholds,
+ * drop rate 0) instead of being left at unknown reset or stale values.
+ * Cross-port use with differing parameters is last-writer-wins per
+ * queue; users should keep RED parameters consistent across ports.
+ * The same values are written to all three drop precedences: nothing
+ * in the driver assigns drop precedences today, so all traffic is
+ * DP 0, and tc-red has no drop-precedence concept either (mirrors the
+ * per-DP-row programming fixed for RTL839x).
+ */
+int rtl930x_qos_swred_set(struct rtl838x_switch_priv *priv, int port, int queue,
+			  u32 min_pages, u32 max_pages, u8 probability)
+{
+	u32 v = FIELD_PREP(RTL930X_SWRED_PROB_M, probability) |
+		FIELD_PREP(RTL930X_SWRED_THR_MAX_M, max_pages) |
+		FIELD_PREP(RTL930X_SWRED_THR_MIN_M, min_pages);
+	u32 never = FIELD_PREP(RTL930X_SWRED_THR_MAX_M, RTL930X_SWRED_THR_MAX_PAGES) |
+		    FIELD_PREP(RTL930X_SWRED_THR_MIN_M, RTL930X_SWRED_THR_MAX_PAGES);
+
+	if (min_pages > max_pages || max_pages > RTL930X_SWRED_THR_MAX_PAGES)
+		return -EINVAL;
+
+	mutex_lock(&priv->reg_mutex);
+	for (int q = 0; q < 8; q++) {
+		u32 val = (queue >= 0 && q != queue) ? never : v;
+
+		for (int dp = 0; dp < RTL930X_SWRED_DROP_PRECEDENCES; dp++)
+			sw_w32(val, RTL930X_SWRED_QUEUE_DROP_CTRL(q, dp));
+	}
+	sw_w32_mask(BIT(port), BIT(port), RTL930X_SWRED_PORT_CTRL);
+	mutex_unlock(&priv->reg_mutex);
+
+	return 0;
+}
+
+void rtl930x_qos_swred_disable(struct rtl838x_switch_priv *priv, int port)
+{
+	mutex_lock(&priv->reg_mutex);
+	sw_w32_mask(BIT(port), 0, RTL930X_SWRED_PORT_CTRL);
+	mutex_unlock(&priv->reg_mutex);
+}
+
 static void rtldsa_930x_qos_init(struct rtl838x_switch_priv *priv)
 {
 	struct dsa_port *dp;
