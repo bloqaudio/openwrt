@@ -17,6 +17,7 @@
 #include "rtl83xx.h"
 
 struct phylink_pcs *rtpcs_create(struct device *dev, struct device_node *np, int port);
+void rtpcs_pcs_set_sfp_node(struct phylink_pcs *pcs, struct device_node *np);
 
 int rtl83xx_port_get_stp_state(struct rtl838x_switch_priv *priv, int port)
 {
@@ -257,7 +258,7 @@ static int rtldsa_bus_c45_write(struct mii_bus *bus, int addr, int devad, int re
 
 static int rtl83xx_mdio_probe(struct rtl838x_switch_priv *priv)
 {
-	struct device_node *dn, *phy_node, *pcs_node, *led_node, *np, *mii_np;
+	struct device_node *dn, *phy_node, *pcs_node, *sfp_node, *led_node, *np, *mii_np;
 	struct device *dev = priv->dev;
 	struct mii_bus *bus;
 	int ret;
@@ -326,6 +327,7 @@ static int rtl83xx_mdio_probe(struct rtl838x_switch_priv *priv)
 
 		pcs_node = of_parse_phandle(dn, "pcs-handle", 0);
 		phy_node = of_parse_phandle(dn, "phy-handle", 0);
+		sfp_node = of_parse_phandle(dn, "sfp", 0);
 		if (pn != priv->cpu_port && !phy_node && !pcs_node) {
 			dev_err(priv->dev, "Port node %d has neither pcs-handle nor phy-handle\n", pn);
 			continue;
@@ -339,6 +341,9 @@ static int rtl83xx_mdio_probe(struct rtl838x_switch_priv *priv)
 				priv->pcs[pn] = NULL;
 				continue;
 			}
+
+			if (sfp_node)
+				rtpcs_pcs_set_sfp_node(priv->pcs[pn], sfp_node);
 		}
 
 		if (of_get_phy_mode(dn, &interface))

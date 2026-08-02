@@ -1,14 +1,19 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <dt-bindings/gpio/gpio.h>
+#include <linux/gpio.h>
+#include <linux/gpio/consumer.h>
 #include <linux/mdio.h>
 #include <linux/mfd/syscon.h>
 #include <linux/of.h>
+#include <linux/of_gpio.h>
 #include <linux/of_mdio.h>
 #include <linux/of_platform.h>
 #include <linux/phy.h>
 #include <linux/platform_device.h>
 #include <linux/phylink.h>
 #include <linux/regmap.h>
+#include <linux/workqueue.h>
 
 #define RTPCS_SDS_CNT				14
 #define RTPCS_PORT_CNT				57
@@ -20,6 +25,11 @@
 #define RTPCS_SPEED_10000			4
 #define RTPCS_SPEED_2500			5
 #define RTPCS_SPEED_5000			6
+
+/* Interval between SerDes setup retries on SFP ports that have, or may
+ * have, a module inserted but no link yet.
+ */
+#define RTPCS_SDS_SETUP_RETRY_DELAY		msecs_to_jiffies(30000)
 
 #define RTPCS_838X_CPU_PORT			28
 #define RTPCS_838X_SERDES_CNT			6
@@ -156,6 +166,16 @@ struct rtpcs_link {
 	struct phylink_pcs pcs;
 	struct rtpcs_serdes *sds;
 	int port;
+
+	/* SFP cage of the port, if any. Used to leave cages that are
+	 * known to be empty alone and to retry SerDes setups that did
+	 * not produce a link.
+	 */
+	struct device_node *sfp_node;
+	bool sds_setup_done;
+	struct delayed_work retry_work;
+	phy_interface_t retry_mode;
+	unsigned int retry_neg_mode;
 };
 
 struct rtpcs_config {
@@ -2949,6 +2969,121 @@ static void rtpcs_pcs_an_restart(struct phylink_pcs *pcs)
 		 link->port, link->sds->id);
 }
 
+static bool rtpcs_mac_link_up(struct rtpcs_link *link)
+{
+	struct rtpcs_ctrl *ctrl = link->ctrl;
+
+	return rtpcs_regmap_read_bits(ctrl, ctrl->cfg->mac_link_sts,
+				      link->port, link->port);
+}
+
+/* MOD-DEF0 is the only SFP presence signal that is valid at any time: it
+ * is a hardware pin, grounded by an inserted module, and does not depend
+ * on the SFP bus driver having finished probing. The GPIO is owned by
+ * the SFP driver, so it is only read, never claimed. Return true only if
+ * the cage is KNOWN to be empty; whenever the pin cannot be evaluated
+ * (no GPIO in the device tree, expander not registered yet, read error)
+ * a module is assumed present, so a populated port is never skipped.
+ */
+static bool rtpcs_sfp_module_absent(struct rtpcs_link *link)
+{
+	static const char * const props[] = { "mod-def0-gpios", "mod-def0-gpio" };
+	struct of_phandle_args args;
+	struct gpio_desc *desc;
+	int gpio = -ENOENT;
+	bool present;
+	u32 flags = 0;
+	int raw;
+
+	if (!link->sfp_node)
+		return false;
+
+	for (unsigned int i = 0; i < ARRAY_SIZE(props); i++) {
+		gpio = of_get_named_gpio(link->sfp_node, props[i], 0);
+		if (!gpio_is_valid(gpio))
+			continue;
+
+		/* The polarity cell of the gpio specifier; there is no
+		 * flags-returning lookup helper anymore.
+		 */
+		if (!of_parse_phandle_with_args(link->sfp_node, props[i],
+						"#gpio-cells", 0, &args)) {
+			if (args.args_count > 1)
+				flags = args.args[1];
+			of_node_put(args.np);
+		}
+		break;
+	}
+	if (!gpio_is_valid(gpio))
+		return false;
+
+	desc = gpio_to_desc(gpio);
+	if (!desc)
+		return false;
+
+	raw = gpiod_get_raw_value_cansleep(desc);
+	if (raw < 0)
+		return false;
+
+	present = (flags & GPIO_ACTIVE_LOW) ? !raw : raw;
+
+	return !present;
+}
+
+/* The first SerDes setup of an SFP port always runs, even if the cage
+ * might be empty: at boot the presence signal may not be readable yet
+ * and a populated port must never be skipped. Once a setup has run, a
+ * cage that is KNOWN to be empty is no longer touched, so an empty cage
+ * costs one boot-time setup and is then left alone, keeping the
+ * calibration sequence from disturbing populated neighbor SerDes.
+ */
+static bool rtpcs_sfp_skip_setup(struct rtpcs_link *link)
+{
+	if (!link->sfp_node || !link->sds_setup_done)
+		return false;
+
+	return rtpcs_sfp_module_absent(link);
+}
+
+static void rtpcs_sds_setup_retry(struct work_struct *work)
+{
+	struct rtpcs_link *link = container_of(to_delayed_work(work),
+					       struct rtpcs_link, retry_work);
+	struct rtpcs_ctrl *ctrl = link->ctrl;
+	int ret;
+
+	mutex_lock(&ctrl->lock);
+
+	/* Done once the link is up or the module is (now known to be) gone */
+	if (rtpcs_mac_link_up(link) || rtpcs_sfp_module_absent(link))
+		goto out;
+
+	dev_info(ctrl->dev, "port %d, sds %d: no link, retry SerDes setup\n",
+		 link->port, link->sds->id);
+
+	ret = ctrl->cfg->setup_serdes(link->sds, link->retry_mode);
+	if (!ret) {
+		link->sds->first_start = false;
+		link->sds->configured_mode = link->retry_mode;
+
+		if (ctrl->cfg->set_autoneg)
+			ctrl->cfg->set_autoneg(link->sds, link->retry_neg_mode);
+	}
+
+	mod_delayed_work(system_power_efficient_wq, &link->retry_work,
+			 RTPCS_SDS_SETUP_RETRY_DELAY);
+
+out:
+	mutex_unlock(&ctrl->lock);
+}
+
+static void rtpcs_pcs_disable(struct phylink_pcs *pcs)
+{
+	struct rtpcs_link *link = rtpcs_phylink_pcs_to_link(pcs);
+
+	cancel_delayed_work_sync(&link->retry_work);
+}
+
 static int rtpcs_pcs_config(struct phylink_pcs *pcs, unsigned int neg_mode,
 			    phy_interface_t interface, const unsigned long *advertising,
 			    bool permit_pause_to_mac)
@@ -2972,13 +3107,33 @@ static int rtpcs_pcs_config(struct phylink_pcs *pcs, unsigned int neg_mode,
 		if (interface == link->sds->configured_mode) {
 			dev_dbg(ctrl->dev, "sds %d already in mode %s, no change\n",
 				link->sds->id, phy_modes(interface));
+		} else if (rtpcs_sfp_skip_setup(link)) {
+			dev_dbg(ctrl->dev, "sds %d: no module, skip setup for mode %s\n",
+				link->sds->id, phy_modes(interface));
 		} else {
 			ret = ctrl->cfg->setup_serdes(link->sds, interface);
+			link->sds_setup_done = true;
+			if (!ret) {
+				link->sds->first_start = false;
+				link->sds->configured_mode = interface;
+			}
+
+			/* SerDes RX calibration is not fully deterministic
+			 * and a failed setup is not latched, so a setup on
+			 * an SFP port that did not (yet) produce a link is
+			 * retried until the link comes up, the module is
+			 * removed or the port is administratively disabled.
+			 */
+			if (link->sfp_node && !rtpcs_mac_link_up(link)) {
+				link->retry_mode = interface;
+				link->retry_neg_mode = neg_mode;
+				mod_delayed_work(system_power_efficient_wq,
+						 &link->retry_work,
+						 RTPCS_SDS_SETUP_RETRY_DELAY);
+			}
+
 			if (ret < 0)
 				goto out;
-
-			link->sds->first_start = false;
-			link->sds->configured_mode = interface;
 		}
 	}
 
@@ -2993,6 +3148,16 @@ out:
 
 	return ret;
 }
+
+void rtpcs_pcs_set_sfp_node(struct phylink_pcs *pcs, struct device_node *np);
+void rtpcs_pcs_set_sfp_node(struct phylink_pcs *pcs, struct device_node *np)
+{
+	struct rtpcs_link *link = rtpcs_phylink_pcs_to_link(pcs);
+
+	/* Borrows the caller's node reference for the driver lifetime */
+	link->sfp_node = np;
+}
+EXPORT_SYMBOL(rtpcs_pcs_set_sfp_node);
 
 struct phylink_pcs *rtpcs_create(struct device *dev, struct device_node *np, int port);
 struct phylink_pcs *rtpcs_create(struct device *dev, struct device_node *np, int port)
@@ -3049,6 +3214,7 @@ struct phylink_pcs *rtpcs_create(struct device *dev, struct device_node *np, int
 	link->sds = &ctrl->serdes[sds_id];
 	link->pcs.ops = ctrl->cfg->pcs_ops;
 	link->pcs.neg_mode = true;
+	INIT_DELAYED_WORK(&link->retry_work, rtpcs_sds_setup_retry);
 
 	ctrl->link[port] = link;
 
@@ -3156,6 +3322,7 @@ static int rtpcs_93xx_set_autoneg(struct rtpcs_serdes *sds, unsigned int neg_mod
 
 static const struct phylink_pcs_ops rtpcs_838x_pcs_ops = {
 	.pcs_an_restart		= rtpcs_pcs_an_restart,
+	.pcs_disable		= rtpcs_pcs_disable,
 	.pcs_config		= rtpcs_pcs_config,
 	.pcs_get_state		= rtpcs_pcs_get_state,
 };
@@ -3176,6 +3343,7 @@ static const struct rtpcs_config rtpcs_838x_cfg = {
 
 static const struct phylink_pcs_ops rtpcs_839x_pcs_ops = {
 	.pcs_an_restart		= rtpcs_pcs_an_restart,
+	.pcs_disable		= rtpcs_pcs_disable,
 	.pcs_config		= rtpcs_pcs_config,
 	.pcs_get_state		= rtpcs_pcs_get_state,
 };
@@ -3194,6 +3362,7 @@ static const struct rtpcs_config rtpcs_839x_cfg = {
 
 static const struct phylink_pcs_ops rtpcs_930x_pcs_ops = {
 	.pcs_an_restart		= rtpcs_pcs_an_restart,
+	.pcs_disable		= rtpcs_pcs_disable,
 	.pcs_config		= rtpcs_pcs_config,
 	.pcs_get_state		= rtpcs_pcs_get_state,
 };
@@ -3214,6 +3383,7 @@ static const struct rtpcs_config rtpcs_930x_cfg = {
 
 static const struct phylink_pcs_ops rtpcs_931x_pcs_ops = {
 	.pcs_an_restart		= rtpcs_pcs_an_restart,
+	.pcs_disable		= rtpcs_pcs_disable,
 	.pcs_config		= rtpcs_pcs_config,
 	.pcs_get_state		= rtpcs_pcs_get_state,
 };
