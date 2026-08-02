@@ -2839,6 +2839,67 @@ void rtl930x_qos_sched_defaults(struct rtl838x_switch_priv *priv)
 		rtl930x_qos_port_sched_defaults(dp->index);
 }
 
+static u32 rtl930x_qos_shaper_addr(int port, int queue)
+{
+	if (queue < 0)
+		return RTL930X_EGBW_PORT_CTRL(port);
+
+	if (port < 24)
+		return RTL930X_EGBW_PORT_Q_MAX_LB_CTRL_SET0(port, queue);
+
+	return RTL930X_EGBW_PORT_Q_MAX_LB_CTRL_SET1(port, queue);
+}
+
+/* Program a maximum egress bandwidth leaky bucket. A rate of 0 disables
+ * the bucket. The SDK leaves the global leaky-bucket tick/token register
+ * EGBW_LB_CTRL at chip reset defaults and only requires the burst to
+ * hold at least 3 tokens; the same is enforced here.
+ */
+static int rtl930x_qos_shaper_set(struct rtl838x_switch_priv *priv, int port,
+				  int queue, u64 rate_bytes_ps, u32 burst)
+{
+	u32 addr = rtl930x_qos_shaper_addr(port, queue);
+	u32 rate = 0, tkn;
+
+	if (rate_bytes_ps) {
+		rate = DIV_ROUND_UP_ULL(rate_bytes_ps * 8, 16000);
+		if (!rate || rate > RTL930X_EGBW_Q_RATE_M)
+			return -EINVAL;
+
+		tkn = (sw_r32(RTL930X_EGBW_LB_CTRL) & RTL930X_EGBW_LB_TKN_M) >> 16;
+		if (burst < 3 * tkn || burst > RTL930X_EGBW_Q_BURST_M)
+			return -EINVAL;
+	}
+
+	mutex_lock(&priv->reg_mutex);
+	if (rate_bytes_ps) {
+		sw_w32(RTL930X_EGBW_Q_EN | rate, addr);
+		sw_w32(burst & RTL930X_EGBW_Q_BURST_M, addr + 4);
+	} else {
+		/* Restore the reset posture (rate wide open, reset burst):
+		 * a zero burst word blocks the queue or port entirely, as
+		 * the burst cap applies even with the enable bit clear.
+		 */
+		sw_w32(RTL930X_EGBW_Q_RATE_M, addr);
+		sw_w32(RTL930X_EGBW_LB_RESET_BURST, addr + 4);
+	}
+	mutex_unlock(&priv->reg_mutex);
+
+	return 0;
+}
+
+int rtl930x_qos_queue_shaper_set(struct rtl838x_switch_priv *priv, int port,
+				 int queue, u64 rate_bytes_ps, u32 burst)
+{
+	return rtl930x_qos_shaper_set(priv, port, queue, rate_bytes_ps, burst);
+}
+
+int rtl930x_qos_port_shaper_set(struct rtl838x_switch_priv *priv, int port,
+				u64 rate_bytes_ps, u32 burst)
+{
+	return rtl930x_qos_shaper_set(priv, port, -1, rate_bytes_ps, burst);
+}
+
 static void rtldsa_930x_qos_init(struct rtl838x_switch_priv *priv)
 {
 	struct dsa_port *dp;

@@ -838,6 +838,44 @@ static int rtldsa_930x_tc_setup_qdisc_ets(struct dsa_switch *ds, int port,
 	return 0;
 }
 
+/* TBF attached to an ETS band shapes the egress leaky bucket of the
+ * hardware queue the band maps to (band b = queue 7 - b, so parent
+ * classid minor m shapes queue 8 - m); TBF at the root shapes the
+ * whole port.
+ */
+static int rtldsa_930x_tc_setup_qdisc_tbf(struct dsa_switch *ds, int port,
+					  struct tc_tbf_qopt_offload *qopt)
+{
+	struct rtl838x_switch_priv *priv = ds->priv;
+	struct tc_tbf_qopt_offload_replace_params *p = &qopt->replace_params;
+	int queue = -1;
+
+	if (qopt->parent != TC_H_ROOT) {
+		unsigned int minor = TC_H_MIN(qopt->parent);
+
+		if (!minor || minor > MAX_PRIOS)
+			return -EOPNOTSUPP;
+		queue = MAX_PRIOS - minor;
+	}
+
+	switch (qopt->command) {
+	case TC_TBF_REPLACE:
+		if (queue < 0)
+			return rtl930x_qos_port_shaper_set(priv, port,
+						p->rate.rate_bytes_ps,
+						p->max_size);
+		return rtl930x_qos_queue_shaper_set(priv, port, queue,
+						    p->rate.rate_bytes_ps,
+						    p->max_size);
+	case TC_TBF_DESTROY:
+		if (queue < 0)
+			return rtl930x_qos_port_shaper_set(priv, port, 0, 0);
+		return rtl930x_qos_queue_shaper_set(priv, port, queue, 0, 0);
+	default:
+		return -EOPNOTSUPP;
+	}
+}
+
 static int rtldsa_93xx_port_setup_tc(struct dsa_switch *ds, int port,
 				     enum tc_setup_type type, void *type_data)
 {
@@ -849,6 +887,8 @@ static int rtldsa_93xx_port_setup_tc(struct dsa_switch *ds, int port,
 	switch (type) {
 	case TC_SETUP_QDISC_ETS:
 		return rtldsa_930x_tc_setup_qdisc_ets(ds, port, type_data);
+	case TC_SETUP_QDISC_TBF:
+		return rtldsa_930x_tc_setup_qdisc_tbf(ds, port, type_data);
 	default:
 		return -EOPNOTSUPP;
 	}

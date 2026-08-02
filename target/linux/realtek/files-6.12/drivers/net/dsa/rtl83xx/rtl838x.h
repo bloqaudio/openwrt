@@ -592,6 +592,29 @@ typedef enum {
 #define RTL930X_SCHED_Q_WEIGHT_M		GENMASK(6, 0)
 #define RTL930X_SCHED_Q_STRICT_EN		BIT(7)
 #define RTL930X_SCHED_Q_WEIGHT_MAX		127
+/* Egress bandwidth leaky buckets: one 64-bit entry per port queue, and one
+ * per port. Low word: BURST bits [15:0] (bytes); high word: RATE bits
+ * [19:0] (1 LSB = 16 Kbps) and EN bit 20
+ * (SDK dal_longan_rate_portEgrQueueBwCtrl{Enable,Rate,BurstSize}_set and
+ * dal_longan_rate_portEgrBwCtrl{Enable,Rate,BurstSize}_set).
+ * port: 0-23, queue: 0-7
+ */
+#define RTL930X_EGBW_PORT_Q_MAX_LB_CTRL_SET0(port, q) \
+							(0x3C60 + ((port) * 384) + ((q) * 8))
+/* port: 24-27, queue: 0-11 */
+#define RTL930X_EGBW_PORT_Q_MAX_LB_CTRL_SET1(port, q) \
+							(0xE300 + (((port) - 24) * 96) + ((q) * 8))
+/* port: 0-28 */
+#define RTL930X_EGBW_PORT_CTRL(port)		(0x7660 + ((port) * 16))
+/* Reset value of the burst word; the burst cap gates egress even with
+ * EN clear, so "disabled" must restore it rather than write zero.
+ */
+#define RTL930X_EGBW_LB_RESET_BURST		(0x4000)
+#define RTL930X_EGBW_LB_CTRL			(0x78EC)
+#define RTL930X_EGBW_LB_TKN_M			GENMASK(31, 16)
+#define RTL930X_EGBW_Q_RATE_M			GENMASK(19, 0)
+#define RTL930X_EGBW_Q_EN			BIT(20)
+#define RTL930X_EGBW_Q_BURST_M			GENMASK(15, 0)
 /* port: 0-51, index: 0-7 */
 #define RTL931X_SCHED_PORT_Q_CTRL_SET0(port, index) \
 						(0x2888 + ((port) << 5) + ((index) * 4))
@@ -1394,6 +1417,10 @@ int rtl930x_qos_sched_algo_get(int port);
 void rtl930x_qos_sched_algo_set(int port, bool wrr);
 void rtl930x_qos_port_sched_defaults(int port);
 void rtl930x_qos_sched_defaults(struct rtl838x_switch_priv *priv);
+int rtl930x_qos_queue_shaper_set(struct rtl838x_switch_priv *priv, int port,
+				 int queue, u64 rate_bytes_ps, u32 burst);
+int rtl930x_qos_port_shaper_set(struct rtl838x_switch_priv *priv, int port,
+				u64 rate_bytes_ps, u32 burst);
 
 void rtldsa_counters_lock_register(struct rtl838x_switch_priv *priv, int port)
 	__acquires(&priv->ports[port].counters.lock);
