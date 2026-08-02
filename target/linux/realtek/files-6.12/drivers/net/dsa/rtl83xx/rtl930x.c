@@ -2786,21 +2786,57 @@ static void rtldsa_930x_qos_prio2queue_matrix(int *min_queues)
 	sw_w32(v, RTL930X_QM_INTPRI2QID_CTRL);
 }
 
-static void rtldsa_930x_qos_set_scheduling_queue_weights(struct rtl838x_switch_priv *priv)
+/* Per-queue scheduling control: WEIGHT (1-127, shared by WFQ and WRR)
+ * and STRICT_EN, marking the queue strict-priority instead of weighted
+ * (SDK dal_longan_qos_schedulingQueue_set and
+ * dal_longan_qos_portQueueStrictEnable_set).
+ */
+void rtl930x_qos_queue_sched_set(int port, int queue, u8 weight, bool strict)
+{
+	u32 v = weight & RTL930X_SCHED_Q_WEIGHT_M;
+
+	if (strict)
+		v |= RTL930X_SCHED_Q_STRICT_EN;
+
+	if (port < 24)
+		sw_w32(v, RTL930X_SCHED_PORT_Q_CTRL_SET0(port, queue));
+	else
+		sw_w32(v, RTL930X_SCHED_PORT_Q_CTRL_SET1(port, queue));
+}
+
+/* Weighted scheduling algorithm of a port: 0 = WFQ (byte-count),
+ * 1 = WRR (packet-count), one bit per port in SCHED_PORT_ALGO_CTRL
+ * (SDK dal_longan_qos_schedulingAlgorithm_set). Strict-priority queues
+ * always win over weighted queues regardless of this selection.
+ */
+int rtl930x_qos_sched_algo_get(int port)
+{
+	return !!(sw_r32(RTL930X_SCHED_PORT_ALGO_CTRL) & BIT(port));
+}
+
+void rtl930x_qos_sched_algo_set(int port, bool wrr)
+{
+	sw_w32_mask(BIT(port), wrr ? BIT(port) : 0,
+		    RTL930X_SCHED_PORT_ALGO_CTRL);
+}
+
+/* Boot-time default scheduling of a port: all queues weighted with
+ * weight 1, weighted algorithm WFQ.
+ */
+void rtl930x_qos_port_sched_defaults(int port)
+{
+	for (int q = 0; q < 8; q++)
+		rtl930x_qos_queue_sched_set(port, q, 1, false);
+
+	rtl930x_qos_sched_algo_set(port, false);
+}
+
+void rtl930x_qos_sched_defaults(struct rtl838x_switch_priv *priv)
 {
 	struct dsa_port *dp;
-	u32 addr;
 
-	dsa_switch_for_each_user_port(dp, priv->ds) {
-		for (int q = 0; q < 8; q++) {
-			if (dp->index < 24)
-				addr = RTL930X_SCHED_PORT_Q_CTRL_SET0(dp->index, q);
-			else
-				addr = RTL930X_SCHED_PORT_Q_CTRL_SET1(dp->index, q);
-
-			sw_w32(rtldsa_default_queue_weights[q], addr);
-		}
-	}
+	dsa_switch_for_each_user_port(dp, priv->ds)
+		rtl930x_qos_port_sched_defaults(dp->index);
 }
 
 static void rtldsa_930x_qos_init(struct rtl838x_switch_priv *priv)
@@ -2827,7 +2863,7 @@ static void rtldsa_930x_qos_init(struct rtl838x_switch_priv *priv)
 	 * core seeds the dcbnl app table from hardware when the user ports
 	 * are created, before this init runs.
 	 */
-	rtldsa_930x_qos_set_scheduling_queue_weights(priv);
+	rtl930x_qos_sched_defaults(priv);
 }
 
 /* Default (port-based) internal priority of a port: 3 bits per port in

@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
 #include <net/dsa.h>
+#include <net/pkt_cls.h>
 #include <linux/etherdevice.h>
 #include <linux/if_bridge.h>
+#include <linux/pkt_sched.h>
 #include <asm/mach-rtl838x/mach-rtl83xx.h>
 
 #include "rtl83xx.h"
@@ -784,6 +786,72 @@ static int rtldsa_93xx_port_del_dscp_prio(struct dsa_switch *ds, int port,
 		return 0;
 
 	return rtl930x_qos_dscp_prio_set(priv, dscp, dscp >> 3);
+}
+
+/* ETS band to hardware queue: band 0 is the highest-priority band in
+ * sch_ets (tried first), while on RTL930x queue 7 is served first, so
+ * band b maps to queue 7 - b. The priomap is not programmable per port
+ * (the internal-priority-to-queue map RTL930X_QM_INTPRI2QID_CTRL is
+ * switch-global and stays at its identity boot default); classification
+ * into queues is controlled by the DCBNL DSCP/default-prio surface.
+ */
+static int rtldsa_930x_tc_setup_qdisc_ets(struct dsa_switch *ds, int port,
+					  struct tc_ets_qopt_offload *qopt)
+{
+	struct tc_ets_qopt_offload_replace_params *p = &qopt->replace_params;
+	int band;
+
+	if (qopt->parent != TC_H_ROOT)
+		return -EOPNOTSUPP;
+
+	switch (qopt->command) {
+	case TC_ETS_REPLACE:
+		break;
+	case TC_ETS_DESTROY:
+		rtl930x_qos_port_sched_defaults(port);
+		return 0;
+	default:
+		return -EOPNOTSUPP;
+	}
+
+	if (p->bands != MAX_PRIOS)
+		return -EOPNOTSUPP;
+
+	for (band = 0; band < p->bands; band++) {
+		if (!p->quanta[band])
+			continue;
+		if (!p->weights[band] ||
+		    p->weights[band] > RTL930X_SCHED_Q_WEIGHT_MAX)
+			return -EINVAL;
+	}
+
+	for (band = 0; band < p->bands; band++) {
+		int queue = MAX_PRIOS - 1 - band;
+
+		if (p->quanta[band])
+			rtl930x_qos_queue_sched_set(port, queue,
+						    p->weights[band], false);
+		else
+			rtl930x_qos_queue_sched_set(port, queue, 1, true);
+	}
+
+	return 0;
+}
+
+static int rtldsa_93xx_port_setup_tc(struct dsa_switch *ds, int port,
+				     enum tc_setup_type type, void *type_data)
+{
+	struct rtl838x_switch_priv *priv = ds->priv;
+
+	if (priv->family_id != RTL9300_FAMILY_ID)
+		return -EOPNOTSUPP;
+
+	switch (type) {
+	case TC_SETUP_QDISC_ETS:
+		return rtldsa_930x_tc_setup_qdisc_ets(ds, port, type_data);
+	default:
+		return -EOPNOTSUPP;
+	}
 }
 
 static struct phylink_pcs *rtldsa_phylink_mac_select_pcs(struct dsa_switch *ds,
@@ -3395,6 +3463,8 @@ const struct dsa_switch_ops rtl93xx_switch_ops = {
 	.port_get_dscp_prio	= rtldsa_93xx_port_get_dscp_prio,
 	.port_add_dscp_prio	= rtldsa_93xx_port_add_dscp_prio,
 	.port_del_dscp_prio	= rtldsa_93xx_port_del_dscp_prio,
+
+	.port_setup_tc		= rtldsa_93xx_port_setup_tc,
 
 	.port_lag_change	= rtl83xx_port_lag_change,
 	.port_lag_join		= rtl83xx_port_lag_join,

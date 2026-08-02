@@ -2,6 +2,7 @@
 
 #include <linux/debugfs.h>
 #include <linux/kernel.h>
+#include <linux/string.h>
 #include <asm/mach-rtl838x/mach-rtl83xx.h>
 
 #include "rtl83xx.h"
@@ -540,6 +541,65 @@ RTL930X_STORM_RATE_FOPS(uc, UC);
 RTL930X_STORM_RATE_FOPS(mc, MC);
 RTL930X_STORM_RATE_FOPS(bc, BC);
 
+/* Weighted scheduling algorithm per port: "wfq" (byte-count) or "wrr"
+ * (packet-count). There is no kernel API for the WFQ/WRR distinction
+ * (tc-ets offloads strict/weighted queue selection and weights only),
+ * hence a debugfs knob; the boot default is WFQ.
+ */
+static ssize_t sched_algo_read(struct file *filp, char __user *buffer,
+			       size_t count, loff_t *ppos)
+{
+	struct rtl838x_port *p = filp->private_data;
+	char buf[8];
+
+	if (*ppos != 0)
+		return 0;
+
+	return simple_read_from_buffer(buffer, count, ppos, buf,
+			scnprintf(buf, sizeof(buf), "%s\n",
+				  rtl930x_qos_sched_algo_get(p->dp->index) ?
+				  "wrr" : "wfq"));
+}
+
+static ssize_t sched_algo_write(struct file *filp, const char __user *buffer,
+				size_t count, loff_t *ppos)
+{
+	struct rtl838x_port *p = filp->private_data;
+	struct rtl838x_switch_priv *priv = p->dp->ds->priv;
+	char b[8];
+	ssize_t len;
+
+	if (*ppos != 0)
+		return -EINVAL;
+
+	if (count >= sizeof(b))
+		return -ENOSPC;
+
+	len = simple_write_to_buffer(b, sizeof(b) - 1, ppos, buffer, count);
+	if (len < 0)
+		return len;
+
+	b[len] = '\0';
+
+	mutex_lock(&priv->reg_mutex);
+	if (sysfs_streq(b, "wrr"))
+		rtl930x_qos_sched_algo_set(p->dp->index, true);
+	else if (sysfs_streq(b, "wfq"))
+		rtl930x_qos_sched_algo_set(p->dp->index, false);
+	else
+		len = -EINVAL;
+	mutex_unlock(&priv->reg_mutex);
+
+	return len;
+}
+
+static const struct file_operations sched_algo_fops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.read = sched_algo_read,
+	.write = sched_algo_write,
+};
+
 static const struct debugfs_reg32 port_ctrl_regs[] = {
 	{ .name = "port_isolation", .offset = RTL838X_PORT_ISO_CTRL(0), },
 	{ .name = "mac_force_mode", .offset = RTL838X_MAC_FORCE_MODE_CTRL, },
@@ -838,5 +898,7 @@ void rtl930x_dbgfs_init(struct rtl838x_switch_priv *priv)
 				    &priv->ports[i], &storm_rate_mc_fops);
 		debugfs_create_file("storm_rate_bc", 0600, port_dir,
 				    &priv->ports[i], &storm_rate_bc_fops);
+		debugfs_create_file("sched_algo", 0600, port_dir,
+				    &priv->ports[i], &sched_algo_fops);
 	}
 }

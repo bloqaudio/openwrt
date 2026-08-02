@@ -586,6 +586,12 @@ typedef enum {
 /* port: 24-27, index: 0-11 */
 #define RTL930X_SCHED_PORT_Q_CTRL_SET1(port, index) \
 						((0xE860 + ((port) - 24) * 48) + ((index) * 4))
+/* One bit per port: 0 = WFQ (byte-count), 1 = WRR (packet-count) */
+#define RTL930X_SCHED_PORT_ALGO_CTRL		(0x7A9C)
+/* Per-queue fields of RTL930X_SCHED_PORT_Q_CTRL_SET{0,1} */
+#define RTL930X_SCHED_Q_WEIGHT_M		GENMASK(6, 0)
+#define RTL930X_SCHED_Q_STRICT_EN		BIT(7)
+#define RTL930X_SCHED_Q_WEIGHT_MAX		127
 /* port: 0-51, index: 0-7 */
 #define RTL931X_SCHED_PORT_Q_CTRL_SET0(port, index) \
 						(0x2888 + ((port) << 5) + ((index) * 4))
@@ -1383,6 +1389,11 @@ int rtl930x_qos_default_prio_set(struct rtl838x_switch_priv *priv, int port,
 int rtl930x_qos_dscp_prio_get(int dscp);
 int rtl930x_qos_dscp_prio_set(struct rtl838x_switch_priv *priv, int dscp,
 			      u8 prio);
+void rtl930x_qos_queue_sched_set(int port, int queue, u8 weight, bool strict);
+int rtl930x_qos_sched_algo_get(int port);
+void rtl930x_qos_sched_algo_set(int port, bool wrr);
+void rtl930x_qos_port_sched_defaults(int port);
+void rtl930x_qos_sched_defaults(struct rtl838x_switch_priv *priv);
 
 void rtldsa_counters_lock_register(struct rtl838x_switch_priv *priv, int port)
 	__acquires(&priv->ports[port].counters.lock);
