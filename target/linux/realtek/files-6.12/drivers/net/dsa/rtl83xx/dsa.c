@@ -685,8 +685,20 @@ static int rtl93xx_setup(struct dsa_switch *ds)
 
 	priv->r->led_init(priv);
 
-	if (priv->family_id == RTL9300_FAMILY_ID)
+	if (priv->family_id == RTL9300_FAMILY_ID) {
 		rtl930x_storm_control_init(priv);
+
+		/* The DSA core seeds the dcbnl app table from hardware when
+		 * the user ports are created (dsa_user_dcbnl_init), right
+		 * after this setup finishes, so the DSCP defaults must be
+		 * programmed here; the later qos_init would be too late
+		 * and the seed would cache the pre-init table.
+		 */
+		rtldsa_930x_qos_setup_default_dscp2queue_map();
+
+		/* The DSCP-to-internal-priority table is switch-global */
+		ds->dscp_prio_mapping_is_global = true;
+	}
 
 	return 0;
 }
@@ -711,6 +723,67 @@ static int rtldsa_93xx_port_max_mtu(struct dsa_switch *ds, int port)
 		return ETH_DATA_LEN;
 
 	return RTL930X_MAX_FRAME_LEN - RTL83XX_FRAME_OVERHEAD;
+}
+
+static int rtldsa_93xx_port_get_default_prio(struct dsa_switch *ds, int port)
+{
+	struct rtl838x_switch_priv *priv = ds->priv;
+
+	if (priv->family_id != RTL9300_FAMILY_ID)
+		return -EOPNOTSUPP;
+
+	return rtl930x_qos_default_prio_get(port);
+}
+
+static int rtldsa_93xx_port_set_default_prio(struct dsa_switch *ds, int port,
+					     u8 prio)
+{
+	struct rtl838x_switch_priv *priv = ds->priv;
+
+	if (priv->family_id != RTL9300_FAMILY_ID)
+		return -EOPNOTSUPP;
+
+	return rtl930x_qos_default_prio_set(priv, port, prio);
+}
+
+static int rtldsa_93xx_port_get_dscp_prio(struct dsa_switch *ds, int port,
+					  u8 dscp)
+{
+	struct rtl838x_switch_priv *priv = ds->priv;
+
+	if (priv->family_id != RTL9300_FAMILY_ID)
+		return -EOPNOTSUPP;
+
+	return rtl930x_qos_dscp_prio_get(dscp);
+}
+
+static int rtldsa_93xx_port_add_dscp_prio(struct dsa_switch *ds, int port,
+					  u8 dscp, u8 prio)
+{
+	struct rtl838x_switch_priv *priv = ds->priv;
+
+	if (priv->family_id != RTL9300_FAMILY_ID)
+		return -EOPNOTSUPP;
+
+	return rtl930x_qos_dscp_prio_set(priv, dscp, prio);
+}
+
+static int rtldsa_93xx_port_del_dscp_prio(struct dsa_switch *ds, int port,
+					  u8 dscp, u8 prio)
+{
+	struct rtl838x_switch_priv *priv = ds->priv;
+
+	if (priv->family_id != RTL9300_FAMILY_ID)
+		return -EOPNOTSUPP;
+
+	/* The DSCP map is switch-global: another port may have re-mapped
+	 * this DSCP since the app entry was added. Only a mapping that
+	 * still matches is restored to the default (dscp >> 3).
+	 */
+	if (rtl930x_qos_dscp_prio_get(dscp) != prio)
+		return 0;
+
+	return rtl930x_qos_dscp_prio_set(priv, dscp, dscp >> 3);
 }
 
 static struct phylink_pcs *rtldsa_phylink_mac_select_pcs(struct dsa_switch *ds,
@@ -3316,6 +3389,12 @@ const struct dsa_switch_ops rtl93xx_switch_ops = {
 
 	.port_change_mtu	= rtldsa_93xx_port_change_mtu,
 	.port_max_mtu		= rtldsa_93xx_port_max_mtu,
+
+	.port_get_default_prio	= rtldsa_93xx_port_get_default_prio,
+	.port_set_default_prio	= rtldsa_93xx_port_set_default_prio,
+	.port_get_dscp_prio	= rtldsa_93xx_port_get_dscp_prio,
+	.port_add_dscp_prio	= rtldsa_93xx_port_add_dscp_prio,
+	.port_del_dscp_prio	= rtldsa_93xx_port_del_dscp_prio,
 
 	.port_lag_change	= rtl83xx_port_lag_change,
 	.port_lag_join		= rtl83xx_port_lag_join,

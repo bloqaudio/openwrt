@@ -2762,7 +2762,7 @@ static void rtldsa_930x_qos_set_group_selector(int port, int group)
 		    RTL930X_PORT_TBL_IDX_CTRL(port));
 }
 
-static void rtldsa_930x_qos_setup_default_dscp2queue_map(void)
+void rtldsa_930x_qos_setup_default_dscp2queue_map(void)
 {
 	u32 queue;
 
@@ -2823,8 +2823,58 @@ static void rtldsa_930x_qos_init(struct rtl838x_switch_priv *priv)
 
 	sw_w32(v, RTL930X_PRI_SEL_TBL_CTRL(0));
 
-	rtldsa_930x_qos_setup_default_dscp2queue_map();
+	/* The DSCP defaults are programmed from rtl93xx_setup(): the DSA
+	 * core seeds the dcbnl app table from hardware when the user ports
+	 * are created, before this init runs.
+	 */
 	rtldsa_930x_qos_set_scheduling_queue_weights(priv);
+}
+
+/* Default (port-based) internal priority of a port: 3 bits per port in
+ * PRI_SEL_PORT_PRI (SDK dal_longan_qos_priRemap_set, PRI_SRC_PB_PRI).
+ */
+int rtl930x_qos_default_prio_get(int port)
+{
+	return (sw_r32(RTL930X_PRI_SEL_PORT_PRI(port)) >> ((port % 10) * 3)) & 0x7;
+}
+
+int rtl930x_qos_default_prio_set(struct rtl838x_switch_priv *priv, int port,
+				 u8 prio)
+{
+	if (prio >= MAX_PRIOS)
+		return -EINVAL;
+
+	mutex_lock(&priv->reg_mutex);
+	sw_w32_mask(0x7 << ((port % 10) * 3), prio << ((port % 10) * 3),
+		    RTL930X_PRI_SEL_PORT_PRI(port));
+	mutex_unlock(&priv->reg_mutex);
+
+	return 0;
+}
+
+/* DSCP to internal priority remapping: 3 bits per DSCP value in REMAP_DSCP
+ * (SDK dal_longan_qos_priRemap_set, PRI_SRC_DSCP). The table is global to
+ * the switch, the caller-facing DSA op is per port.
+ */
+int rtl930x_qos_dscp_prio_get(int dscp)
+{
+	return (sw_r32(RTL930X_REMAP_DSCP(dscp)) >>
+		RTL93XX_REMAP_DSCP_INTPRI_DSCP_OFFSET(dscp)) & 0x7;
+}
+
+int rtl930x_qos_dscp_prio_set(struct rtl838x_switch_priv *priv, int dscp,
+			      u8 prio)
+{
+	if (prio >= MAX_PRIOS)
+		return -EINVAL;
+
+	mutex_lock(&priv->reg_mutex);
+	sw_w32_mask(RTL93XX_REMAP_DSCP_INTPRI_DSCP_MASK(dscp),
+		    prio << RTL93XX_REMAP_DSCP_INTPRI_DSCP_OFFSET(dscp),
+		    RTL930X_REMAP_DSCP(dscp));
+	mutex_unlock(&priv->reg_mutex);
+
+	return 0;
 }
 
 /* Bring per-port storm control into a known state: PPS mode, disabled, SDK

@@ -520,6 +520,7 @@ typedef enum {
 #define RTL839X_QM_PORT_QNUM(p)			(0x1130 + (((p / 10) << 2)))
 #define RTL838X_PRI_SEL_PORT_PRI(p)		(0x5FB8 + (((p / 10) << 2)))
 #define RTL839X_PRI_SEL_PORT_PRI(p)		(0x10A8 + (((p / 10) << 2)))
+#define RTL930X_PRI_SEL_PORT_PRI(p)		(0x9AE8 + (((p / 10) << 2)))
 #define RTL838X_QM_PKT2CPU_INTPRI_MAP		(0x5F10)
 #define RTL839X_QM_PKT2CPU_INTPRI_MAP		(0x1154)
 #define RTL838X_PRI_SEL_CTRL			(0x10E0)
@@ -1375,6 +1376,13 @@ void rtl838x_dbgfs_init(struct rtl838x_switch_priv *priv);
 void rtl930x_dbgfs_init(struct rtl838x_switch_priv *priv);
 void rtl930x_storm_control_init(struct rtl838x_switch_priv *priv);
 void rtl930x_port_max_frame_set(int port, int frame_len);
+void rtldsa_930x_qos_setup_default_dscp2queue_map(void);
+int rtl930x_qos_default_prio_get(int port);
+int rtl930x_qos_default_prio_set(struct rtl838x_switch_priv *priv, int port,
+				 u8 prio);
+int rtl930x_qos_dscp_prio_get(int dscp);
+int rtl930x_qos_dscp_prio_set(struct rtl838x_switch_priv *priv, int dscp,
+			      u8 prio);
 
 void rtldsa_counters_lock_register(struct rtl838x_switch_priv *priv, int port)
 	__acquires(&priv->ports[port].counters.lock);
