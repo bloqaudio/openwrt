@@ -630,6 +630,27 @@ typedef enum {
 #define RTL930X_SWRED_PAGE_BYTES		256
 #define RTL930X_SWRED_THR_MAX_PAGES		4095
 #define RTL930X_SWRED_DROP_PRECEDENCES		3
+/* Egress remarking: per-port enables and global source selects
+ * (SDK dal_longan_qos_port{1p,Out1p,Dscp,Dei}RemarkEnable_set and
+ * dal_longan_qos_{1p,Dscp,Dei}RemarkSrcSel_set). With all per-port
+ * enables clear the original header fields are kept on egress.
+ */
+#define RTL930X_RMK_CTRL			(0xD144)
+#define RTL930X_RMK_IPRI_RMK_SRC_M		GENMASK(9, 8)
+#define RTL930X_RMK_OPRI_RMK_SRC_M		GENMASK(7, 6)
+#define RTL930X_RMK_DEI_RMK_SRC			BIT(5)
+#define RTL930X_RMK_DSCP_RMK_SRC_M		GENMASK(4, 2)
+#define RTL930X_RMK_PORT_CTRL(p)		(0xD148 + ((p) * 4))
+#define RTL930X_RMK_PORT_IPRI_RMK_EN		BIT(0)
+#define RTL930X_RMK_PORT_OPRI_RMK_EN		BIT(1)
+#define RTL930X_RMK_PORT_DSCP_RMK_EN		BIT(2)
+#define RTL930X_RMK_PORT_DEI_RMK_EN		BIT(3)
+#define RTL930X_RMK_PORT_DEI_RMK_TAG_SEL	BIT(4)
+/* Global remark mapping tables, indexed by the selected source value */
+#define RTL930X_RMK_INTPRI2IPRI_CTRL		(0xD1BC)
+#define RTL930X_RMK_INTPRI2DEI_CTRL		(0xD20C)
+#define RTL930X_RMK_DP2DEI_CTRL			(0xD210)
+#define RTL930X_RMK_INTPRI2DSCP_CTRL(p)		(0xD214 + (((p) / 5) * 4))
 /* port: 0-51, index: 0-7 */
 #define RTL931X_SCHED_PORT_Q_CTRL_SET0(port, index) \
 						(0x2888 + ((port) << 5) + ((index) * 4))

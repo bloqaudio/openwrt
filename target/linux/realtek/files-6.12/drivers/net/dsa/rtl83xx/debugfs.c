@@ -600,6 +600,68 @@ static const struct file_operations sched_algo_fops = {
 	.write = sched_algo_write,
 };
 
+/* Egress remarking state (read-only). There is no kernel API for egress
+ * 1p/DSCP/DEI remarking on DSA ports (the DCBNL app table covers ingress
+ * classification only), so the remark engine state is exposed here for
+ * inspection. The driver leaves the engine untouched: all per-port
+ * enables are clear, which keeps the original header fields on egress.
+ */
+static ssize_t remark_read(struct file *filp, char __user *buffer,
+			   size_t count, loff_t *ppos)
+{
+	static const char * const rmk_src[] = {
+		"intpri", "ipri", "opri", "dscp", "dp", "dp+intpri"
+	};
+	struct rtl838x_port *p = filp->private_data;
+	u32 ctrl, port_ctrl;
+	char buf[384];
+	int len = 0;
+
+	if (*ppos != 0)
+		return 0;
+
+	ctrl = sw_r32(RTL930X_RMK_CTRL);
+	port_ctrl = sw_r32(RTL930X_RMK_PORT_CTRL(p->dp->index));
+
+	len += scnprintf(buf + len, sizeof(buf) - len, "ipri_rmk_en %u\n",
+			 !!(port_ctrl & RTL930X_RMK_PORT_IPRI_RMK_EN));
+	len += scnprintf(buf + len, sizeof(buf) - len, "opri_rmk_en %u\n",
+			 !!(port_ctrl & RTL930X_RMK_PORT_OPRI_RMK_EN));
+	len += scnprintf(buf + len, sizeof(buf) - len, "dscp_rmk_en %u\n",
+			 !!(port_ctrl & RTL930X_RMK_PORT_DSCP_RMK_EN));
+	len += scnprintf(buf + len, sizeof(buf) - len, "dei_rmk_en %u\n",
+			 !!(port_ctrl & RTL930X_RMK_PORT_DEI_RMK_EN));
+	len += scnprintf(buf + len, sizeof(buf) - len, "dei_rmk_tag_sel %s\n",
+			 port_ctrl & RTL930X_RMK_PORT_DEI_RMK_TAG_SEL ?
+			 "outer" : "inner");
+	len += scnprintf(buf + len, sizeof(buf) - len, "ipri_rmk_src %s\n",
+			 rmk_src[min_t(u32, (ctrl & RTL930X_RMK_IPRI_RMK_SRC_M) >> 8, 3)]);
+	len += scnprintf(buf + len, sizeof(buf) - len, "opri_rmk_src %s\n",
+			 rmk_src[min_t(u32, (ctrl & RTL930X_RMK_OPRI_RMK_SRC_M) >> 6, 3)]);
+	len += scnprintf(buf + len, sizeof(buf) - len, "dei_rmk_src %s\n",
+			 ctrl & RTL930X_RMK_DEI_RMK_SRC ? "dp" : "intpri");
+	len += scnprintf(buf + len, sizeof(buf) - len, "dscp_rmk_src %s\n",
+			 rmk_src[min_t(u32, (ctrl & RTL930X_RMK_DSCP_RMK_SRC_M) >> 2, 5)]);
+	len += scnprintf(buf + len, sizeof(buf) - len, "intpri2ipri %08x\n",
+			 sw_r32(RTL930X_RMK_INTPRI2IPRI_CTRL));
+	len += scnprintf(buf + len, sizeof(buf) - len, "intpri2dscp_0 %08x\n",
+			 sw_r32(RTL930X_RMK_INTPRI2DSCP_CTRL(0)));
+	len += scnprintf(buf + len, sizeof(buf) - len, "intpri2dscp_1 %08x\n",
+			 sw_r32(RTL930X_RMK_INTPRI2DSCP_CTRL(5)));
+	len += scnprintf(buf + len, sizeof(buf) - len, "intpri2dei %02x\n",
+			 sw_r32(RTL930X_RMK_INTPRI2DEI_CTRL) & 0xff);
+	len += scnprintf(buf + len, sizeof(buf) - len, "dp2dei %02x\n",
+			 sw_r32(RTL930X_RMK_DP2DEI_CTRL) & 0x7);
+
+	return simple_read_from_buffer(buffer, count, ppos, buf, len);
+}
+
+static const struct file_operations remark_fops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.read = remark_read,
+};
+
 static const struct debugfs_reg32 port_ctrl_regs[] = {
 	{ .name = "port_isolation", .offset = RTL838X_PORT_ISO_CTRL(0), },
 	{ .name = "mac_force_mode", .offset = RTL838X_MAC_FORCE_MODE_CTRL, },
@@ -900,5 +962,7 @@ void rtl930x_dbgfs_init(struct rtl838x_switch_priv *priv)
 				    &priv->ports[i], &storm_rate_bc_fops);
 		debugfs_create_file("sched_algo", 0600, port_dir,
 				    &priv->ports[i], &sched_algo_fops);
+		debugfs_create_file("remark", 0400, port_dir,
+				    &priv->ports[i], &remark_fops);
 	}
 }
