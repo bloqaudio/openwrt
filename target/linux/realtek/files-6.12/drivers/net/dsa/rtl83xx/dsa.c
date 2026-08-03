@@ -604,6 +604,18 @@ static int rtl83xx_setup(struct dsa_switch *ds)
 
 	rtl83xx_vlan_setup(priv);
 
+	/* Every user port starts standalone, so give each one its internal
+	 * L3 VLAN here: it provides the routing VLAN context of a routed
+	 * port. Ports that later join a bridge have it torn down again in
+	 * the bridge_join path, and restored on bridge_leave. Without this
+	 * a port that is never bridged keeps PVID 1 and its traffic is
+	 * classified into the default bridge VLAN instead.
+	 */
+	for (int i = 0; i < priv->cpu_port; i++) {
+		if (priv->ports[i].phy || priv->pcs[i])
+			rtldsa_l3_port_vlan_set(priv, i, true);
+	}
+
 	rtldsa_setup_bpdu_traps(priv);
 	rtldsa_setup_lldp_traps(priv);
 

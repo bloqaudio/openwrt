@@ -2031,6 +2031,30 @@ static int rtldsa_fib6_add(struct rtl838x_switch_priv *priv,
 		return -ENODEV;
 	}
 
+	/* addrconf can replay the same prefix route (e.g. on interface
+	 * flag changes); a second identical entry would occupy another
+	 * prefix-region slot with no effect, so drop duplicates here.
+	 */
+	if (!(rt->fib6_dst.plen == 128 && priv->r->host_route_write)) {
+		struct rhlist_head *list, *pos;
+		struct rtl83xx_route *r;
+
+		rcu_read_lock();
+		list = rhltable_lookup(&priv->routes, gw6, route_ht_params);
+		rhl_for_each_entry_rcu(r, pos, list, linkage) {
+			if (r->attr.type == 2 &&
+			    r->prefix_len == rt->fib6_dst.plen &&
+			    ipv6_addr_equal(&r->dst_ip6, &rt->fib6_dst.addr)) {
+				rcu_read_unlock();
+				pr_debug("%s: duplicate IPv6 prefix %pI6c/%d\n",
+					 __func__, &rt->fib6_dst.addr,
+					 rt->fib6_dst.plen);
+				return 0;
+			}
+		}
+		rcu_read_unlock();
+	}
+
 	/* Allocate route or host-route entry (if hardware supports this);
 	 * the gateway key is the native 128-bit address (:: for connected
 	 * routes, typically a link-local address otherwise).
