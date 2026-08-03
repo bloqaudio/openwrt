@@ -531,6 +531,8 @@ static void rtl83xx_vlan_setup(struct rtl838x_switch_priv *priv)
 	/* Set forwarding action based on inner VLAN tag */
 	for (int i = 0; i < priv->cpu_port; i++)
 		priv->r->vlan_fwd_on_inner(i, true);
+	if (priv->r->vlan_qinq_setup)
+		priv->r->vlan_qinq_setup(priv);
 
 	/* All user ports start out standalone: give each its internal L3
 	 * VLAN so routed traffic can be hardware-forwarded from the start.

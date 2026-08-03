@@ -22,6 +22,11 @@
 #define RTL930X_VLAN_PORT_TAG_STS_CTRL_IGR_P_OTAG_KEEP_MASK	GENMASK(1, 1)
 #define RTL930X_VLAN_PORT_TAG_STS_CTRL_IGR_P_ITAG_KEEP_MASK	GENMASK(0, 0)
 
+#define RTL930X_VLAN_TPID_8021Q					0x8100
+#define RTL930X_VLAN_TPID_8021AD				0x88a8
+#define RTL930X_VLAN_TPID_PAIR(otpid, itpid) \
+	(((u32)(otpid) << 16) | (itpid))
+
 #define RTL930X_LED_GLB_ACTIVE_LOW				BIT(22)
 
 #define RTL930X_LED_SETX_0_CTRL(x) (RTL930X_LED_SET0_0_CTRL - (x * 8))
@@ -2494,6 +2499,78 @@ static void rtl930x_vlan_port_keep_tag_set(int port, bool keep_outer, bool keep_
 	       RTL930X_VLAN_PORT_TAG_STS_CTRL(port));
 }
 
+static void rtl930x_vlan_qinq_setup(struct rtl838x_switch_priv *priv)
+{
+	int port, tpid;
+
+	/* Longan provides four paired outer/inner TPID entries. Keep every
+	 * pair deterministic: standard S-TAG outside, standard C-TAG inside.
+	 */
+	for (tpid = 0; tpid < 4; tpid++)
+		sw_w32(RTL930X_VLAN_TPID_PAIR(RTL930X_VLAN_TPID_8021AD,
+					      RTL930X_VLAN_TPID_8021Q),
+		       RTL930X_VLAN_TAG_TPID_CTRL(tpid));
+
+	/* The normal port posture recognizes only C-TAGs. S-TAG recognition
+	 * is enabled when a user port joins an 802.1ad bridge. The CPU port
+	 * recognizes both so software-injected S-TAGs select the outer VID.
+	 */
+	for (port = 0; port <= priv->cpu_port; port++) {
+		sw_w32(BIT(0), RTL930X_VLAN_PORT_ITAG_TPID_CMP_MSK(port));
+		sw_w32(port == priv->cpu_port ? BIT(0) : 0,
+		       RTL930X_VLAN_PORT_OTAG_TPID_CMP_MSK(port));
+		sw_w32(RTL930X_VLAN_PORT_AFT_ACCEPT_ALL,
+		       RTL930X_VLAN_PORT_AFT(port));
+	}
+
+	/* CPU-injected untagged/C-TAG frames retain the existing inner-VID
+	 * forwarding behaviour; S-TAG and double-tagged frames use the SVID.
+	 */
+	sw_w32_mask(GENMASK(3, 0), BIT(3) | BIT(2),
+		    RTL930X_VLAN_PORT_FWD + (priv->cpu_port << 2));
+}
+
+static void rtl930x_vlan_port_qinq_set(int port, bool enable)
+{
+	u32 tag_sts;
+
+	/* All frame classes on a provider-bridge port forward on the outer
+	 * VID. A normal 802.1Q port forwards every class on the inner VID.
+	 */
+	rtl930x_vlan_fwd_on_inner(port, !enable);
+
+	/* Pair 0 is 0x88a8/0x8100. Normal ports deliberately do not parse an
+	 * S-TAG, preserving the pre-QinQ 802.1Q posture.
+	 */
+	sw_w32(BIT(0), RTL930X_VLAN_PORT_ITAG_TPID_CMP_MSK(port));
+	sw_w32(enable ? BIT(0) : 0,
+	       RTL930X_VLAN_PORT_OTAG_TPID_CMP_MSK(port));
+
+	/* Inserted outer tags take pair-0's 0x88a8 TPID rather than retaining
+	 * an ingress TPID. The same zero value is valid after leaving QinQ.
+	 */
+	sw_w32_mask(RTL930X_VLAN_PORT_EGR_TPID_OTPID_IDX |
+		    RTL930X_VLAN_PORT_EGR_TPID_OTPID_KEEP, 0,
+		    RTL930X_VLAN_PORT_EGR_TPID_CTRL(port));
+
+	if (!enable) {
+		/* Existing 802.1Q posture: outer untagged, inner table-tagged. */
+		rtl930x_vlan_port_keep_tag_set(port, false, true);
+		return;
+	}
+
+	/* Provider-bridge posture: the VLAN table controls the outer S-TAG;
+	 * preserve an ingress C-TAG transparently across the switch.
+	 */
+	tag_sts = FIELD_PREP(RTL930X_VLAN_PORT_TAG_STS_CTRL_EGR_OTAG_STS_MASK,
+			     RTL930X_VLAN_PORT_TAG_STS_TAGGED) |
+		  FIELD_PREP(RTL930X_VLAN_PORT_TAG_STS_CTRL_EGR_ITAG_STS_MASK,
+			     RTL930X_VLAN_PORT_TAG_STS_INTERNAL) |
+		  RTL930X_VLAN_PORT_TAG_STS_CTRL_EGR_P_ITAG_KEEP_MASK |
+		  RTL930X_VLAN_PORT_TAG_STS_CTRL_IGR_P_ITAG_KEEP_MASK;
+	sw_w32(tag_sts, RTL930X_VLAN_PORT_TAG_STS_CTRL(port));
+}
+
 static void rtl930x_vlan_port_pvidmode_set(int port, enum pbvlan_type type, enum pbvlan_mode mode)
 {
 	if (type == PBVLAN_TYPE_INNER)
@@ -3190,6 +3267,8 @@ const struct rtl838x_reg rtl930x_reg = {
 	.vlan_profile_dump = rtl930x_vlan_profile_dump,
 	.vlan_profile_setup = rtl930x_vlan_profile_setup,
 	.vlan_fwd_on_inner = rtl930x_vlan_fwd_on_inner,
+	.vlan_qinq_setup = rtl930x_vlan_qinq_setup,
+	.vlan_port_qinq_set = rtl930x_vlan_port_qinq_set,
 	.set_vlan_igr_filter = rtl930x_set_igr_filter,
 	.set_vlan_egr_filter = rtl930x_set_egr_filter,
 	.stp_get = rtl930x_stp_get,

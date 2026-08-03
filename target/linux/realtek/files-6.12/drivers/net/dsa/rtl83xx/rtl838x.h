@@ -83,10 +83,21 @@
 #define RTL839X_VLAN_PORT_EGR_FLTR		(0x27C4)
 
 #define RTL930X_VLAN_PROFILE_SET(idx)		(0x9c60 + (((idx) * 20)))
+#define RTL930X_VLAN_TAG_TPID_CTRL(idx)		(0xc7ac + ((idx) << 2))
+#define RTL930X_VLAN_PORT_ITAG_TPID_CMP_MSK(port) \
+	(0x327c + ((port) << 6))
+#define RTL930X_VLAN_PORT_OTAG_TPID_CMP_MSK(port) \
+	(0x3280 + ((port) << 6))
+#define RTL930X_VLAN_PORT_AFT(port)		(0x8260 + ((port) << 2))
 #define RTL930X_VLAN_CTRL			(0x82D4)
 #define RTL930X_VLAN_PORT_PB_VLAN		(0x82D8)
 #define RTL930X_VLAN_PORT_IGR_FLTR		(0x83C0)
 #define RTL930X_VLAN_PORT_EGR_FLTR		(0x83C8)
+#define RTL930X_VLAN_PORT_EGR_TPID_CTRL(port)	(0xce98 + ((port) << 2))
+
+#define RTL930X_VLAN_PORT_AFT_ACCEPT_ALL	GENMASK(3, 0)
+#define RTL930X_VLAN_PORT_EGR_TPID_OTPID_IDX	GENMASK(5, 4)
+#define RTL930X_VLAN_PORT_EGR_TPID_OTPID_KEEP	BIT(3)
 
 #define RTL931X_VLAN_PROFILE_SET(idx)		(0x9800 + (((idx) * 28)))
 #define RTL931X_VLAN_CTRL			(0x94E4)
@@ -1331,6 +1342,8 @@ struct rtl838x_reg {
 	void (*vlan_port_pvidmode_set)(int port, enum pbvlan_type type, enum pbvlan_mode mode);
 	void (*vlan_port_pvid_set)(int port, enum pbvlan_type type, int pvid);
 	void (*vlan_port_keep_tag_set)(int port, bool keep_outer, bool keep_inner);
+	void (*vlan_qinq_setup)(struct rtl838x_switch_priv *priv);
+	void (*vlan_port_qinq_set)(int port, bool enable);
 	int (*vlan_port_fast_age)(struct rtl838x_switch_priv *priv, int port, u16 vid);
 	void (*set_vlan_igr_filter)(int port, enum igr_filter state);
 	void (*set_vlan_egr_filter)(int port, enum egr_filter state);
