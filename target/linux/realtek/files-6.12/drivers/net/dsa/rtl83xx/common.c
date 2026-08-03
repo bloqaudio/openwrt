@@ -731,19 +731,31 @@ int rtl83xx_port_is_under(const struct net_device *dev, struct rtl838x_switch_pr
 }
 
 static const struct rhashtable_params route_ht_params = {
-	.key_len     = sizeof(u32),
-	.key_offset  = offsetof(struct rtl83xx_route, gw_ip),
+	.key_len     = sizeof(struct in6_addr),
+	.key_offset  = offsetof(struct rtl83xx_route, gw_ip6),
 	.head_offset = offsetof(struct rtl83xx_route, linkage),
 };
+
+/* Build the gateway hash key of an IPv4 route. Gateways are stored
+ * v4-mapped so the connected-route keys 0.0.0.0 (IPv4) and :: (IPv6)
+ * never collide in a bucket.
+ */
+static void rtl83xx_route_key4(__be32 gw, struct in6_addr *key)
+{
+	ipv6_addr_set(key, 0, 0, htonl(0x0000ffff), gw);
+}
 
 /* Updates an L3 next hop entry in the ROUTING table */
 static int rtl83xx_l3_nexthop_update(struct rtl838x_switch_priv *priv,  __be32 ip_addr, u64 mac)
 {
 	struct rtl83xx_route *r;
 	struct rhlist_head *tmp, *list;
+	struct in6_addr key;
+
+	rtl83xx_route_key4(ip_addr, &key);
 
 	rcu_read_lock();
-	list = rhltable_lookup(&priv->routes, &ip_addr, route_ht_params);
+	list = rhltable_lookup(&priv->routes, &key, route_ht_params);
 	if (!list) {
 		rcu_read_unlock();
 		return -ENOENT;
@@ -908,7 +920,8 @@ static int rtl83xx_port_dev_lower_find(struct net_device *dev, struct rtl838x_sw
 	return data.port;
 }
 
-static struct rtl83xx_route *rtl83xx_route_alloc(struct rtl838x_switch_priv *priv, u32 ip)
+static struct rtl83xx_route *rtl83xx_route_alloc(struct rtl838x_switch_priv *priv,
+						 const struct in6_addr *key)
 {
 	struct rtl83xx_route *r;
 	int idx = 0, err;
@@ -916,7 +929,7 @@ static struct rtl83xx_route *rtl83xx_route_alloc(struct rtl838x_switch_priv *pri
 	mutex_lock(&priv->reg_mutex);
 
 	idx = find_first_zero_bit(priv->route_use_bm, MAX_ROUTES);
-	pr_debug("%s id: %d, ip %pI4\n", __func__, idx, &ip);
+	pr_debug("%s id: %d, gw %pI6c\n", __func__, idx, key);
 
 	r = kzalloc(sizeof(*r), GFP_KERNEL);
 	if (!r) {
@@ -925,7 +938,7 @@ static struct rtl83xx_route *rtl83xx_route_alloc(struct rtl838x_switch_priv *pri
 	}
 
 	r->id = idx;
-	r->gw_ip = ip;
+	r->gw_ip6 = *key;
 	r->pr.id = -1; /* We still need to allocate a rule in HW */
 	r->is_host_route = false;
 
@@ -948,7 +961,8 @@ out_free:
 	return NULL;
 }
 
-static struct rtl83xx_route *rtl83xx_host_route_alloc(struct rtl838x_switch_priv *priv, u32 ip)
+static struct rtl83xx_route *rtl83xx_host_route_alloc(struct rtl838x_switch_priv *priv,
+						      const struct in6_addr *key)
 {
 	struct rtl83xx_route *r;
 	int idx = 0, err;
@@ -956,7 +970,7 @@ static struct rtl83xx_route *rtl83xx_host_route_alloc(struct rtl838x_switch_priv
 	mutex_lock(&priv->reg_mutex);
 
 	idx = find_first_zero_bit(priv->host_route_use_bm, MAX_HOST_ROUTES);
-	pr_debug("%s id: %d, ip %pI4\n", __func__, idx, &ip);
+	pr_debug("%s id: %d, gw %pI6c\n", __func__, idx, key);
 
 	r = kzalloc(sizeof(*r), GFP_KERNEL);
 	if (!r) {
@@ -969,7 +983,7 @@ static struct rtl83xx_route *rtl83xx_host_route_alloc(struct rtl838x_switch_priv
 	 */
 	r->id = idx + MAX_ROUTES;
 
-	r->gw_ip = ip;
+	r->gw_ip6 = *key;
 	r->pr.id = -1; /* We still need to allocate a rule in HW */
 	r->is_host_route = true;
 
@@ -1072,12 +1086,15 @@ static int rtldsa_fib4_del(struct rtl838x_switch_priv *priv,
 	struct fib_nh *nh = fib_info_nh(info->fi, 0);
 	struct rhlist_head *tmp, *list;
 	struct rtl83xx_route *route, *entry;
+	struct in6_addr key;
 
 	if (rtldsa_fib4_check(priv, info, FIB_EVENT_ENTRY_DEL))
 		return 0;
 
+	rtl83xx_route_key4(nh->fib_nh_gw4, &key);
+
 	rcu_read_lock();
-	list = rhltable_lookup(&priv->routes, &nh->fib_nh_gw4, route_ht_params);
+	list = rhltable_lookup(&priv->routes, &key, route_ht_params);
 	if (!list) {
 		rcu_read_unlock();
 		dev_err(priv->dev, "no such gateway: %pI4\n", &nh->fib_nh_gw4);
@@ -1227,6 +1244,7 @@ static int rtl83xx_l3_neigh_route_add(struct rtl838x_switch_priv *priv,
 				      int vlan, int port)
 {
 	struct rtl83xx_route *r;
+	struct in6_addr key;
 	int slot, if_id;
 
 	if (!priv->r->host_route_write || !priv->r->set_l3_router_mac)
@@ -1250,7 +1268,8 @@ static int rtl83xx_l3_neigh_route_add(struct rtl838x_switch_priv *priv,
 	pr_debug("%s: ip %pI4 mac %016llx vlan %d port %d\n",
 		 __func__, &ip, mac, vlan, port);
 
-	r = rtl83xx_host_route_alloc(priv, ip);
+	rtl83xx_route_key4(ip, &key);
+	r = rtl83xx_host_route_alloc(priv, &key);
 	if (!r)
 		return -ENOSPC;
 
@@ -1321,9 +1340,12 @@ static void rtl83xx_l3_neigh_route_del(struct rtl838x_switch_priv *priv, __be32 
 	struct rtl83xx_route *r = NULL, *entry;
 	struct rhlist_head *tmp, *list;
 	struct rtl83xx_nexthop nh;
+	struct in6_addr key;
+
+	rtl83xx_route_key4(ip, &key);
 
 	rcu_read_lock();
-	list = rhltable_lookup(&priv->routes, &ip, route_ht_params);
+	list = rhltable_lookup(&priv->routes, &key, route_ht_params);
 	if (!list) {
 		rcu_read_unlock();
 		return;
@@ -1424,6 +1446,7 @@ static int rtldsa_fib4_add(struct rtl838x_switch_priv *priv,
 	int vlan = is_vlan_dev(ndev) ? vlan_dev_vlan_id(ndev) : 0;
 	struct fib_nh *nh = fib_info_nh(info->fi, 0);
 	struct rtl83xx_route *route;
+	struct in6_addr key;
 	int port;
 
 	if (rtldsa_fib4_check(priv, info, FIB_EVENT_ENTRY_ADD))
@@ -1443,10 +1466,11 @@ static int rtldsa_fib4_add(struct rtl838x_switch_priv *priv,
 	}
 
 	/* Allocate route or host-route entry (if hardware supports this) */
+	rtl83xx_route_key4(nh->fib_nh_gw4, &key);
 	if (info->dst_len == 32 && priv->r->host_route_write)
-		route = rtl83xx_host_route_alloc(priv, nh->fib_nh_gw4);
+		route = rtl83xx_host_route_alloc(priv, &key);
 	else
-		route = rtl83xx_route_alloc(priv, nh->fib_nh_gw4);
+		route = rtl83xx_route_alloc(priv, &key);
 
 	if (route)
 		dev_info(priv->dev, "route hashtable extended for gw %pI4\n", &nh->fib_nh_gw4);

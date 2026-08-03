@@ -1244,9 +1244,13 @@ struct rtl93xx_route_attr {
 };
 
 struct rtl83xx_route {
-	u32 gw_ip;			/* IP of the route's gateway */
-	u32 dst_ip;			/* IP of the destination net */
-	struct in6_addr dst_ip6;
+	struct in6_addr gw_ip6;		/* IP of the route's gateway - the hashtable key.
+					 * IPv4 gateways are stored v4-mapped so the
+					 * connected-route keys 0.0.0.0 and :: never share
+					 * a bucket.
+					 */
+	u32 dst_ip;			/* IPv4 destination net */
+	struct in6_addr dst_ip6;	/* IPv6 destination net */
 	int prefix_len;			/* Network prefix len of the destination net */
 	bool is_host_route;
 	bool neigh_route;		/* Synthesized from a neighbour entry, not the FIB:
