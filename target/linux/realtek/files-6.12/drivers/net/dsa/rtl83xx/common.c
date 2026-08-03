@@ -1039,6 +1039,13 @@ static void rtl83xx_route_rm(struct rtl838x_switch_priv *priv, struct rtl83xx_ro
 			priv->r->host_route_write(id, r);
 		}
 		clear_bit(r->id, priv->route_use_bm);
+	} else if (r->attr.type == 2) {
+		/* An IPv6 gateway prefix route lives in the sorted IPv6
+		 * region of the prefix table, which is rewritten wholesale
+		 * by rtl83xx_l3_ip6_prefix_reprogram() after any change -
+		 * no individual invalidation here.
+		 */
+		clear_bit(r->id, priv->route_use_bm);
 	} else {
 		/* If there is a HW representation of the route, delete it.
 		 * route_lookup_hw is a longest-prefix-match search: for a route
@@ -1385,6 +1392,144 @@ static void rtl83xx_l3_neigh_route_del(struct rtl838x_switch_priv *priv, __be32 
 	rtl83xx_l2_nexthop_rm(priv, &nh);
 }
 
+static void rtldsa_ip6_mask(int prefix_len, struct in6_addr *mask)
+{
+	int o, b;
+
+	memset(mask->s6_addr, 0, sizeof(mask->s6_addr));
+	o = prefix_len >> 3;
+	b = prefix_len & 0x7;
+	if (o >= (int)sizeof(mask->s6_addr)) {
+		memset(mask->s6_addr, 0xff, sizeof(mask->s6_addr));
+		return;
+	}
+	memset(mask->s6_addr, 0xff, o);
+	if (b)
+		mask->s6_addr[o] = 0xff00 >> b;
+}
+
+/* IPv6 prefix entries live in the shared 512-entry prefix table in a
+ * region that grows downward from index 507: each entry spans 3 TCAM
+ * slots and must start at an index == 0 or 3 (mod 8); the hardware
+ * returns the lowest matching index, so the region is kept sorted with
+ * the longest prefix at the lowest index. This is the Longan SDK region
+ * discipline (v4 entries grow up from 0, v6 down from IDX_MAX - 4); the
+ * SDK moves entries on insert/delete, here the whole region is simply
+ * rewritten on every change - v6 prefix routes are few and change rarely.
+ */
+#define RTLDSA_IP6_ROUTE_IDX_TOP	(MAX_ROUTES - 5)	/* 507 */
+#define RTLDSA_IP6_ROUTE_MAX		128	/* 2 entries per 8 slots */
+
+/* Table index of the n-th entry of the IPv6 prefix region, counting
+ * downward from the top: 507, 504, 499, 496, 491, 488, ...
+ */
+static int rtldsa_ip6_route_idx(int n)
+{
+	int idx = RTLDSA_IP6_ROUTE_IDX_TOP;
+
+	while (n-- > 0) {
+		idx -= 3;
+		if (idx % 8 != 0 && idx % 8 != 3)
+			idx -= 2;
+	}
+
+	return idx;
+}
+
+/* Rewrite the IPv6 prefix region from the current software state: all
+ * resolved gateway prefix routes sorted longest-prefix-first at the
+ * lowest indices. Growth claims 3-slot triples from route_use_bm (a
+ * triple already owned by a route ID blocks further growth - the
+ * remaining routes stay on the CPU path via the catch-all trap);
+ * shrinking invalidates and releases the tail.
+ */
+static int rtl83xx_l3_ip6_prefix_reprogram(struct rtl838x_switch_priv *priv)
+{
+	struct rhashtable_iter iter;
+	struct rtl83xx_route **sorted, *r;
+	struct rtl83xx_route invalid = { };
+	int i, idx, n = 0;
+
+	if (!priv->r->route_write)
+		return -EOPNOTSUPP;
+
+	sorted = kmalloc_array(RTLDSA_IP6_ROUTE_MAX, sizeof(*sorted), GFP_KERNEL);
+	if (!sorted)
+		return -ENOMEM;
+
+	/* Collect all resolved IPv6 gateway prefix routes, longest prefix
+	 * first. Connected routes (gateway ::) are not programmed: their
+	 * hosts are covered by neighbour host routes.
+	 */
+	rhltable_walk_enter(&priv->routes, &iter);
+	rhashtable_walk_start(&iter);
+	while ((r = rhashtable_walk_next(&iter)) != NULL) {
+		bool dup = false;
+
+		if (IS_ERR(r))
+			continue;
+		if (r->attr.type != 2 || r->is_host_route ||
+		    r->prefix_len >= 128 || !r->attr.valid ||
+		    ipv6_addr_any(&r->gw_ip6))
+			continue;
+		if (n >= RTLDSA_IP6_ROUTE_MAX)
+			break;
+		for (i = 0; i < n; i++) {
+			if (sorted[i]->prefix_len == r->prefix_len &&
+			    ipv6_addr_equal(&sorted[i]->dst_ip6, &r->dst_ip6)) {
+				dup = true;
+				break;
+			}
+		}
+		if (dup)
+			continue;
+		i = n++;
+		while (i > 0 && sorted[i - 1]->prefix_len < r->prefix_len) {
+			sorted[i] = sorted[i - 1];
+			i--;
+		}
+		sorted[i] = r;
+	}
+	rhashtable_walk_stop(&iter);
+	rhashtable_walk_exit(&iter);
+
+	/* Claim the triples needed beyond the currently programmed region. */
+	for (i = priv->ip6_prefix_hw_cnt; i < n; i++) {
+		idx = rtldsa_ip6_route_idx(i);
+		if (test_bit(idx, priv->route_use_bm) ||
+		    test_bit(idx + 1, priv->route_use_bm) ||
+		    test_bit(idx + 2, priv->route_use_bm)) {
+			dev_warn(priv->dev,
+				 "IPv6 prefix table region full, %d route(s) stay in software\n",
+				 n - i);
+			n = i;
+			break;
+		}
+		set_bit(idx, priv->route_use_bm);
+		set_bit(idx + 1, priv->route_use_bm);
+		set_bit(idx + 2, priv->route_use_bm);
+	}
+
+	/* Rewrite the region, longest prefix at the lowest index. */
+	for (i = 0; i < n; i++)
+		priv->r->route_write(rtldsa_ip6_route_idx(i), sorted[i]);
+
+	/* Invalidate and release any tail the region no longer covers. */
+	invalid.attr.type = 2;
+	for (i = n; i < priv->ip6_prefix_hw_cnt; i++) {
+		idx = rtldsa_ip6_route_idx(i);
+		priv->r->route_write(idx, &invalid);
+		clear_bit(idx, priv->route_use_bm);
+		clear_bit(idx + 1, priv->route_use_bm);
+		clear_bit(idx + 2, priv->route_use_bm);
+	}
+
+	priv->ip6_prefix_hw_cnt = n;
+	kfree(sorted);
+
+	return 0;
+}
+
 /* Updates an L3 next hop entry in the ROUTING table for an IPv6 gateway -
  * the IPv6 twin of rtl83xx_l3_nexthop_update(). The nexthop, L2 nexthop
  * and egress interface machinery is family-agnostic and shared with IPv4.
@@ -1394,6 +1539,7 @@ static int rtl83xx_l3_nexthop6_update(struct rtl838x_switch_priv *priv,
 {
 	struct rtl83xx_route *r;
 	struct rhlist_head *tmp, *list;
+	bool reprogram = false;
 
 	rcu_read_lock();
 	list = rhltable_lookup(&priv->routes, ip6, route_ht_params);
@@ -1432,8 +1578,33 @@ static int rtl83xx_l3_nexthop6_update(struct rtl838x_switch_priv *priv,
 		if (priv->r->set_l3_nexthop)
 			priv->r->set_l3_nexthop(r->nh.id, r->nh.l2_id, r->nh.if_id);
 
-		if (!r->is_host_route)
+		if (!r->is_host_route) {
+			/* Prefix route: program a PIE rule matching the
+			 * prefix (mirroring the IPv4 prefix path) and mark
+			 * the region for a rewrite with the new NH_IDX.
+			 */
+			r->pr.is_ipv6 = true;
+			r->pr.dip6 = r->dst_ip6;
+			rtldsa_ip6_mask(r->prefix_len, &r->pr.dip6_m);
+			r->pr.fwd_sel = true;
+			r->pr.fwd_data = r->nh.l2_id;
+			r->pr.fwd_act = PIE_ACT_ROUTE_UC;
+
+			if (r->pr.id < 0) {
+				r->pr.packet_cntr = rtl83xx_packet_cntr_alloc(priv);
+				if (r->pr.packet_cntr >= 0) {
+					pr_debug("Using packet counter %d\n", r->pr.packet_cntr);
+					r->pr.log_sel = true;
+					r->pr.log_data = r->pr.packet_cntr;
+				}
+				priv->r->pie_rule_add(priv, &r->pr);
+			} else {
+				priv->r->pie_rule_write(priv, r->pr.id, &r->pr);
+			}
+
+			reprogram = true;
 			continue;
+		}
 
 		/* Update the existing slot if this destination is already
 		 * programmed; only claim a free slot for a first-time
@@ -1453,6 +1624,9 @@ static int rtl83xx_l3_nexthop6_update(struct rtl838x_switch_priv *priv,
 		priv->r->host_route_write(slot, r);
 	}
 	rcu_read_unlock();
+
+	if (reprogram)
+		rtl83xx_l3_ip6_prefix_reprogram(priv);
 
 	return 0;
 }
@@ -1824,13 +1998,6 @@ static int rtldsa_fib6_check(struct rtl838x_switch_priv *priv,
 		dev_warn(priv->dev, "skip default route\n");
 		return -EINVAL;
 	}
-	/* Prefix routes via a gateway are not offloaded (host routes only);
-	 * they stay on the CPU path via the catch-all trap.
-	 */
-	if (rt->fib6_dst.plen < 128 && !ipv6_addr_any(gw6)) {
-		pr_debug("%s: skip gateway prefix route\n", __func__);
-		return -EINVAL;
-	}
 
 	return 0;
 }
@@ -1949,6 +2116,7 @@ static int rtldsa_fib6_del(struct rtl838x_switch_priv *priv,
 	struct in6_addr *gw6 = &rt->fib6_nh->fib_nh_gw6;
 	struct rhlist_head *tmp, *list;
 	struct rtl83xx_route *route, *entry;
+	bool was_prefix;
 
 	if (rtldsa_fib6_check(priv, info, FIB_EVENT_ENTRY_DEL))
 		return 0;
@@ -1989,7 +2157,16 @@ static int rtldsa_fib6_del(struct rtl838x_switch_priv *priv,
 	if (route->pr.id >= 0)
 		priv->r->pie_rule_rm(priv, &route->pr);
 
+	was_prefix = !route->is_host_route && route->prefix_len < 128 &&
+		     !ipv6_addr_any(&route->gw_ip6);
+
 	rtl83xx_route_rm(priv, route);
+
+	/* The prefix region is contiguous and sorted: removing an entry
+	 * leaves a hole, so rewrite the region.
+	 */
+	if (was_prefix)
+		rtl83xx_l3_ip6_prefix_reprogram(priv);
 
 	return 0;
 }

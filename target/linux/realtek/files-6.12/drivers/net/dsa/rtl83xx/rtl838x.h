@@ -1454,6 +1454,7 @@ struct rtl838x_switch_priv {
 	struct rhltable routes;
 	unsigned long route_use_bm[MAX_ROUTES >> 5];
 	unsigned long host_route_use_bm[MAX_HOST_ROUTES >> 5];
+	int ip6_prefix_hw_cnt;	/* entries programmed in the IPv6 prefix region */
 	struct rtl838x_l3_intf *interfaces[MAX_INTERFACES];
 	u16 intf_mtus[MAX_INTF_MTUS];
 	int intf_mtu_count[MAX_INTF_MTUS];
