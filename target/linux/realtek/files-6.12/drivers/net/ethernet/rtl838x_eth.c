@@ -25,6 +25,8 @@
 #include "rtl838x_eth.h"
 
 int rtl83xx_setup_tc(struct net_device *dev, enum tc_setup_type type, void *type_data);
+void rtl83xx_sample_rx(struct net_device *conduit, int port, bool egress,
+		       struct sk_buff *skb, unsigned int frame_len);
 
 /* Maximum number of RX rings is 8 on RTL83XX and 32 on the 93XX
  * The ring is assigned by switch based on packet/port priortity
@@ -256,6 +258,7 @@ static void rtl931x_update_cntr(int r, int released)
 
 struct dsa_tag {
 	u8	reason;
+	u8	sflow;
 	u8	queue;
 	u16	port;
 	u8	l2_offloaded;
@@ -263,10 +266,17 @@ struct dsa_tag {
 	bool	crc_error;
 };
 
+/* RTL930X RX CPU tag sFlow field values: 1 = ingress sample, 2 = egress
+ * sample (SDK nic_rtl9300.h NIC_9300_SFLOW_RX/TX).
+ */
+#define RTL930X_TAG_SFLOW_RX	1
+#define RTL930X_TAG_SFLOW_TX	2
+
 static bool rtl838x_decode_tag(struct p_hdr *h, struct dsa_tag *t)
 {
 	/* cpu_tag[0] is reserved. Fields are off-by-one */
 	t->reason = h->cpu_tag[4] & 0xf;
+	t->sflow = 0;
 	t->queue = (h->cpu_tag[1] & 0xe0) >> 5;
 	t->port = h->cpu_tag[1] & 0x1f;
 	t->crc_error = t->reason == 13;
@@ -284,6 +294,7 @@ static bool rtl839x_decode_tag(struct p_hdr *h, struct dsa_tag *t)
 {
 	/* cpu_tag[0] is reserved. Fields are off-by-one */
 	t->reason = h->cpu_tag[5] & 0x1f;
+	t->sflow = 0;
 	t->queue = (h->cpu_tag[4] & 0xe000) >> 13;
 	t->port = h->cpu_tag[1] & 0x3f;
 	t->crc_error = h->cpu_tag[4] & BIT(6);
@@ -301,11 +312,18 @@ static bool rtl839x_decode_tag(struct p_hdr *h, struct dsa_tag *t)
 static bool rtl930x_decode_tag(struct p_hdr *h, struct dsa_tag *t)
 {
 	t->reason = h->cpu_tag[7] & 0x3f;
+	/* sFlow field: 2 bits after the 4 mirror-hit bits of the tag's
+	 * B8-B11 word (MSB first), i.e. cpu_tag[4] bits 11:10; 0 = no
+	 * sample, 1 = ingress sample, 2 = egress sample (SDK
+	 * nic_rtl9300.h, struct nic_9300_cpuTag_s.rx).
+	 */
+	t->sflow = (h->cpu_tag[4] >> 10) & 0x3;
 	t->queue =  (h->cpu_tag[2] >> 11) & 0x1f;
 	t->port = (h->cpu_tag[0] >> 8) & 0x1f;
 	t->crc_error = h->cpu_tag[1] & BIT(6);
 
-	pr_debug("Reason %d, port %d, queue %d\n", t->reason, t->port, t->queue);
+	pr_debug("Reason %d, port %d, queue %d, sflow %d\n",
+		 t->reason, t->port, t->queue, t->sflow);
 	if (t->reason >= 19 && t->reason <= 27)
 		t->l2_offloaded = 0;
 	else
@@ -317,6 +335,7 @@ static bool rtl930x_decode_tag(struct p_hdr *h, struct dsa_tag *t)
 static bool rtl931x_decode_tag(struct p_hdr *h, struct dsa_tag *t)
 {
 	t->reason = h->cpu_tag[7] & 0x3f;
+	t->sflow = 0;
 	t->queue =  (h->cpu_tag[2] >> 11) & 0x1f;
 	t->port = (h->cpu_tag[0] >> 8) & 0x3f;
 	t->crc_error = h->cpu_tag[1] & BIT(6);
@@ -1252,6 +1271,22 @@ static int rtl838x_hw_receive(struct net_device *dev, int r, int budget)
 			/* Overwrite CRC with cpu_tag */
 			if (dsa) {
 				priv->r->decode_tag(h, &tag);
+				/* A sampling copy exists only for psample
+				 * (the ASIC forwards or delivers the
+				 * original separately), so it is consumed
+				 * here - passing it up the stack would
+				 * double-deliver CPU traffic and
+				 * double-forward software-bridged flows.
+				 * It still carries the CRC in its last 4
+				 * bytes; emitted to psample without it.
+				 */
+				if (tag.sflow) {
+					rtl83xx_sample_rx(dev, tag.port,
+							  tag.sflow == RTL930X_TAG_SFLOW_TX,
+							  skb, len - 4);
+					dev_kfree_skb_any(skb);
+					goto next_frame;
+				}
 				skb->data[len - 4] = 0x80;
 				skb->data[len - 3] = tag.port;
 				skb->data[len - 2] = 0x10;
@@ -1281,6 +1316,7 @@ static int rtl838x_hw_receive(struct net_device *dev, int r, int budget)
 			dev->stats.rx_dropped++;
 		}
 
+next_frame:
 		/* Reset header structure */
 		memset(h, 0, sizeof(struct p_hdr));
 		h->buf = data;
