@@ -2331,7 +2331,16 @@ static void rtl930x_set_l3_egress_mac(u32 idx, u64 mac)
  * Lowest matching index wins, so these sit at the very top of the table.
  */
 #define RTL930X_ROUTE_IDX_CATCHALL_IP4	(MAX_ROUTES - 1)
-#define RTL930X_ROUTE_IDX_CATCHALL_IP6	(MAX_ROUTES - 2)
+/* An IPv6 prefix entry is only valid at an index == 0 or 3 (mod 8) and
+ * occupies a multi-slot footprint (SDK route-entry allocator); 507 is
+ * the highest valid IPv6 position, and since the hardware returns the
+ * lowest matching index, every dynamic IPv6 route (at 504 and below)
+ * shadows the catch-all. The previous index (MAX_ROUTES - 2 = 510,
+ * == 6 mod 8) is not a valid IPv6 entry position - the entry never
+ * matched, and every IPv6 lookup miss was silently dropped in hardware
+ * once IP6UC routing was globally enabled.
+ */
+#define RTL930X_ROUTE_IDX_CATCHALL_IP6	(MAX_ROUTES - 5)
 
 static int rtl930x_l3_setup(struct rtl838x_switch_priv *priv)
 {
@@ -2422,7 +2431,14 @@ static int rtl930x_l3_setup(struct rtl838x_switch_priv *priv)
 
 	rt.attr.type = 2; /* IPv6 */
 	rtl930x_route_write(RTL930X_ROUTE_IDX_CATCHALL_IP6, &rt);
+	/* The IPv6 entry footprint spans three slots */
 	set_bit(RTL930X_ROUTE_IDX_CATCHALL_IP6, priv->route_use_bm);
+	set_bit(RTL930X_ROUTE_IDX_CATCHALL_IP6 + 1, priv->route_use_bm);
+	set_bit(RTL930X_ROUTE_IDX_CATCHALL_IP6 + 2, priv->route_use_bm);
+	/* 510 is unusable for IPv6 and stays reserved-unused so nothing
+	 * lands between the two catch-alls.
+	 */
+	set_bit(MAX_ROUTES - 2, priv->route_use_bm);
 
 	return 0;
 }

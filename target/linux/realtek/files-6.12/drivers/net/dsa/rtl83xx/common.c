@@ -1417,7 +1417,7 @@ static void rtldsa_ip6_mask(int prefix_len, struct in6_addr *mask)
  * SDK moves entries on insert/delete, here the whole region is simply
  * rewritten on every change - v6 prefix routes are few and change rarely.
  */
-#define RTLDSA_IP6_ROUTE_IDX_TOP	(MAX_ROUTES - 5)	/* 507 */
+#define RTLDSA_IP6_ROUTE_IDX_TOP	(MAX_ROUTES - 8)	/* 504; 507 = v6 catch-all */
 #define RTLDSA_IP6_ROUTE_MAX		128	/* 2 entries per 8 slots */
 
 /* Table index of the n-th entry of the IPv6 prefix region, counting
@@ -1985,10 +1985,6 @@ static int rtldsa_fib6_check(struct rtl838x_switch_priv *priv,
 
 	vlan = is_vlan_dev(ndev) ? vlan_dev_vlan_id(ndev) : 0;
 
-	dev_info(priv->dev, "%s IPv6 route %pI6c/%d via %pI6c (VLAN %d, MAC %pM)\n",
-		 event == FIB_EVENT_ENTRY_ADD ? "add" : "delete",
-		 &rt->fib6_dst.addr, rt->fib6_dst.plen, gw6, vlan, ndev->dev_addr);
-
 	addr_type = ipv6_addr_type(&rt->fib6_dst.addr);
 	if (addr_type & (IPV6_ADDR_MULTICAST | IPV6_ADDR_LINKLOCAL | IPV6_ADDR_LOOPBACK)) {
 		dev_warn(priv->dev, "skip multicast/link-local/loopback destination\n");
@@ -1998,6 +1994,13 @@ static int rtldsa_fib6_check(struct rtl838x_switch_priv *priv,
 		dev_warn(priv->dev, "skip default route\n");
 		return -EINVAL;
 	}
+
+	/* Logged only after the filters: a skipped route (link-local,
+	 * multicast, default) must not read as an accepted one.
+	 */
+	dev_info(priv->dev, "%s IPv6 route %pI6c/%d via %pI6c (VLAN %d, MAC %pM)\n",
+		 event == FIB_EVENT_ENTRY_ADD ? "add" : "delete",
+		 &rt->fib6_dst.addr, rt->fib6_dst.plen, gw6, vlan, ndev->dev_addr);
 
 	return 0;
 }
