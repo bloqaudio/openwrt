@@ -295,6 +295,24 @@
 #define RTL930X_MIR_DPM_CTRL			(0xA2C0)
 #define RTL930X_MIR_SPM_CTRL			(0xA2B0)
 
+/* Port-based packet sampling (sFlow): one 32-bit register per port, the
+ * low half holding the ingress rate and the high half the egress rate.
+ * A rate of N samples one in N packets, 0 disables sampling; there is no
+ * separate enable bit. Sampled packets are copied to the CPU, forwarding
+ * of the original is unaffected (SDK dal_longan_mirror_sflowPort{Igr,Egr}
+ * SampleRate_set). The global control register selects the sample copy
+ * target (local vs master CPU) and which copy to keep when a packet is
+ * both ingress- and egress-sampled (SDK dal_longan_mirror_sflowSample
+ * {Target,Ctrl}_set).
+ */
+#define RTL930X_SFLOW_CTRL			(0xBEA0)
+#define RTL930X_SFLOW_CTRL_SMPL_SEL		BIT(0)
+#define RTL930X_SFLOW_CTRL_CPU_SEL		BIT(1)
+#define RTL930X_SFLOW_PORT_RATE_CTRL(p)		(0xBEA4 + (((p) << 2)))
+#define RTL930X_SFLOW_IGR_RATE_MASK		GENMASK(15, 0)
+#define RTL930X_SFLOW_EGR_RATE_MASK		GENMASK(31, 16)
+#define RTL930X_SFLOW_RATE_MAX			(0xffff)
+
 #define RTL931X_MIR_CTRL			(0xAF00)
 #define RTL931X_MIR_DPM_CTRL			(0xAF30)
 #define RTL931X_MIR_SPM_CTRL			(0xAF10)
@@ -885,6 +903,19 @@ struct rtldsa_counter_state {
 	struct rtnl_link_stats64 link_stat;
 };
 
+struct psample_group;
+
+/* Per-port hardware packet sampling state, indexed by direction
+ * (0 = ingress, 1 = egress). Written under reg_mutex from the tc
+ * offload path, read locklessly from the conduit RX path under
+ * rcu_read_lock(); readers must use READ_ONCE() on group.
+ */
+struct rtldsa_sample {
+	struct psample_group *group;
+	u32 rate;
+	u32 trunc_size;
+};
+
 struct rtl838x_port {
 	bool enable:1;
 	bool phy_is_integrated:1;
@@ -900,6 +931,7 @@ struct rtl838x_port {
 	int led_set;
 	int leds_on_this_port;
 	struct rtldsa_counter_state counters;
+	struct rtldsa_sample sample[2];
 	const struct dsa_port *dp;
 };
 

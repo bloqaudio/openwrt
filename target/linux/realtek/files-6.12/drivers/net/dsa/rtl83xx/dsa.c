@@ -2,6 +2,7 @@
 
 #include <net/dsa.h>
 #include <net/pkt_cls.h>
+#include <net/psample.h>
 #include <linux/etherdevice.h>
 #include <linux/if_bridge.h>
 #include <linux/pkt_sched.h>
@@ -3091,6 +3092,169 @@ out_unlock:
 	mutex_unlock(&priv->reg_mutex);
 }
 
+#if IS_BUILTIN(CONFIG_PSAMPLE)
+static int rtldsa_port_sample_add(struct dsa_switch *ds, int port,
+				  struct dsa_mall_sample_tc_entry *sample,
+				  struct netlink_ext_ack *extack)
+{
+	struct rtl838x_switch_priv *priv = ds->priv;
+	struct psample_group *group = sample->psample_group;
+	struct rtldsa_sample *s;
+	u32 mask, val;
+
+	if (priv->family_id != RTL9300_FAMILY_ID) {
+		NL_SET_ERR_MSG_MOD(extack,
+				   "Sampling offload not supported on this chip");
+		return -EOPNOTSUPP;
+	}
+
+	if (!sample->rate || sample->rate > RTL930X_SFLOW_RATE_MAX) {
+		NL_SET_ERR_MSG_MOD(extack,
+				   "Sampling rate must be between 1 and 65535");
+		return -EINVAL;
+	}
+
+	/* Egress sampling is declined: the egress rate field programs
+	 * cleanly per the vendor reference but the silicon delivers no
+	 * egress sample copies to the CPU in any tested configuration
+	 * (switched and CPU-originated traffic, either SMPL_SEL value),
+	 * so accepting it would configure a sampler that never samples.
+	 */
+	if (!sample->ingress) {
+		NL_SET_ERR_MSG_MOD(extack,
+				   "Only ingress sampling is functional on this switch");
+		return -EOPNOTSUPP;
+	}
+
+	s = &priv->ports[port].sample[0];
+	mask = RTL930X_SFLOW_IGR_RATE_MASK;
+	val = sample->rate;
+
+	mutex_lock(&priv->reg_mutex);
+
+	/* Sample copies go to the local CPU; when a packet is both
+	 * ingress- and egress-sampled, keep the ingress copy.
+	 */
+	sw_w32_mask(RTL930X_SFLOW_CTRL_SMPL_SEL | RTL930X_SFLOW_CTRL_CPU_SEL,
+		    0, RTL930X_SFLOW_CTRL);
+	sw_w32_mask(mask, val, RTL930X_SFLOW_PORT_RATE_CTRL(port));
+
+	/* Ref the new group before dropping the old one: both pointers may
+	 * be identical on filter replace.
+	 */
+	psample_group_take(group);
+	if (s->group)
+		psample_group_put(s->group);
+	WRITE_ONCE(s->group, group);
+	s->rate = sample->rate;
+	s->trunc_size = sample->truncate ? sample->trunc_size : 0;
+
+	mutex_unlock(&priv->reg_mutex);
+
+	return 0;
+}
+
+static void rtldsa_port_sample_del(struct dsa_switch *ds, int port,
+				   struct dsa_mall_sample_tc_entry *sample)
+{
+	struct rtl838x_switch_priv *priv = ds->priv;
+	struct rtldsa_sample *s = &priv->ports[port].sample[sample->ingress ? 0 : 1];
+	struct psample_group *group;
+
+	if (priv->family_id != RTL9300_FAMILY_ID)
+		return;
+
+	mutex_lock(&priv->reg_mutex);
+	sw_w32_mask(sample->ingress ? RTL930X_SFLOW_IGR_RATE_MASK :
+		    RTL930X_SFLOW_EGR_RATE_MASK, 0,
+		    RTL930X_SFLOW_PORT_RATE_CTRL(port));
+	group = s->group;
+	WRITE_ONCE(s->group, NULL);
+	s->rate = 0;
+	s->trunc_size = 0;
+	mutex_unlock(&priv->reg_mutex);
+
+	/* The conduit RX path reads the group under rcu_read_lock() */
+	synchronize_rcu();
+	if (group)
+		psample_group_put(group);
+}
+
+/* Called from the conduit RX path (NAPI, under the conduit ring lock) for
+ * packets whose CPU tag marks them as sampling copies. Emits a copy of the
+ * frame, without its trailing CRC, to the psample group of the tc sample
+ * action that programmed the sampler.
+ */
+void rtl83xx_sample_rx(struct net_device *conduit, int port, bool egress,
+		       struct sk_buff *skb, unsigned int frame_len)
+{
+	struct rtl838x_switch_priv *priv;
+	struct psample_metadata md = {};
+	struct psample_group *group;
+	const struct rtldsa_sample *s;
+	struct dsa_switch *ds;
+	struct sk_buff *copy;
+	struct dsa_port *dp;
+
+	if (!conduit->dsa_ptr || !conduit->dsa_ptr->ds)
+		return;
+	ds = conduit->dsa_ptr->ds;
+	priv = ds->priv;
+	if (port < 0 || port >= ARRAY_SIZE(priv->ports))
+		return;
+
+	rcu_read_lock();
+
+	s = &priv->ports[port].sample[egress ? 1 : 0];
+	group = READ_ONCE(s->group);
+	if (!group)
+		goto out_unlock;
+
+	copy = skb_copy(skb, GFP_ATOMIC);
+	if (!copy)
+		goto out_unlock;
+
+	/* Strip the trailing CRC. Truncation needs no software trimming:
+	 * psample caps the emitted data at md.trunc_size itself.
+	 */
+	skb_trim(copy, frame_len);
+	md.trunc_size = s->trunc_size ? s->trunc_size : frame_len;
+
+	dp = dsa_to_port(ds, port);
+	if (!IS_ERR(dp) && dp->user) {
+		if (egress)
+			md.out_ifindex = dp->user->ifindex;
+		else
+			md.in_ifindex = dp->user->ifindex;
+	}
+
+	psample_sample_packet(group, copy, s->rate, &md);
+	consume_skb(copy);
+
+out_unlock:
+	rcu_read_unlock();
+}
+#else /* !IS_BUILTIN(CONFIG_PSAMPLE) */
+static int rtldsa_port_sample_add(struct dsa_switch *ds, int port,
+				  struct dsa_mall_sample_tc_entry *sample,
+				  struct netlink_ext_ack *extack)
+{
+	NL_SET_ERR_MSG_MOD(extack,
+			   "Sampling offload requires built-in CONFIG_PSAMPLE");
+	return -EOPNOTSUPP;
+}
+
+static void rtldsa_port_sample_del(struct dsa_switch *ds, int port,
+				   struct dsa_mall_sample_tc_entry *sample)
+{
+}
+
+void rtl83xx_sample_rx(struct net_device *conduit, int port, bool egress,
+		       struct sk_buff *skb, unsigned int frame_len)
+{
+}
+#endif /* IS_BUILTIN(CONFIG_PSAMPLE) */
+
 static int rtldsa_port_pre_bridge_flags(struct dsa_switch *ds, int port,
 					struct switchdev_brport_flags flags,
 					struct netlink_ext_ack *extack)
@@ -3557,6 +3721,9 @@ const struct dsa_switch_ops rtl93xx_switch_ops = {
 
 	.port_mirror_add	= rtldsa_port_mirror_add,
 	.port_mirror_del	= rtldsa_port_mirror_del,
+
+	.port_sample_add	= rtldsa_port_sample_add,
+	.port_sample_del	= rtldsa_port_sample_del,
 
 	.port_change_mtu	= rtldsa_93xx_port_change_mtu,
 	.port_max_mtu		= rtldsa_93xx_port_max_mtu,

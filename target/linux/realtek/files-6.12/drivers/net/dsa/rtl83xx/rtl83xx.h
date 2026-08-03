@@ -141,6 +141,8 @@ int rtl83xx_port_get_stp_state(struct rtl838x_switch_priv *priv, int port);
 int rtl83xx_port_is_under(const struct net_device *dev, struct rtl838x_switch_priv *priv);
 void rtl83xx_port_stp_state_set(struct dsa_switch *ds, int port, u8 state);
 int rtl83xx_setup_tc(struct net_device *dev, enum tc_setup_type type, void *type_data);
+void rtl83xx_sample_rx(struct net_device *conduit, int port, bool egress,
+		       struct sk_buff *skb, unsigned int frame_len);
 int rtl83xx_port_cls_flower_add(struct rtl838x_switch_priv *priv, int port,
 				struct flow_cls_offload *cls, bool ingress);
 int rtl83xx_port_cls_flower_del(struct rtl838x_switch_priv *priv, int port,
