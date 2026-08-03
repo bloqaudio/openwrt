@@ -1,0 +1,170 @@
+Add a FLOW_ACTION_SAMPLE dispatch to the DSA matchall classifier offload,
+following the existing mirred and police entries. A new pair of switch
+ops, port_sample_add/port_sample_del, receives a pre-parsed sample entry
+(direction, 1-in-N rate, truncation parameters and the psample group the
+samples are to be delivered to).
+
+Both the ingress and the egress qdisc are accepted; whether a driver
+supports either direction is its own decision. Since the hardware of
+typical switch ASICs provides a single sampler per port and direction,
+replacing a filter replaces the programmed sampler in place instead of
+rejecting the new rule.
+
+The psample group pointer is borrowed from the action; drivers that cache
+it for their data path must take their own reference with
+psample_group_take().
+
+
+--- a/include/net/dsa.h
++++ b/include/net/dsa.h
+@@ -23,6 +23,7 @@
+ #include <net/switchdev.h>
+ 
+ struct dsa_8021q_context;
++struct psample_group;
+ struct tc_action;
+ 
+ #define DSA_TAG_PROTO_NONE_VALUE		0
+@@ -202,6 +203,7 @@
+ enum dsa_port_mall_action_type {
+ 	DSA_PORT_MALL_MIRROR,
+ 	DSA_PORT_MALL_POLICER,
++	DSA_PORT_MALL_SAMPLE,
+ };
+ 
+ /* TC mirroring entry */
+@@ -216,6 +218,15 @@
+ 	u64 rate_bytes_per_sec;
+ };
+ 
++/* TC sample entry */
++struct dsa_mall_sample_tc_entry {
++	bool ingress;
++	u32 rate;
++	u32 trunc_size;
++	bool truncate;
++	struct psample_group *psample_group;
++};
++
+ /* TC matchall entry */
+ struct dsa_mall_tc_entry {
+ 	struct list_head list;
+@@ -224,6 +235,7 @@
+ 	union {
+ 		struct dsa_mall_mirror_tc_entry mirror;
+ 		struct dsa_mall_policer_tc_entry policer;
++		struct dsa_mall_sample_tc_entry sample;
+ 	};
+ };
+ 
+@@ -1119,6 +1131,11 @@
+ 	int	(*port_policer_add)(struct dsa_switch *ds, int port,
+ 				    struct dsa_mall_policer_tc_entry *policer);
+ 	void	(*port_policer_del)(struct dsa_switch *ds, int port);
++	int	(*port_sample_add)(struct dsa_switch *ds, int port,
++				   struct dsa_mall_sample_tc_entry *sample,
++				   struct netlink_ext_ack *extack);
++	void	(*port_sample_del)(struct dsa_switch *ds, int port,
++				   struct dsa_mall_sample_tc_entry *sample);
+ 	int	(*port_setup_tc)(struct dsa_switch *ds, int port,
+ 				 enum tc_setup_type type, void *type_data);
+ 
+--- a/net/dsa/user.c
++++ b/net/dsa/user.c
+@@ -1482,6 +1482,74 @@
+ 	return err;
+ }
+ 
++static int
++dsa_user_add_cls_matchall_sample(struct net_device *dev,
++				 struct tc_cls_matchall_offload *cls,
++				 bool ingress)
++{
++	struct netlink_ext_ack *extack = cls->common.extack;
++	struct dsa_port *dp = dsa_user_to_port(dev);
++	struct dsa_user_priv *p = netdev_priv(dev);
++	struct dsa_mall_sample_tc_entry *sample;
++	struct dsa_mall_tc_entry *mall_tc_entry, *tmp;
++	struct dsa_switch *ds = dp->ds;
++	struct flow_action_entry *act;
++	int err;
++
++	if (!ds->ops->port_sample_add) {
++		NL_SET_ERR_MSG_MOD(extack,
++				   "Sampling offload not implemented");
++		return -EOPNOTSUPP;
++	}
++
++	if (!flow_action_basic_hw_stats_check(&cls->rule->action,
++					      cls->common.extack))
++		return -EOPNOTSUPP;
++
++	act = &cls->rule->action.entries[0];
++
++	if (!act->sample.psample_group)
++		return -EINVAL;
++
++	/* Typical switch ASICs provide a single sampler per port and
++	 * direction, so replacing a filter replaces the programmed
++	 * sampler in place instead of failing with -EEXIST.
++	 */
++	list_for_each_entry_safe(mall_tc_entry, tmp, &p->mall_tc_list, list) {
++		if (mall_tc_entry->type == DSA_PORT_MALL_SAMPLE &&
++		    mall_tc_entry->sample.ingress == ingress) {
++			if (ds->ops->port_sample_del)
++				ds->ops->port_sample_del(ds, dp->index,
++							 &mall_tc_entry->sample);
++			list_del(&mall_tc_entry->list);
++			kfree(mall_tc_entry);
++		}
++	}
++
++	mall_tc_entry = kzalloc(sizeof(*mall_tc_entry), GFP_KERNEL);
++	if (!mall_tc_entry)
++		return -ENOMEM;
++
++	mall_tc_entry->cookie = cls->cookie;
++	mall_tc_entry->type = DSA_PORT_MALL_SAMPLE;
++	sample = &mall_tc_entry->sample;
++	sample->ingress = ingress;
++	sample->rate = act->sample.rate;
++	sample->trunc_size = act->sample.trunc_size;
++	sample->truncate = act->sample.truncate;
++	sample->psample_group = act->sample.psample_group;
++
++	err = ds->ops->port_sample_add(ds, dp->index, sample, extack);
++	if (err) {
++		kfree(mall_tc_entry);
++		return err;
++	}
++
++	list_add_tail(&mall_tc_entry->list, &p->mall_tc_list);
++
++	return 0;
++}
++
+ static int dsa_user_add_cls_matchall(struct net_device *dev,
+ 				     struct tc_cls_matchall_offload *cls,
+ 				     bool ingress)
+@@ -1495,6 +1563,9 @@
+ 	else if (flow_offload_has_one_action(&cls->rule->action) &&
+ 		 cls->rule->action.entries[0].id == FLOW_ACTION_POLICE)
+ 		err = dsa_user_add_cls_matchall_police(dev, cls, ingress);
++	else if (flow_offload_has_one_action(&cls->rule->action) &&
++		 cls->rule->action.entries[0].id == FLOW_ACTION_SAMPLE)
++		err = dsa_user_add_cls_matchall_sample(dev, cls, ingress);
+ 
+ 	return err;
+ }
+@@ -1522,6 +1593,11 @@
+ 		if (ds->ops->port_policer_del)
+ 			ds->ops->port_policer_del(ds, dp->index);
+ 		break;
++	case DSA_PORT_MALL_SAMPLE:
++		if (ds->ops->port_sample_del)
++			ds->ops->port_sample_del(ds, dp->index,
++						 &mall_tc_entry->sample);
++		break;
+ 	default:
+ 		WARN_ON(1);
+ 	}
