@@ -1032,58 +1032,80 @@ static u32 rtl930x_l3_hash4(u32 ip, int algorithm, bool move_dip)
 	return hash;
 }
 
-// Currently not used
-// static u32 rtl930x_l3_hash6(struct in6_addr *ip6, int algorithm, bool move_dip)
-// {
-// 	u32 rows[16];
-// 	u32 hash;
-// 	u32 s0, s1, pH;
+/* IPv6 host-route hash, translating the Longan SDK algorithms 0 and 1
+ * (_dal_longan_l3_hostHash0_ret/_ret1): the 128-bit DIP is folded into a
+ * 2-bit group (DIP[127:126]) followed by 9-bit groups down to DIP[8:0],
+ * s6_addr[0] being the most significant octet. Algorithm 0 XORs all
+ * groups; algorithm 1 XORs the first twelve, sums DIP[35:9] with two
+ * carry folds into 9 bits, and XORs the result with DIP[8:0].
+ */
+static u32 rtl930x_l3_hash6(struct in6_addr *ip6, int algorithm, bool move_dip)
+{
+	u32 rows[16];
+	u32 hash;
+	u32 s0, s1, pH;
 
-// 	rows[0] = (HASH_PICK(ip6->s6_addr[0], 6, 2) << 0);
-// 	rows[1] = (HASH_PICK(ip6->s6_addr[0], 0, 6) << 3) | HASH_PICK(ip6->s6_addr[1], 5, 3);
-// 	rows[2] = (HASH_PICK(ip6->s6_addr[1], 0, 5) << 4) | HASH_PICK(ip6->s6_addr[2], 4, 4);
-// 	rows[3] = (HASH_PICK(ip6->s6_addr[2], 0, 4) << 5) | HASH_PICK(ip6->s6_addr[3], 3, 5);
-// 	rows[4] = (HASH_PICK(ip6->s6_addr[3], 0, 3) << 6) | HASH_PICK(ip6->s6_addr[4], 2, 6);
-// 	rows[5] = (HASH_PICK(ip6->s6_addr[4], 0, 2) << 7) | HASH_PICK(ip6->s6_addr[5], 1, 7);
-// 	rows[6] = (HASH_PICK(ip6->s6_addr[5], 0, 1) << 8) | HASH_PICK(ip6->s6_addr[6], 0, 8);
-// 	rows[7] = (HASH_PICK(ip6->s6_addr[7], 0, 8) << 1) | HASH_PICK(ip6->s6_addr[8], 7, 1);
-// 	rows[8] = (HASH_PICK(ip6->s6_addr[8], 0, 7) << 2) | HASH_PICK(ip6->s6_addr[9], 6, 2);
-// 	rows[9] = (HASH_PICK(ip6->s6_addr[9], 0, 6) << 3) | HASH_PICK(ip6->s6_addr[10], 5, 3);
-// 	rows[10] = (HASH_PICK(ip6->s6_addr[10], 0, 5) << 4) | HASH_PICK(ip6->s6_addr[11], 4, 4);
-// 	if (!algorithm) {
-// 		rows[11] = (HASH_PICK(ip6->s6_addr[11], 0, 4) << 5) |
-// 			   (HASH_PICK(ip6->s6_addr[12], 3, 5) << 0);
-// 		rows[12] = (HASH_PICK(ip6->s6_addr[12], 0, 3) << 6) |
-// 			   (HASH_PICK(ip6->s6_addr[13], 2, 6) << 0);
-// 		rows[13] = (HASH_PICK(ip6->s6_addr[13], 0, 2) << 7) |
-// 			   (HASH_PICK(ip6->s6_addr[14], 1, 7) << 0);
-// 		if (!move_dip) {
-// 			rows[14] = (HASH_PICK(ip6->s6_addr[14], 0, 1) << 8) |
-// 				   (HASH_PICK(ip6->s6_addr[15], 0, 8) << 0);
-// 		}
-// 		hash = rows[0] ^ rows[1] ^ rows[2] ^ rows[3] ^ rows[4] ^
-// 		       rows[5] ^ rows[6] ^ rows[7] ^ rows[8] ^ rows[9] ^
-// 		       rows[10] ^ rows[11] ^ rows[12] ^ rows[13] ^ rows[14];
-// 	} else {
-// 		rows[11] = (HASH_PICK(ip6->s6_addr[11], 0, 4) << 5);
-// 		rows[12] = (HASH_PICK(ip6->s6_addr[12], 3, 5) << 0);
-// 		rows[13] = (HASH_PICK(ip6->s6_addr[12], 0, 3) << 6) |
-// 			   HASH_PICK(ip6->s6_addr[13], 2, 6);
-// 		rows[14] = (HASH_PICK(ip6->s6_addr[13], 0, 2) << 7) |
-// 			   HASH_PICK(ip6->s6_addr[14], 1, 7);
-// 		if (!move_dip) {
-// 			rows[15] = (HASH_PICK(ip6->s6_addr[14], 0, 1) << 8) |
-// 				   (HASH_PICK(ip6->s6_addr[15], 0, 8) << 0);
-// 		}
-// 		s0 = rows[12] + rows[13] + rows[14];
-// 		s1 = (s0 & 0x1ff) + ((s0 & (0x1ff << 9)) >> 9);
-// 		pH = (s1 & 0x1ff) + ((s1 & (0x1ff << 9)) >> 9);
-// 		hash = rows[0] ^ rows[1] ^ rows[2] ^ rows[3] ^ rows[4] ^
-// 		       rows[5] ^ rows[6] ^ rows[7] ^ rows[8] ^ rows[9] ^
-// 		       rows[10] ^ rows[11] ^ pH ^ rows[15];
-// 	}
-// 	return hash;
-// }
+	memset(rows, 0, sizeof(rows));
+
+	rows[0] = (HASH_PICK(ip6->s6_addr[0], 6, 2) << 0);
+	rows[1] = (HASH_PICK(ip6->s6_addr[0], 0, 6) << 3) | HASH_PICK(ip6->s6_addr[1], 5, 3);
+	rows[2] = (HASH_PICK(ip6->s6_addr[1], 0, 5) << 4) | HASH_PICK(ip6->s6_addr[2], 4, 4);
+	rows[3] = (HASH_PICK(ip6->s6_addr[2], 0, 4) << 5) | HASH_PICK(ip6->s6_addr[3], 3, 5);
+	rows[4] = (HASH_PICK(ip6->s6_addr[3], 0, 3) << 6) | HASH_PICK(ip6->s6_addr[4], 2, 6);
+	rows[5] = (HASH_PICK(ip6->s6_addr[4], 0, 2) << 7) | HASH_PICK(ip6->s6_addr[5], 1, 7);
+	rows[6] = (HASH_PICK(ip6->s6_addr[5], 0, 1) << 8) | HASH_PICK(ip6->s6_addr[6], 0, 8);
+	rows[7] = (HASH_PICK(ip6->s6_addr[7], 0, 8) << 1) | HASH_PICK(ip6->s6_addr[8], 7, 1);
+	rows[8] = (HASH_PICK(ip6->s6_addr[8], 0, 7) << 2) | HASH_PICK(ip6->s6_addr[9], 6, 2);
+	rows[9] = (HASH_PICK(ip6->s6_addr[9], 0, 6) << 3) | HASH_PICK(ip6->s6_addr[10], 5, 3);
+	rows[10] = (HASH_PICK(ip6->s6_addr[10], 0, 5) << 4) | HASH_PICK(ip6->s6_addr[11], 4, 4);
+	if (!algorithm) {
+		rows[11] = (HASH_PICK(ip6->s6_addr[11], 0, 4) << 5) |
+			   (HASH_PICK(ip6->s6_addr[12], 3, 5) << 0);
+		rows[12] = (HASH_PICK(ip6->s6_addr[12], 0, 3) << 6) |
+			   (HASH_PICK(ip6->s6_addr[13], 2, 6) << 0);
+		rows[13] = (HASH_PICK(ip6->s6_addr[13], 0, 2) << 7) |
+			   (HASH_PICK(ip6->s6_addr[14], 1, 7) << 0);
+		if (!move_dip)
+			rows[14] = (HASH_PICK(ip6->s6_addr[14], 0, 1) << 8) |
+				   (HASH_PICK(ip6->s6_addr[15], 0, 8) << 0);
+		hash = rows[0] ^ rows[1] ^ rows[2] ^ rows[3] ^ rows[4] ^
+		       rows[5] ^ rows[6] ^ rows[7] ^ rows[8] ^ rows[9] ^
+		       rows[10] ^ rows[11] ^ rows[12] ^ rows[13] ^ rows[14];
+	} else {
+		rows[11] = (HASH_PICK(ip6->s6_addr[11], 0, 4) << 5);
+		rows[12] = (HASH_PICK(ip6->s6_addr[12], 3, 5) << 0);
+		rows[13] = (HASH_PICK(ip6->s6_addr[12], 0, 3) << 6) |
+			   HASH_PICK(ip6->s6_addr[13], 2, 6);
+		rows[14] = (HASH_PICK(ip6->s6_addr[13], 0, 2) << 7) |
+			   HASH_PICK(ip6->s6_addr[14], 1, 7);
+		if (!move_dip)
+			rows[15] = (HASH_PICK(ip6->s6_addr[14], 0, 1) << 8) |
+				   (HASH_PICK(ip6->s6_addr[15], 0, 8) << 0);
+		s0 = rows[12] + rows[13] + rows[14];
+		s1 = (s0 & 0x1ff) + ((s0 & (0x1ff << 9)) >> 9);
+		pH = (s1 & 0x1ff) + ((s1 & (0x1ff << 9)) >> 9);
+		hash = rows[0] ^ rows[1] ^ rows[2] ^ rows[3] ^ rows[4] ^
+		       rows[5] ^ rows[6] ^ rows[7] ^ rows[8] ^ rows[9] ^
+		       rows[10] ^ rows[11] ^ pH ^ rows[15];
+	}
+	return hash;
+}
+
+/* Length of a contiguous prefix mask stored as four big-endian words */
+static int rtl930x_ip6_mask_len(struct in6_addr *ip6_m)
+{
+	int len = 0;
+
+	for (int i = 0; i < 4; i++) {
+		u32 v = be32_to_cpu(ip6_m->s6_addr32[i]);
+
+		len += 32 - fls(~v);
+		if (v != 0xffffffff)
+			break;
+	}
+
+	return len;
+}
 
 /* Read a prefix route entry from the L3_PREFIX_ROUTE_IPUC table
  * We currently only support IPv4 and IPv6 unicast route
@@ -1128,11 +1150,11 @@ static void rtl930x_route_read(int idx, struct rtl83xx_route *rt)
 		ipv6_addr_set(&ip6_m,
 			      sw_r32(rtl_table_data(r, 6)), sw_r32(rtl_table_data(r, 7)),
 			      sw_r32(rtl_table_data(r, 8)), sw_r32(rtl_table_data(r, 9)));
-		rt->prefix_len = host_route ? 128 : 0;
-		rt->prefix_len = (rt->prefix_len < 0 && default_route) ? 0 : -1;
+		rt->prefix_len = host_route ? 128 : -1;
+		if (rt->prefix_len < 0 && default_route)
+			rt->prefix_len = 0;
 		if (rt->prefix_len < 0)
-			rt->prefix_len = find_last_bit((unsigned long *)&ip6_m.s6_addr32,
-						       128);
+			rt->prefix_len = rtl930x_ip6_mask_len(&ip6_m);
 		break;
 	case 1: /* IPv4 Multicast route */
 	case 3: /* IPv6 Multicast route */
@@ -1160,11 +1182,20 @@ out:
 static void rtl930x_net6_mask(int prefix_len, struct in6_addr *ip6_m)
 {
 	int o, b;
-	/* Define network mask */
+
+	/* Define network mask: full 0xff octets, then the partial octet.
+	 * Zero the tail explicitly - the caller's struct may be reused.
+	 */
+	memset(ip6_m->s6_addr, 0, sizeof(ip6_m->s6_addr));
 	o = prefix_len >> 3;
 	b = prefix_len & 0x7;
+	if (o >= (int)sizeof(ip6_m->s6_addr)) {
+		memset(ip6_m->s6_addr, 0xff, sizeof(ip6_m->s6_addr));
+		return;
+	}
 	memset(ip6_m->s6_addr, 0xff, o);
-	ip6_m->s6_addr[o] |= b ? 0xff00 >> b : 0x00;
+	if (b)
+		ip6_m->s6_addr[o] = 0xff00 >> b;
 }
 
 /* Read a host route entry from the table using its index
@@ -1191,9 +1222,12 @@ static void rtl930x_host_route_read(int idx, struct rtl83xx_route *rt)
 		rt->dst_ip = sw_r32(rtl_table_data(r, 4));
 		break;
 	case 2: /* IPv6 Unicast route */
+		/* The 128-bit address sits in words 1-4, most significant
+		 * word first - the same order host_route_write programs it.
+		 */
 		ipv6_addr_set(&rt->dst_ip6,
-			      sw_r32(rtl_table_data(r, 3)), sw_r32(rtl_table_data(r, 2)),
-			      sw_r32(rtl_table_data(r, 1)), sw_r32(rtl_table_data(r, 0)));
+			      sw_r32(rtl_table_data(r, 1)), sw_r32(rtl_table_data(r, 2)),
+			      sw_r32(rtl_table_data(r, 3)), sw_r32(rtl_table_data(r, 4)));
 		break;
 	case 1: /* IPv4 Multicast route */
 	case 3: /* IPv6 Multicast route */
@@ -1289,7 +1323,7 @@ static int rtl930x_route_lookup_hw(struct rtl83xx_route *rt)
 	if (rt->attr.type) { /* IPv6 */
 		rtl930x_net6_mask(rt->prefix_len, &ip6_m);
 		for (int i = 0; i < 4; i++)
-			sw_w32(rt->dst_ip6.s6_addr32[0] & ip6_m.s6_addr32[0],
+			sw_w32(rt->dst_ip6.s6_addr32[i] & ip6_m.s6_addr32[i],
 			       RTL930X_L3_HW_LU_KEY_IP_CTRL + (i << 2));
 	} else { /* IPv4 */
 		ip4_m = inet_make_mask(rt->prefix_len);
@@ -1324,12 +1358,18 @@ static int rtl930x_find_l3_slot(struct rtl83xx_route *rt, bool must_exist)
 	u32 hash;
 	struct rtl83xx_route route_entry;
 
-	/* IPv6 entries take up 3 slots */
-	slot_width = (rt->attr.type == 0) || (rt->attr.type == 2) ? 1 : 3;
+	/* IPv6 host entries are 160 bits wide and occupy 3 consecutive
+	 * slots of a hash row; the SDK only ever starts them at slot 0 or
+	 * slot 3, so those are the only positions probed here.
+	 */
+	slot_width = rt->attr.type == 2 ? 3 : 1;
 
 	for (int t = 0; t < 2; t++) {
 		algorithm = (sw_r32(RTL930X_L3_HOST_TBL_CTRL) >> (2 + t)) & 0x1;
-		hash = rtl930x_l3_hash4(rt->dst_ip, algorithm, false);
+		if (rt->attr.type == 2)
+			hash = rtl930x_l3_hash6(&rt->dst_ip6, algorithm, false);
+		else
+			hash = rtl930x_l3_hash4(rt->dst_ip, algorithm, false);
 
 		pr_debug("%s: table %d, algorithm %d, hash %04x\n", __func__, t, algorithm, hash);
 
@@ -1352,10 +1392,28 @@ static int rtl930x_find_l3_slot(struct rtl83xx_route *rt, bool must_exist)
 			 * not the route we are trying to place: otherwise every
 			 * route lands in slot 0 of its row, clobbering colliders.
 			 */
-			if (!must_exist && !route_entry.attr.valid)
-				return idx;
+			if (!must_exist) {
+				bool free = !route_entry.attr.valid;
+
+				/* A multi-slot entry fits only if every slot
+				 * of its span is empty.
+				 */
+				for (int k = 1; k < slot_width && free; k++) {
+					int kidx = ((((addr + k) / 8) * 6) + ((addr + k) % 8));
+
+					memset(&route_entry, 0, sizeof(route_entry));
+					rtl930x_host_route_read(kidx, &route_entry);
+					free = !route_entry.attr.valid;
+				}
+				if (free)
+					return idx;
+				continue;
+			}
 			if (must_exist && route_entry.attr.valid &&
-			    route_entry.dst_ip == rt->dst_ip)
+			    route_entry.attr.type == rt->attr.type &&
+			    (rt->attr.type == 2 ?
+			     ipv6_addr_equal(&route_entry.dst_ip6, &rt->dst_ip6) :
+			     route_entry.dst_ip == rt->dst_ip))
 				return idx;
 		}
 	}
@@ -2317,7 +2375,14 @@ static int rtl930x_l3_setup(struct rtl838x_switch_priv *priv)
 	 * ICMP time-exceeded / fragmentation-needed (traceroute, PMTUD).
 	 */
 	sw_w32(0x0002a081, RTL930X_L3_IPUC_ROUTE_CTRL);
-	sw_w32(0x00014581, RTL930X_L3_IP6UC_ROUTE_CTRL);
+	/* GLB_EN, HDR_ROUTE_ACT/HBH_ACT=TRAP2CPU, DMAC_MISMATCH=FORWARD, and
+	 * HL_FAIL_ACT/MTU_FAIL_ACT=TRAP2CPU (bits 21 and 19): the IPv6
+	 * hop-limit/MTU equivalents of the IPv4 exception traps - without
+	 * them, offloaded v6 traffic with an expired hop limit or an
+	 * oversized packet would be silently dropped instead of producing
+	 * ICMPv6 time-exceeded / packet-too-big (traceroute6, PMTUD).
+	 */
+	sw_w32(0x00294581, RTL930X_L3_IP6UC_ROUTE_CTRL);
 	sw_w32(0x00000501, RTL930X_L3_IPMC_ROUTE_CTRL);
 	sw_w32(0x00012881, RTL930X_L3_IP6MC_ROUTE_CTRL);
 
