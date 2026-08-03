@@ -30,6 +30,37 @@ static void rtldsa_init_counters(struct rtl838x_switch_priv *priv);
 static void rtldsa_port_xstp_state_set(struct rtl838x_switch_priv *priv, int port,
 				       u8 state, u16 mst_slot);
 
+enum rtldsa_vlan_proto {
+	RTLDSA_VLAN_PROTO_NONE,
+	RTLDSA_VLAN_PROTO_8021Q,
+	RTLDSA_VLAN_PROTO_8021AD,
+};
+
+static int rtldsa_bridge_vlan_proto_get(const struct net_device *bridge_dev,
+					 u16 *proto,
+					 struct netlink_ext_ack *extack)
+{
+	if (!bridge_dev || br_vlan_get_proto(bridge_dev, proto))
+		*proto = ETH_P_8021Q;
+
+	if (*proto == ETH_P_8021Q || *proto == ETH_P_8021AD)
+		return 0;
+
+	NL_SET_ERR_MSG_MOD(extack, "Unsupported bridge VLAN protocol");
+	return -EOPNOTSUPP;
+}
+
+static u64 rtldsa_user_port_mask(struct dsa_switch *ds)
+{
+	struct dsa_port *dp;
+	u64 mask = 0;
+
+	dsa_switch_for_each_user_port(dp, ds)
+		mask |= BIT_ULL(dp->index);
+
+	return mask;
+}
+
 static void rtl83xx_init_stats(struct rtl838x_switch_priv *priv)
 {
 	mutex_lock(&priv->reg_mutex);
@@ -1822,8 +1853,11 @@ static int rtldsa_port_enable(struct dsa_switch *ds, int port, struct phy_device
 	pr_debug("%s: %x %d", __func__, (u32)priv, port);
 	priv->ports[port].enable = true;
 
-	/* enable inner tagging on egress, do not keep any tags */
-	priv->r->vlan_port_keep_tag_set(port, 0, 1);
+	/* Reapply the bridge's tag role after a down/up cycle. */
+	if (dsa_is_user_port(ds, port) && priv->r->vlan_port_qinq_set)
+		priv->r->vlan_port_qinq_set(port, priv->ports[port].qinq);
+	else
+		priv->r->vlan_port_keep_tag_set(port, 0, 1);
 
 	if (dsa_is_cpu_port(ds, port))
 		return 0;
@@ -2161,9 +2195,23 @@ static int rtldsa_port_bridge_join(struct dsa_switch *ds, int port, struct dsa_b
 				   bool *tx_fwd_offload, struct netlink_ext_ack *extack)
 {
 	struct rtl838x_switch_priv *priv = ds->priv;
+	bool qinq;
+	int err;
 	unsigned int i;
+	u16 proto;
 
 	pr_debug("%s %x: %d", __func__, (u32)priv, port);
+
+	err = rtldsa_bridge_vlan_proto_get(bridge.dev, &proto, extack);
+	if (err)
+		return err;
+
+	qinq = proto == ETH_P_8021AD;
+	if (qinq && !priv->r->vlan_port_qinq_set) {
+		NL_SET_ERR_MSG_MOD(extack,
+				   "802.1ad QinQ is not supported on this switch");
+		return -EOPNOTSUPP;
+	}
 
 	/* reset to default flags for new net_bridge_port */
 	priv->ports[port].isolated = false;
@@ -2176,6 +2224,11 @@ static int rtldsa_port_bridge_join(struct dsa_switch *ds, int port, struct dsa_b
 	 * VLAN of the standalone port and reset the PVID.
 	 */
 	rtldsa_l3_port_vlan_set(priv, port, false);
+
+	if (priv->r->vlan_port_qinq_set) {
+		priv->r->vlan_port_qinq_set(port, qinq);
+		priv->ports[port].qinq = qinq;
+	}
 
 	if (priv->r->set_static_move_action)
 		priv->r->set_static_move_action(port, false);
@@ -2202,6 +2255,11 @@ static void rtldsa_port_bridge_leave(struct dsa_switch *ds, int port, struct dsa
 	mutex_lock(&priv->reg_mutex);
 
 	rtldsa_update_port_member(priv, port, bridge.dev, false);
+
+	if (priv->ports[port].qinq && priv->r->vlan_port_qinq_set) {
+		priv->r->vlan_port_qinq_set(port, false);
+		priv->ports[port].qinq = false;
+	}
 
 	/* Standalone again: restore the port's internal L3 VLAN */
 	rtldsa_l3_port_vlan_set(priv, port, true);
@@ -2442,6 +2500,9 @@ static int rtl83xx_vlan_add(struct dsa_switch *ds, int port,
 	struct rtl838x_vlan_info info;
 	struct rtl838x_switch_priv *priv = ds->priv;
 	struct net_device *bridge_dev;
+	u64 user_port_mask;
+	enum rtldsa_vlan_proto proto_id;
+	bool qinq;
 	u16 proto;
 	int err;
 
@@ -2457,15 +2518,20 @@ static int rtl83xx_vlan_add(struct dsa_switch *ds, int port,
 		return -ENOTSUPP;
 	}
 
-	/* 802.1ad (QinQ) is not supported yet. Reject it explicitly:
-	 * programming an 802.1ad bridge VLAN as 802.1Q without an error
-	 * would silently misconfigure the network. The switchdev VLAN
-	 * object does not carry the protocol, so ask the bridge.
+	/* switchdev VLAN objects do not carry the bridge protocol. Query the
+	 * bridge, as the former 802.1ad rejection path did.
 	 */
 	bridge_dev = dsa_port_bridge_dev_get(dsa_to_port(ds, port));
-	if (bridge_dev && !br_vlan_get_proto(bridge_dev, &proto) &&
-	    proto != ETH_P_8021Q) {
-		NL_SET_ERR_MSG_MOD(extack, "802.1ad QinQ is not supported");
+	err = rtldsa_bridge_vlan_proto_get(bridge_dev, &proto, extack);
+	if (err)
+		return err;
+
+	qinq = proto == ETH_P_8021AD;
+	proto_id = qinq ? RTLDSA_VLAN_PROTO_8021AD :
+			  RTLDSA_VLAN_PROTO_8021Q;
+	if (qinq && !priv->r->vlan_port_qinq_set) {
+		NL_SET_ERR_MSG_MOD(extack,
+				   "802.1ad QinQ is not supported on this switch");
 		return -EOPNOTSUPP;
 	}
 
@@ -2480,7 +2546,41 @@ static int rtl83xx_vlan_add(struct dsa_switch *ds, int port,
 	if (err)
 		return err;
 
+	user_port_mask = rtldsa_user_port_mask(ds);
+
 	mutex_lock(&priv->reg_mutex);
+
+	/* Get port memberships before changing PVID or role so a rejected
+	 * cross-protocol claim leaves all port state untouched.
+	 */
+	priv->r->vlan_tables_read(vlan->vid, &info);
+
+	if (dsa_is_user_port(ds, port)) {
+		/* The CPU port may remain a member after the last user leaves;
+		 * it does not keep a protocol claim alive.
+		 */
+		if (!(info.member_ports & user_port_mask))
+			priv->vlan_proto[vlan->vid] = RTLDSA_VLAN_PROTO_NONE;
+
+		if (priv->vlan_proto[vlan->vid] != RTLDSA_VLAN_PROTO_NONE &&
+		    priv->vlan_proto[vlan->vid] != proto_id) {
+			NL_SET_ERR_MSG_MOD(extack,
+					   "VLAN is already used by a bridge with a different VLAN protocol");
+			err = -EBUSY;
+			goto out_unlock;
+		}
+
+		priv->vlan_proto[vlan->vid] = proto_id;
+
+		/* Recheck lazily for VLAN replay and for a protocol selected
+		 * before the next VLAN operation.
+		 */
+		if (priv->r->vlan_port_qinq_set &&
+		    priv->ports[port].qinq != qinq) {
+			priv->r->vlan_port_qinq_set(port, qinq);
+			priv->ports[port].qinq = qinq;
+		}
+	}
 
 	/*
 	 * Realtek switches copy frames as-is to/from the CPU. For a proper
@@ -2496,9 +2596,6 @@ static int rtl83xx_vlan_add(struct dsa_switch *ds, int port,
 		else if (priv->ports[port].pvid == vlan->vid)
 			rtl83xx_vlan_set_pvid(priv, port, 0);
 	}
-
-	/* Get port memberships of this vlan */
-	priv->r->vlan_tables_read(vlan->vid, &info);
 
 	/* new VLAN? */
 	if (!info.member_ports) {
@@ -2524,9 +2621,12 @@ static int rtl83xx_vlan_add(struct dsa_switch *ds, int port,
 	priv->r->vlan_set_tagged(vlan->vid, &info);
 	pr_debug("Member ports, VLAN %d: %llx\n", vlan->vid, info.member_ports);
 
+	err = 0;
+
+out_unlock:
 	mutex_unlock(&priv->reg_mutex);
 
-	return 0;
+	return err;
 }
 
 static int rtl83xx_vlan_del(struct dsa_switch *ds, int port,
@@ -2534,6 +2634,10 @@ static int rtl83xx_vlan_del(struct dsa_switch *ds, int port,
 {
 	struct rtl838x_vlan_info info;
 	struct rtl838x_switch_priv *priv = ds->priv;
+	struct net_device *bridge_dev;
+	u64 user_port_mask;
+	bool qinq;
+	u16 proto = ETH_P_8021Q;
 	u16 pvid;
 
 	pr_debug("%s: port %d, vid %d, flags %x\n",
@@ -2555,7 +2659,25 @@ static int rtl83xx_vlan_del(struct dsa_switch *ds, int port,
 	    vlan->vid >= RTLDSA_L3_PORT_VID(priv->cpu_port - 1))
 		return 0;
 
+	bridge_dev = dsa_port_bridge_dev_get(dsa_to_port(ds, port));
+	if (bridge_dev)
+		br_vlan_get_proto(bridge_dev, &proto);
+	qinq = proto == ETH_P_8021AD;
+	user_port_mask = rtldsa_user_port_mask(ds);
+
 	mutex_lock(&priv->reg_mutex);
+
+	/* A protocol change is not replayed by the bridge. A later delete is
+	 * still an opportunity to restore the current port role.
+	 */
+	if (dsa_is_user_port(ds, port) &&
+	    priv->r->vlan_port_qinq_set &&
+	    (proto == ETH_P_8021Q || proto == ETH_P_8021AD) &&
+	    priv->ports[port].qinq != qinq) {
+		priv->r->vlan_port_qinq_set(port, qinq);
+		priv->ports[port].qinq = qinq;
+	}
+
 	pvid = priv->ports[port].pvid;
 
 	/* Reset to default if removing the current PVID */
@@ -2566,8 +2688,11 @@ static int rtl83xx_vlan_del(struct dsa_switch *ds, int port,
 	priv->r->vlan_tables_read(vlan->vid, &info);
 
 	/* remove port from both tables */
-	info.untagged_ports &= (~BIT_ULL(port));
-	info.member_ports &= (~BIT_ULL(port));
+	info.untagged_ports &= ~BIT_ULL(port);
+	info.member_ports &= ~BIT_ULL(port);
+
+	if (!(info.member_ports & user_port_mask))
+		priv->vlan_proto[vlan->vid] = RTLDSA_VLAN_PROTO_NONE;
 
 	/* VLANs without members are set back (implicitly) to CIST by DSA */
 	if (!info.member_ports) {

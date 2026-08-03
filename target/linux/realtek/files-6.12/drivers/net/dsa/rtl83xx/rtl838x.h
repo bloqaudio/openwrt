@@ -933,6 +933,7 @@ struct rtl838x_port {
 	bool is10G:1;
 	bool is2G5:1;
 	bool isolated:1;
+	bool qinq:1;
 	bool rate_police_egress:1;
 	bool rate_police_ingress:1;
 	u64 pm;
@@ -1419,6 +1420,10 @@ struct rtl838x_switch_priv {
 	u16 family_id;
 	char version;
 	struct rtl838x_port ports[57];
+	/* Protocol owning each shared VLAN-table VID. CPU-port membership
+	 * never claims a VID; values are enum rtldsa_vlan_proto.
+	 */
+	u8 vlan_proto[MAX_VLANS];
 	struct phylink_pcs *pcs[57];
 	struct mutex reg_mutex;		/* Mutex for individual register manipulations */
 	struct mutex pie_mutex;		/* Mutex for Packet Inspection Engine */
