@@ -3,6 +3,8 @@
 #include <linux/of_mdio.h>
 #include <linux/of_platform.h>
 #include <net/arp.h>
+#include <net/ipv6.h>
+#include <net/ndisc.h>
 #include <net/nexthop.h>
 #include <net/neighbour.h>
 #include <net/netevent.h>
@@ -1025,6 +1027,18 @@ static void rtl83xx_route_rm(struct rtl838x_switch_priv *priv, struct rtl83xx_ro
 			priv->r->host_route_write(id, r);
 		}
 		clear_bit(r->id - MAX_ROUTES, priv->host_route_use_bm);
+	} else if (r->attr.type == 2 && ipv6_addr_any(&r->gw_ip6)) {
+		/* A connected IPv6 route is programmed as a TRAP2CPU host
+		 * entry for its subnet base address - find the slot holding
+		 * it and invalidate it, like a host route.
+		 */
+		id = priv->r->find_l3_slot(r, true);
+		pr_debug("%s: Got id for connected v6 base entry: %d\n", __func__, id);
+		if (id >= 0) {
+			r->attr.valid = false;
+			priv->r->host_route_write(id, r);
+		}
+		clear_bit(r->id, priv->route_use_bm);
 	} else {
 		/* If there is a HW representation of the route, delete it.
 		 * route_lookup_hw is a longest-prefix-match search: for a route
@@ -1371,6 +1385,239 @@ static void rtl83xx_l3_neigh_route_del(struct rtl838x_switch_priv *priv, __be32 
 	rtl83xx_l2_nexthop_rm(priv, &nh);
 }
 
+/* Updates an L3 next hop entry in the ROUTING table for an IPv6 gateway -
+ * the IPv6 twin of rtl83xx_l3_nexthop_update(). The nexthop, L2 nexthop
+ * and egress interface machinery is family-agnostic and shared with IPv4.
+ */
+static int rtl83xx_l3_nexthop6_update(struct rtl838x_switch_priv *priv,
+				      struct in6_addr *ip6, u64 mac)
+{
+	struct rtl83xx_route *r;
+	struct rhlist_head *tmp, *list;
+
+	rcu_read_lock();
+	list = rhltable_lookup(&priv->routes, ip6, route_ht_params);
+	if (!list) {
+		rcu_read_unlock();
+		return -ENOENT;
+	}
+
+	rhl_for_each_entry_rcu(r, tmp, list, linkage) {
+		if (r->attr.type != 2)
+			continue;
+
+		pr_debug("%s: Setting up fwding: ip %pI6c, GW mac %016llx\n",
+			 __func__, ip6, mac);
+
+		r->nh.mac = r->nh.gw = mac;
+		r->nh.port = priv->port_ignore;
+		r->nh.id = r->id;
+
+		if (priv->r->set_l3_egress_mac)
+			priv->r->set_l3_egress_mac(r->id, mac);
+
+		/* Update ROUTING table: map gateway-mac and switch-mac id to route id */
+		rtl83xx_l2_nexthop_add(priv, &r->nh);
+
+		r->attr.valid = true;
+		r->attr.action = ROUTE_ACT_FORWARD;
+		r->attr.hit = false; /* Reset route-used indicator */
+		/* Routed packets must have their hop limit decremented and
+		 * checked; an expired hop limit traps to the CPU
+		 * (HL_FAIL_ACT) so Linux can send ICMP time-exceeded.
+		 */
+		r->attr.ttl_dec = true;
+		r->attr.ttl_check = true;
+
+		if (priv->r->set_l3_nexthop)
+			priv->r->set_l3_nexthop(r->nh.id, r->nh.l2_id, r->nh.if_id);
+
+		if (!r->is_host_route)
+			continue;
+
+		/* Update the existing slot if this destination is already
+		 * programmed; only claim a free slot for a first-time
+		 * install (a plain free-slot search here would duplicate
+		 * the entry on every neighbour refresh).
+		 */
+		int slot = priv->r->find_l3_slot(r, true);
+
+		if (slot < 0)
+			slot = priv->r->find_l3_slot(r, false);
+		pr_debug("%s: Got slot for route: %d\n", __func__, slot);
+		if (slot < 0) {
+			pr_err("%s: no free host-route slot for %pI6c\n",
+			       __func__, &r->dst_ip6);
+			continue;
+		}
+		priv->r->host_route_write(slot, r);
+	}
+	rcu_read_unlock();
+
+	return 0;
+}
+
+#if IS_BUILTIN(CONFIG_IPV6)
+
+static int rtl83xx_port_ipv6_resolve(struct rtl838x_switch_priv *priv,
+				     struct net_device *dev, struct in6_addr *ip6)
+{	struct neighbour *n = neigh_lookup(&nd_tbl, ip6, dev);
+	int err = 0;
+	u64 mac;
+
+	if (!n) {
+		n = neigh_create(&nd_tbl, ip6, dev);
+		if (IS_ERR(n))
+			return PTR_ERR(n);
+	}
+
+	/* If the neigh is already resolved, then go ahead and
+	 * install the entry, otherwise start the discovery process to
+	 * resolve the neigh.
+	 */
+	if (n->nud_state & NUD_VALID) {
+		mac = ether_addr_to_u64(n->ha);
+		pr_info("%s: resolved mac: %016llx\n", __func__, mac);
+		rtl83xx_l3_nexthop6_update(priv, ip6, mac);
+	} else {
+		pr_info("%s: need to wait\n", __func__);
+		neigh_event_send(n, NULL);
+	}
+
+	neigh_release(n);
+
+	return err;
+}
+
+#endif /* IS_BUILTIN(CONFIG_IPV6) */
+
+/* Install a /128 host route for a resolved IPv6 neighbour on a directly
+ * connected subnet - the /32 twin of rtl83xx_l3_neigh_route_add().
+ */
+static int rtl83xx_l3_neigh6_route_add(struct rtl838x_switch_priv *priv,
+				       struct in6_addr *ip6, u64 mac, u64 intf_mac,
+				       int vlan, int port)
+{
+	struct rtl83xx_route *r;
+	int slot, if_id;
+
+	if (!priv->r->host_route_write || !priv->r->set_l3_router_mac)
+		return -EOPNOTSUPP;
+
+	/* Same egress-VLAN rules as for IPv4: SVI neighbours carry their
+	 * VID, a bare routed port uses its reserved internal L3 VLAN,
+	 * anything else stays on the CPU path via the catch-all trap.
+	 */
+	if (!vlan) {
+		if (port < 0)
+			return -EOPNOTSUPP;
+		vlan = RTLDSA_L3_PORT_VID(port);
+	}
+
+	pr_debug("%s: ip %pI6c mac %016llx vlan %d port %d\n",
+		 __func__, ip6, mac, vlan, port);
+
+	r = rtl83xx_host_route_alloc(priv, ip6);
+	if (!r)
+		return -ENOSPC;
+
+	r->neigh_route = true;
+	r->dst_ip6 = *ip6;
+	r->prefix_len = 128;
+	r->attr.type = 2;
+	r->nh.rvid = vlan;
+
+	if (rtl83xx_alloc_router_mac(priv, intf_mac))
+		goto out_free;
+
+	if_id = rtl83xx_alloc_egress_intf(priv, intf_mac, vlan);
+	if (if_id < 0)
+		goto out_free;
+	r->nh.if_id = if_id;
+
+	r->nh.mac = r->nh.gw = mac;
+	/* On a bare routed port the egress port is known; behind an SVI it
+	 * comes from the learned L2 entry for the neighbour.
+	 */
+	r->nh.port = port >= 0 ? port : priv->port_ignore;
+	r->nh.id = r->id;
+
+	if (priv->r->set_l3_egress_mac)
+		priv->r->set_l3_egress_mac(r->id, mac);
+
+	rtl83xx_l2_nexthop_add(priv, &r->nh);
+
+	r->attr.valid = true;
+	r->attr.action = ROUTE_ACT_FORWARD;
+	r->attr.hit = false;
+	r->attr.ttl_dec = true;
+	r->attr.ttl_check = true;
+
+	slot = priv->r->find_l3_slot(r, false);
+	if (slot < 0) {
+		pr_err("%s: no free host-route slot for %pI6c\n", __func__, ip6);
+		rtl83xx_l2_nexthop_rm(priv, &r->nh);
+		goto out_free;
+	}
+	priv->r->host_route_write(slot, r);
+
+	if (priv->r->set_l3_nexthop)
+		priv->r->set_l3_nexthop(r->nh.id, r->nh.l2_id, r->nh.if_id);
+
+	pr_debug("%s: %pI6c -> %016llx VLAN %d l2_id %d if_id %d slot %d\n",
+		 __func__, ip6, mac, vlan, r->nh.l2_id, r->nh.if_id, slot);
+
+	return 0;
+
+out_free:
+	mutex_lock(&priv->reg_mutex);
+	if (rhltable_remove(&priv->routes, &r->linkage, route_ht_params))
+		dev_warn(priv->dev, "%s: could not remove route\n", __func__);
+	clear_bit(r->id - MAX_ROUTES, priv->host_route_use_bm);
+	mutex_unlock(&priv->reg_mutex);
+	kfree(r);
+
+	return -ENOSPC;
+}
+
+/* Tear down a neighbour-synthesized /128 host route once the neighbour is
+ * gone - the IPv6 twin of rtl83xx_l3_neigh_route_del().
+ */
+static void rtl83xx_l3_neigh6_route_del(struct rtl838x_switch_priv *priv,
+					struct in6_addr *ip6)
+{
+	struct rtl83xx_route *r = NULL, *entry;
+	struct rhlist_head *tmp, *list;
+	struct rtl83xx_nexthop nh;
+
+	rcu_read_lock();
+	list = rhltable_lookup(&priv->routes, ip6, route_ht_params);
+	if (!list) {
+		rcu_read_unlock();
+		return;
+	}
+	rhl_for_each_entry_rcu(entry, tmp, list, linkage) {
+		if (entry->neigh_route && entry->attr.type == 2 &&
+		    ipv6_addr_equal(&entry->dst_ip6, ip6)) {
+			r = entry;
+			break;
+		}
+	}
+	rcu_read_unlock();
+
+	if (!r)
+		return;
+
+	pr_debug("%s: removing offloaded neighbour %pI6c\n", __func__, ip6);
+	/* Invalidate the host route first so no window exists where it still
+	 * forwards into a dead L2 nexthop entry. route_rm frees r, so keep a
+	 * copy of the nexthop for the L2 cleanup.
+	 */
+	nh = r->nh;
+	rtl83xx_route_rm(priv, r);
+	rtl83xx_l2_nexthop_rm(priv, &nh);
+}
+
 struct l3_flush_work {
 	struct work_struct work;
 	struct rtl838x_switch_priv *priv;
@@ -1393,7 +1640,8 @@ static void rtl83xx_l3_flush_work_do(struct work_struct *work)
 	bool found;
 
 	do {
-		__be32 ip = 0;
+		struct in6_addr key;
+		bool is_v6 = false;
 
 		found = false;
 		rhltable_walk_enter(&priv->routes, &iter);
@@ -1402,7 +1650,8 @@ static void rtl83xx_l3_flush_work_do(struct work_struct *work)
 			if (IS_ERR(r))
 				continue;
 			if (r->neigh_route && r->nh.rvid == fw->rvid) {
-				ip = r->dst_ip;
+				key = r->gw_ip6;
+				is_v6 = r->attr.type == 2;
 				found = true;
 				break;
 			}
@@ -1410,8 +1659,13 @@ static void rtl83xx_l3_flush_work_do(struct work_struct *work)
 		rhashtable_walk_stop(&iter);
 		rhashtable_walk_exit(&iter);
 
-		if (found)
-			rtl83xx_l3_neigh_route_del(priv, ip);
+		if (found) {
+			if (is_v6) {
+				rtl83xx_l3_neigh6_route_del(priv, &key);
+				continue;
+			}
+			rtl83xx_l3_neigh_route_del(priv, key.s6_addr32[3]);
+		}
 	} while (found);
 
 	kfree(fw);
@@ -1539,14 +1793,208 @@ out_free_rt:
 	return -ENOSPC;
 }
 
-static int rtl83xx_fib6_add(struct rtl838x_switch_priv *priv,
-			    struct fib6_entry_notifier_info *info)
+#if IS_BUILTIN(CONFIG_IPV6)
+
+static int rtldsa_fib6_check(struct rtl838x_switch_priv *priv,
+			     struct fib6_entry_notifier_info *info,
+			     enum fib_event_type event)
 {
-	pr_debug("In %s\n", __func__);
-/*	nh->fib_nh_flags |= RTNH_F_OFFLOAD; */
+	struct fib6_info *rt = info->rt;
+	struct net_device *ndev = rt->fib6_nh->fib_nh_dev;
+	struct in6_addr *gw6 = &rt->fib6_nh->fib_nh_gw6;
+	int addr_type, vlan;
+
+	if (rt->nh || rt->fib6_nsiblings || rt->fib6_type != RTN_UNICAST || !ndev) {
+		pr_debug("%s: skip multipath/non-unicast IPv6 route\n", __func__);
+		return -EINVAL;
+	}
+
+	vlan = is_vlan_dev(ndev) ? vlan_dev_vlan_id(ndev) : 0;
+
+	dev_info(priv->dev, "%s IPv6 route %pI6c/%d via %pI6c (VLAN %d, MAC %pM)\n",
+		 event == FIB_EVENT_ENTRY_ADD ? "add" : "delete",
+		 &rt->fib6_dst.addr, rt->fib6_dst.plen, gw6, vlan, ndev->dev_addr);
+
+	addr_type = ipv6_addr_type(&rt->fib6_dst.addr);
+	if (addr_type & (IPV6_ADDR_MULTICAST | IPV6_ADDR_LINKLOCAL | IPV6_ADDR_LOOPBACK)) {
+		dev_warn(priv->dev, "skip multicast/link-local/loopback destination\n");
+		return -EINVAL;
+	}
+	if (!rt->fib6_dst.plen) {
+		dev_warn(priv->dev, "skip default route\n");
+		return -EINVAL;
+	}
+	/* Prefix routes via a gateway are not offloaded (host routes only);
+	 * they stay on the CPU path via the catch-all trap.
+	 */
+	if (rt->fib6_dst.plen < 128 && !ipv6_addr_any(gw6)) {
+		pr_debug("%s: skip gateway prefix route\n", __func__);
+		return -EINVAL;
+	}
 
 	return 0;
 }
+
+static int rtldsa_fib6_add(struct rtl838x_switch_priv *priv,
+			   struct fib6_entry_notifier_info *info)
+{
+	struct fib6_info *rt = info->rt;
+	struct net_device *ndev = rt->fib6_nh->fib_nh_dev;
+	int vlan = is_vlan_dev(ndev) ? vlan_dev_vlan_id(ndev) : 0;
+	struct in6_addr *gw6 = &rt->fib6_nh->fib_nh_gw6;
+	struct rtl83xx_route *route;
+	int port;
+
+	if (rtldsa_fib6_check(priv, info, FIB_EVENT_ENTRY_ADD))
+		return 0;
+
+	/* ndev may be one of our user ports itself (bare routed port) or an
+	 * upper (SVI/bridge) with a user port below.
+	 */
+	port = rtl83xx_port_is_under(ndev, priv);
+	if (port >= 0 && !vlan)
+		vlan = RTLDSA_L3_PORT_VID(port); /* bare routed port */
+	if (port < 0)
+		port = rtl83xx_port_dev_lower_find(ndev, priv);
+	if (port < 0) {
+		dev_err(priv->dev, "lower interface %s not found\n", ndev->name);
+		return -ENODEV;
+	}
+
+	/* Allocate route or host-route entry (if hardware supports this);
+	 * the gateway key is the native 128-bit address (:: for connected
+	 * routes, typically a link-local address otherwise).
+	 */
+	if (rt->fib6_dst.plen == 128 && priv->r->host_route_write)
+		route = rtl83xx_host_route_alloc(priv, gw6);
+	else
+		route = rtl83xx_route_alloc(priv, gw6);
+
+	if (route)
+		dev_info(priv->dev, "route hashtable extended for gw %pI6c\n", gw6);
+	else {
+		dev_err(priv->dev, "could not extend route hashtable for gw %pI6c\n", gw6);
+		return -ENOSPC;
+	}
+
+	route->dst_ip6 = rt->fib6_dst.addr;
+	route->prefix_len = rt->fib6_dst.plen;
+	route->attr.type = 2;
+	route->nh.rvid = vlan;
+
+	if (priv->r->set_l3_router_mac) {
+		u64 mac = ether_addr_to_u64(ndev->dev_addr);
+		int if_id;
+
+		pr_debug("Local route and router MAC %pM\n", ndev->dev_addr);
+		if (rtl83xx_alloc_router_mac(priv, mac))
+			goto out_free_rt;
+
+		/* vid = 0: Do not care about VID */
+		if_id = rtl83xx_alloc_egress_intf(priv, mac, vlan);
+		if (if_id < 0)
+			goto out_free_rt;
+		route->nh.if_id = if_id;
+
+		if (ipv6_addr_any(gw6)) {
+			int slot;
+
+			/* Connected route: trap packets for the subnet base
+			 * address (the subnet-router anycast address) to the
+			 * CPU, mirroring the IPv4 network-base entry.
+			 */
+			route->nh.mac = mac;
+			route->nh.port = priv->port_ignore;
+			route->attr.valid = true;
+			route->attr.action = ROUTE_ACT_TRAP2CPU;
+
+			slot = priv->r->find_l3_slot(route, false);
+			pr_debug("%s: Got slot for route: %d\n", __func__, slot);
+			if (slot >= 0)
+				priv->r->host_route_write(slot, route);
+		}
+	}
+
+	/* We need to resolve the mac address of the GW */
+	if (!ipv6_addr_any(gw6))
+		rtl83xx_port_ipv6_resolve(priv, ndev, gw6);
+
+	fib6_info_hw_flags_set(&init_net, rt, true, false, false);
+
+	return 0;
+
+out_free_rt:
+	/* Nothing has been written to the hardware tables yet - undo the
+	 * software state so the route is not falsely accounted as offloaded.
+	 * The router MAC stays allocated: it is deduplicated by MAC and may
+	 * be shared with other routes.
+	 */
+	mutex_lock(&priv->reg_mutex);
+	if (rhltable_remove(&priv->routes, &route->linkage, route_ht_params))
+		dev_warn(priv->dev, "%s: could not remove route\n", __func__);
+	if (route->is_host_route)
+		clear_bit(route->id - MAX_ROUTES, priv->host_route_use_bm);
+	else
+		clear_bit(route->id, priv->route_use_bm);
+	mutex_unlock(&priv->reg_mutex);
+	kfree(route);
+
+	return -ENOSPC;
+}
+
+static int rtldsa_fib6_del(struct rtl838x_switch_priv *priv,
+			   struct fib6_entry_notifier_info *info)
+{
+	struct fib6_info *rt = info->rt;
+	struct in6_addr *gw6 = &rt->fib6_nh->fib_nh_gw6;
+	struct rhlist_head *tmp, *list;
+	struct rtl83xx_route *route, *entry;
+
+	if (rtldsa_fib6_check(priv, info, FIB_EVENT_ENTRY_DEL))
+		return 0;
+
+	rcu_read_lock();
+	list = rhltable_lookup(&priv->routes, gw6, route_ht_params);
+	if (!list) {
+		rcu_read_unlock();
+		dev_err(priv->dev, "no such gateway: %pI6c\n", gw6);
+		return -ENOENT;
+	}
+	route = NULL;
+	rhl_for_each_entry_rcu(entry, tmp, list, linkage) {
+		if (entry->attr.type == 2 && !entry->neigh_route &&
+		    ipv6_addr_equal(&entry->dst_ip6, &rt->fib6_dst.addr) &&
+		    entry->prefix_len == rt->fib6_dst.plen) {
+			dev_info(priv->dev, "found a route with id %d, nh-id %d\n",
+				 entry->id, entry->nh.id);
+			route = entry;
+			break;
+		}
+	}
+	rcu_read_unlock();
+
+	/* All connected routes share the gateway key :: - without an exact
+	 * match this would proceed with the LAST examined entry and tear
+	 * down an unrelated route (the IPv4 shared-key 0.0.0.0 lesson).
+	 */
+	if (!route)
+		return -ENOENT;
+
+	rtl83xx_l2_nexthop_rm(priv, &route->nh);
+
+	if (route->pr.packet_cntr >= 0) {
+		pr_debug("releasing packet counter %d\n", route->pr.packet_cntr);
+		set_bit(route->pr.packet_cntr, priv->packet_cntr_use_bm);
+	}
+	if (route->pr.id >= 0)
+		priv->r->pie_rule_rm(priv, &route->pr);
+
+	rtl83xx_route_rm(priv, route);
+
+	return 0;
+}
+
+#endif /* IS_BUILTIN(CONFIG_IPV6) */
 
 struct net_event_work {
 	struct work_struct work;
@@ -1554,9 +2002,12 @@ struct net_event_work {
 	u64 mac;
 	u64 intf_mac;
 	u32 gw_addr;
+	struct in6_addr gw_addr6;
 	int vlan;
 	int port;	/* >= 0 only when the neighbour sits on a bare routed port */
 	bool valid;
+	bool is_v6;
+	bool linklocal;	/* fe80::/10 neighbour: nexthop only, never a host route */
 };
 
 static void rtl83xx_net_event_work_do(struct work_struct *work)
@@ -1564,6 +2015,27 @@ static void rtl83xx_net_event_work_do(struct work_struct *work)
 	struct net_event_work *net_work =
 		container_of(work, struct net_event_work, work);
 	struct rtl838x_switch_priv *priv = net_work->priv;
+
+	if (net_work->is_v6) {
+		if (!net_work->valid) {
+			rtl83xx_l3_neigh6_route_del(priv, &net_work->gw_addr6);
+		} else if (rtl83xx_l3_nexthop6_update(priv, &net_work->gw_addr6,
+						      net_work->mac) == -ENOENT &&
+			   !net_work->linklocal) {
+			/* Not the gateway of any FIB route: a plain host on a
+			 * connected subnet, offload it as a /128 host route.
+			 * Link-local neighbours only ever serve as nexthops
+			 * for gateway routes: link-local addresses are
+			 * per-interface and are never routed to, so no host
+			 * route is installed for them.
+			 */
+			rtl83xx_l3_neigh6_route_add(priv, &net_work->gw_addr6,
+						    net_work->mac, net_work->intf_mac,
+						    net_work->vlan, net_work->port);
+		}
+		kfree(net_work);
+		return;
+	}
 
 	if (!net_work->valid) {
 		rtl83xx_l3_neigh_route_del(priv, net_work->gw_addr);
@@ -1579,6 +2051,72 @@ static void rtl83xx_net_event_work_do(struct work_struct *work)
 
 	kfree(net_work);
 }
+
+#if IS_BUILTIN(CONFIG_IPV6)
+
+/* Handle an ndisc neighbour event: resolve gateways of offloaded IPv6
+ * routes and offload plain hosts on connected subnets as /128 host
+ * routes. Mirrors the arp path in rtl83xx_netevent_event().
+ */
+static int rtl83xx_ndisc_neigh_update(struct rtl838x_switch_priv *priv,
+				      struct neighbour *n)
+{
+	struct in6_addr *key = (struct in6_addr *)n->primary_key;
+	struct net_event_work *net_work;
+	struct net_device *dev = n->dev;
+	int addr_type, port;
+
+	addr_type = ipv6_addr_type(key);
+	/* Never touch multicast neighbours - no route for them ever exists
+	 * in the ASIC.
+	 */
+	if (addr_type & IPV6_ADDR_MULTICAST)
+		return NOTIFY_DONE;
+	/* A valid neighbour with a non-unicast MAC must not be offloaded;
+	 * invalid-state events still pass for teardown.
+	 */
+	if ((n->nud_state & NUD_VALID) && !is_valid_ether_addr(n->ha))
+		return NOTIFY_DONE;
+
+	/* The device is either one of our user ports itself (a bare routed
+	 * port) or an upper (SVI/bridge) with a user port somewhere below.
+	 */
+	port = rtl83xx_port_is_under(dev, priv);
+	if (port < 0)
+		port = rtl83xx_port_dev_lower_find(dev, priv);
+	if (port < 0) {
+		pr_debug("%s: neighbour not on our ports, ignoring\n", __func__);
+		return NOTIFY_DONE;
+	}
+
+	net_work = kzalloc(sizeof(*net_work), GFP_ATOMIC);
+	if (!net_work)
+		return NOTIFY_BAD;
+
+	INIT_WORK(&net_work->work, rtl83xx_net_event_work_do);
+	net_work->priv = priv;
+
+	net_work->mac = ether_addr_to_u64(n->ha);
+	net_work->gw_addr6 = *key;
+	net_work->intf_mac = ether_addr_to_u64(dev->dev_addr);
+	net_work->vlan = is_vlan_dev(dev) ? vlan_dev_vlan_id(dev) : 0;
+	/* Distinguish a neighbour on a bare routed port from one behind a
+	 * bridge/SVI, where the walk-derived port is just the first member.
+	 */
+	net_work->port = rtl83xx_port_is_under(dev, priv);
+	net_work->valid = !!(n->nud_state & NUD_VALID);
+	net_work->is_v6 = true;
+	net_work->linklocal = !!(addr_type & IPV6_ADDR_LINKLOCAL);
+
+	pr_debug("%s: neighbour %pI6c %s on port %d, mac %016llx\n",
+		 __func__, key, net_work->valid ? "update" : "invalidate",
+		 port, net_work->mac);
+	queue_work(priv->wq, &net_work->work);
+
+	return NOTIFY_DONE;
+}
+
+#endif /* IS_BUILTIN(CONFIG_IPV6) */
 
 static int rtl83xx_netevent_event(struct notifier_block *this,
 				  unsigned long event, void *ptr)
@@ -1597,8 +2135,13 @@ static int rtl83xx_netevent_event(struct notifier_block *this,
 		if (!priv->r->l3_setup)
 			return NOTIFY_DONE;
 
-		if (n->tbl != &arp_tbl)
+		if (n->tbl != &arp_tbl) {
+#if IS_BUILTIN(CONFIG_IPV6)
+			if (n->tbl == &nd_tbl)
+				return rtl83xx_ndisc_neigh_update(priv, n);
+#endif
 			return NOTIFY_DONE;
+		}
 		/* Never touch broadcast/multicast neighbours - no route for
 		 * them ever exists in the ASIC.
 		 */
@@ -1680,21 +2223,38 @@ static void rtl83xx_fib_event_work_do(struct work_struct *work)
 	case FIB_EVENT_ENTRY_ADD:
 	case FIB_EVENT_ENTRY_REPLACE:
 	case FIB_EVENT_ENTRY_APPEND:
+#if IS_BUILTIN(CONFIG_IPV6)
 		if (fib_work->is_fib6)
-			err = rtl83xx_fib6_add(priv, &fib_work->fen6_info);
+			err = rtldsa_fib6_add(priv, &fib_work->fen6_info);
 		else
+#endif
 			err = rtldsa_fib4_add(priv, &fib_work->fen_info);
 		if (err)
 			dev_err(priv->dev, "fib_add() failed\n");
 
-		fib_info_put(fib_work->fen_info.fi);
+#if IS_BUILTIN(CONFIG_IPV6)
+		if (fib_work->is_fib6)
+			fib6_info_release(fib_work->fen6_info.rt);
+		else
+#endif
+			fib_info_put(fib_work->fen_info.fi);
 		break;
 	case FIB_EVENT_ENTRY_DEL:
-		err = rtldsa_fib4_del(priv, &fib_work->fen_info);
+#if IS_BUILTIN(CONFIG_IPV6)
+		if (fib_work->is_fib6)
+			err = rtldsa_fib6_del(priv, &fib_work->fen6_info);
+		else
+#endif
+			err = rtldsa_fib4_del(priv, &fib_work->fen_info);
 		if (err)
 			dev_err(priv->dev, "fib_del() failed\n");
 
-		fib_info_put(fib_work->fen_info.fi);
+#if IS_BUILTIN(CONFIG_IPV6)
+		if (fib_work->is_fib6)
+			fib6_info_release(fib_work->fen6_info.rt);
+		else
+#endif
+			fib_info_put(fib_work->fen_info.fi);
 		break;
 	case FIB_EVENT_RULE_ADD:
 	case FIB_EVENT_RULE_DEL:
@@ -1762,10 +2322,21 @@ static int rtl83xx_fib_event(struct notifier_block *this, unsigned long event, v
 			fib_info_hold(fib_work->fen_info.fi);
 
 		} else if (info->family == AF_INET6) {
-			//struct fib6_entry_notifier_info *fen6_info = ptr;
+#if IS_BUILTIN(CONFIG_IPV6)
+			struct fib6_entry_notifier_info *fen6_info = ptr;
+
+			memcpy(&fib_work->fen6_info, ptr, sizeof(fib_work->fen6_info));
+			/* Take a reference on fib6_info to prevent it from
+			 * being freed while work is queued. Release it
+			 * afterwards.
+			 */
+			fib6_info_hold(fen6_info->rt);
+			fib_work->is_fib6 = true;
+#else
 			pr_warn("%s: FIB_RULE ADD/DEL for IPv6 not supported\n", __func__);
 			kfree(fib_work);
 			return NOTIFY_DONE;
+#endif
 		}
 		break;
 
