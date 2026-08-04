@@ -254,3 +254,57 @@
 		};
 	};
 };
+
+/*
+ * This board routes every SerDes lane with the TX pair inverted: the six
+ * 10G-QXGMII links to the RTL8224 quads (SerDes 2-7) and the six SFP+ 10GR
+ * links (SerDes 8-13). The MAC must invert TX to match; RX is wired normally.
+ * Without this the far end never decodes and no lane links.
+ */
+&serdes2 {
+	realtek,pnswap-tx;
+};
+
+&serdes3 {
+	realtek,pnswap-tx;
+};
+
+&serdes4 {
+	realtek,pnswap-tx;
+};
+
+&serdes5 {
+	realtek,pnswap-tx;
+};
+
+&serdes6 {
+	realtek,pnswap-tx;
+};
+
+&serdes7 {
+	realtek,pnswap-tx;
+};
+
+&serdes8 {
+	realtek,pnswap-tx;
+};
+
+&serdes9 {
+	realtek,pnswap-tx;
+};
+
+&serdes10 {
+	realtek,pnswap-tx;
+};
+
+&serdes11 {
+	realtek,pnswap-tx;
+};
+
+&serdes12 {
+	realtek,pnswap-tx;
+};
+
+&serdes13 {
+	realtek,pnswap-tx;
+};
