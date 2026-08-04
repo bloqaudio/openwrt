@@ -3105,6 +3105,19 @@ static int rtpcs_931x_setup_serdes(struct rtpcs_serdes *sds,
 			 * _dal_mango_construct_init_usxgmii() default branch.
 			 */
 			if (mode == PHY_INTERFACE_MODE_10G_QXGMII) {
+				/*
+				 * QXGMII alignment op-code for an RTL8224 host.
+				 * The RTL8224 firmware brings its host SerDes up
+				 * with op-code 0x60aa, AM period 0x00a4 and the
+				 * 0x68c1... AM markers; the MAC end must use the
+				 * same op-code or the lane links but never
+				 * decodes the four channels. The vendor default
+				 * branch's 0x6003 is for other MAC/PHY pairings
+				 * and left this lane receiving zero frames. AM
+				 * period/markers already match the PHY firmware,
+				 * so only the op-code changes here.
+				 */
+				op_code = 0x60aa;
 				rtpcs_sds_write(sds, 0x6, 0x1d, 0x0600);
 				rtpcs_sds_write(sds, 0x6, 0x13, 0x68c1);
 				rtpcs_sds_write(sds, 0x6, 0x14, 0xf021);
