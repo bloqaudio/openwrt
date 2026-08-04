@@ -2727,6 +2727,247 @@ static void rtpcs_931x_setup_qxgmii_groups(struct rtpcs_ctrl *ctrl)
 	regmap_write(ctrl->map, RTL931X_MAC_FORCE_RXDV_HI, 0xffffffff);
 }
 
+
+/*
+ * RTL931x SerDes receive calibration.
+ *
+ * OpenWrt implements this for RTL930x but never for RTL931x, and on boards
+ * whose bootloader cannot drive the PHYs (e.g. an RTL8224 quad, for which the
+ * stock RTL9313 loader has no driver at all) nothing else trains the receiver.
+ * The SerDes then reaches PCS lock and reports link while decoding nothing.
+ *
+ * Ported from the vendor sequence: _dal_mango_construct_pcb_cali() ->
+ * phy_rtl9310_{sdsRxCaliEnable_set,rxCali,pcb_adapt}() in
+ * dal_mango_construct.c / phy_rtl9310.c.
+ */
+
+enum rtpcs_931x_dfe_type {
+	RTPCS_931X_DFE_VTH,
+	RTPCS_931X_DFE_TAP0,
+	RTPCS_931X_DFE_TAP1EVEN,
+	RTPCS_931X_DFE_TAP1ODD,
+	RTPCS_931X_DFE_TAP2EVEN,
+	RTPCS_931X_DFE_TAP2ODD,
+	RTPCS_931X_DFE_TAP3EVEN,
+	RTPCS_931X_DFE_TAP3ODD,
+	RTPCS_931X_DFE_TAP4EVEN,
+	RTPCS_931X_DFE_TAP4ODD,
+};
+
+/*
+ * Route an internal debug value to the readback register at 0x1f:0x14. The
+ * even SerDes of the pair carries the selector, the odd/even distinction is
+ * encoded in the value (75 + lane).
+ */
+static void rtpcs_931x_sds_rxcal_dbg_set(struct rtpcs_serdes *sds, u32 dbg_sel)
+{
+	struct rtpcs_serdes *even_sds = rtpcs_sds_get_even(sds);
+
+	rtpcs_sds_write(even_sds, 0x1f, 0x02, 75 + (sds->id % 2));
+	rtpcs_sds_write_bits(sds, 0x21, 0x0, 2, 2, 1);
+	rtpcs_sds_write_bits(sds, 0x2e, 0x15, 11, 10, dbg_sel);
+}
+
+static void rtpcs_931x_sds_rxcal_dfe_set(struct rtpcs_serdes *sds,
+					 enum rtpcs_931x_dfe_type type, u32 val)
+{
+	switch (type) {
+	case RTPCS_931X_DFE_VTH:
+		rtpcs_sds_write_bits(sds, 0x2f, 0x12, 11, 4, val);
+		rtpcs_sds_write_bits(sds, 0x2e, 0x0f, 12, 12, 1);
+		break;
+	case RTPCS_931X_DFE_TAP0:
+		rtpcs_sds_write_bits(sds, 0x2e, 0x1c, 5, 5, 0);
+		rtpcs_sds_write_bits(sds, 0x2e, 0x1c, 4, 0, val);
+		rtpcs_sds_write_bits(sds, 0x2e, 0x0f, 6, 6, 1);
+		break;
+	case RTPCS_931X_DFE_TAP1EVEN:
+		rtpcs_sds_write_bits(sds, 0x2e, 0x1d, 5, 0, val);
+		rtpcs_sds_write_bits(sds, 0x2e, 0x0f, 7, 7, 1);
+		break;
+	case RTPCS_931X_DFE_TAP1ODD:
+		rtpcs_sds_write_bits(sds, 0x2e, 0x1d, 11, 6, val);
+		rtpcs_sds_write_bits(sds, 0x2e, 0x0f, 7, 7, 1);
+		break;
+	case RTPCS_931X_DFE_TAP2EVEN:
+		rtpcs_sds_write_bits(sds, 0x2e, 0x1f, 5, 0, val);
+		rtpcs_sds_write_bits(sds, 0x2e, 0x0f, 8, 8, 1);
+		break;
+	case RTPCS_931X_DFE_TAP2ODD:
+		rtpcs_sds_write_bits(sds, 0x2e, 0x1f, 11, 6, val);
+		rtpcs_sds_write_bits(sds, 0x2e, 0x0f, 8, 8, 1);
+		break;
+	case RTPCS_931X_DFE_TAP3EVEN:
+		rtpcs_sds_write_bits(sds, 0x2f, 0x0, 5, 0, val);
+		rtpcs_sds_write_bits(sds, 0x2e, 0x0f, 9, 9, 1);
+		break;
+	case RTPCS_931X_DFE_TAP3ODD:
+		rtpcs_sds_write_bits(sds, 0x2f, 0x0, 11, 6, val);
+		rtpcs_sds_write_bits(sds, 0x2e, 0x0f, 9, 9, 1);
+		break;
+	case RTPCS_931X_DFE_TAP4EVEN:
+		rtpcs_sds_write_bits(sds, 0x2f, 0x1, 5, 0, val);
+		rtpcs_sds_write_bits(sds, 0x2e, 0x0f, 10, 10, 1);
+		break;
+	case RTPCS_931X_DFE_TAP4ODD:
+		rtpcs_sds_write_bits(sds, 0x2f, 0x1, 11, 6, val);
+		rtpcs_sds_write_bits(sds, 0x2e, 0x0f, 10, 10, 1);
+		break;
+	}
+}
+
+/* Select a DFE coefficient and read its trained value back. */
+static u32 rtpcs_931x_sds_rxcal_dfe_get(struct rtpcs_serdes *sds, u32 coef_num,
+					u32 msb, u32 lsb)
+{
+	rtpcs_sds_write_bits(sds, 0x2e, 0x14, 10, 5, coef_num);
+
+	return rtpcs_sds_read_bits(sds, 0x1f, 0x14, msb, lsb);
+}
+
+static u32 rtpcs_931x_sds_rxcal_leq_get(struct rtpcs_serdes *sds)
+{
+	u32 gray;
+
+	rtpcs_931x_sds_rxcal_dbg_set(sds, 0x1);
+	gray = rtpcs_sds_read_bits(sds, 0x1f, 0x14, 7, 3);
+
+	return rtpcs_930x_sds_rxcal_gray_to_binary(gray);
+}
+
+static u32 rtpcs_931x_sds_rxcal_tap0_get(struct rtpcs_serdes *sds)
+{
+	rtpcs_931x_sds_rxcal_dbg_set(sds, 0x2);
+
+	return rtpcs_931x_sds_rxcal_dfe_get(sds, 0x00, 5, 0);
+}
+
+/*
+ * Link state as the vendor's default (non-fibre) case reads it: analog
+ * page 5 register 0 bit 12. Note this is NOT the field
+ * rtpcs_931x_sds_link_sts_get() returns.
+ */
+static bool rtpcs_931x_sds_rxcal_link_ok(struct rtpcs_serdes *sds)
+{
+	return !!rtpcs_sds_read_bits(sds, 0x5, 0x0, 12, 12);
+}
+
+static void rtpcs_931x_sds_rxcal_dfe_dis(struct rtpcs_serdes *sds)
+{
+	rtpcs_sds_write_bits(sds, 0x2a, 0x0f, 12, 6, 0x7f);
+}
+
+/* Long-tail equaliser adaptation; run before the DFE taps are trained. */
+static void rtpcs_931x_sds_rxcal_leq_adapt(struct rtpcs_serdes *sds)
+{
+	rtpcs_sds_write_bits(sds, 0x2e, 0x0d, 6, 0, 0x0);
+	rtpcs_sds_write_bits(sds, 0x2e, 0x0d, 13, 13, 0x0);
+	rtpcs_931x_sds_rxcal_dfe_dis(sds);
+
+	rtpcs_sds_write_bits(sds, 0x2e, 0x0d, 7, 7, 1);
+	rtpcs_931x_sds_rx_reset(sds);
+	mdelay(10);
+	rtpcs_sds_write_bits(sds, 0x2e, 0x0d, 7, 7, 0);
+	mdelay(100);
+}
+
+/*
+ * Train the receiver against this board's actual channel: settle the LEQ,
+ * then sweep the slicer threshold until TAP0 lands in its usable window and
+ * freeze the resulting coefficients.
+ */
+static void rtpcs_931x_sds_rxcal_pcb_adapt(struct rtpcs_serdes *sds)
+{
+	static const u8 dfe_coef[] = { 0x00, 0x0c };	/* TAP0, VTH_BIN */
+	u32 leq, tap0, val;
+	int loop, i;
+
+	rtpcs_sds_write_bits(sds, 0x2e, 0x0d, 6, 0, 0);
+	rtpcs_sds_write_bits(sds, 0x2e, 0x0d, 13, 13, 0);
+	rtpcs_931x_sds_rxcal_dfe_dis(sds);
+
+	/* Re-run LEQ until it settles low enough to trust, or we give up. */
+	for (loop = 0; loop < 3; loop++) {
+		rtpcs_sds_write_bits(sds, 0x2e, 0x0d, 7, 7, 1);
+		rtpcs_931x_sds_rx_reset(sds);
+		mdelay(50);
+		rtpcs_sds_write_bits(sds, 0x2e, 0x0d, 7, 7, 0);
+		mdelay(200);
+
+		for (i = 0; i < 5; i++) {
+			if (rtpcs_931x_sds_rxcal_link_ok(sds))
+				break;
+			mdelay(150);
+		}
+
+		if (rtpcs_931x_sds_rxcal_link_ok(sds)) {
+			leq = rtpcs_931x_sds_rxcal_leq_get(sds);
+			if (leq < 20)
+				break;
+		}
+	}
+
+	rtpcs_sds_write_bits(sds, 0x2e, 0x0f, 6, 6, 0);
+	rtpcs_sds_write_bits(sds, 0x2e, 0x0f, 12, 12, 0);
+	rtpcs_931x_sds_rxcal_dbg_set(sds, 0x2);
+
+	/* VTHP in [3:0], VTHN in [7:4]; accept the first TAP0 in 15..31 */
+	for (i = 5; i <= 10; i++) {
+		rtpcs_931x_sds_rxcal_dfe_set(sds, RTPCS_931X_DFE_VTH,
+					     (i << 4) | i);
+		rtpcs_sds_write_bits(sds, 0x2e, 0x0f, 6, 6, 0);
+		mdelay(5);
+		tap0 = rtpcs_931x_sds_rxcal_tap0_get(sds);
+		if (tap0 >= 15 && tap0 <= 31)
+			break;
+	}
+
+	/* Freeze what was trained. TAP0 is pinned to its maximum by design. */
+	for (i = 0; i < ARRAY_SIZE(dfe_coef); i++) {
+		val = rtpcs_931x_sds_rxcal_dfe_get(sds, dfe_coef[i], 5, 0);
+		if (dfe_coef[i] == 0x00)
+			rtpcs_931x_sds_rxcal_dfe_set(sds, RTPCS_931X_DFE_TAP0, 31);
+		else
+			rtpcs_931x_sds_rxcal_dfe_set(sds, RTPCS_931X_DFE_VTH, val);
+	}
+
+	rtpcs_931x_sds_rx_reset(sds);
+
+	/* Hand taps 1-4 back to the hardware adapter. */
+	rtpcs_sds_write_bits(sds, 0x2e, 0x0f, 7, 7, 0);
+	rtpcs_sds_write_bits(sds, 0x2e, 0x0f, 8, 8, 0);
+	rtpcs_sds_write_bits(sds, 0x2e, 0x0f, 9, 9, 0);
+	rtpcs_sds_write_bits(sds, 0x2e, 0x0f, 10, 10, 0);
+}
+
+/*
+ * Full receive calibration for one SerDes. The vendor powers the lane down
+ * across the adaptation, so the port must be quiesced first.
+ */
+static void rtpcs_931x_sds_rx_calibrate(struct rtpcs_serdes *sds)
+{
+	struct rtpcs_ctrl *ctrl = sds->ctrl;
+	u32 ori;
+	int i;
+
+	regmap_read(ctrl->map, RTL931X_PS_SERDES_OFF_MODE_CTRL_ADDR, &ori);
+	regmap_write(ctrl->map, RTL931X_PS_SERDES_OFF_MODE_CTRL_ADDR,
+		     ori | BIT(sds->id));
+
+	/* dfeTap1_4Enable/dfeAuto/leqAuto all default to enabled (pcb_init) */
+	for (i = 0; i < 10; i++) {
+		rtpcs_931x_sds_rxcal_leq_adapt(sds);
+		if (rtpcs_931x_sds_rxcal_link_ok(sds))
+			break;
+		mdelay(100);
+	}
+
+	rtpcs_931x_sds_rxcal_pcb_adapt(sds);
+
+	regmap_write(ctrl->map, RTL931X_PS_SERDES_OFF_MODE_CTRL_ADDR, ori);
+	mdelay(50);
+}
+
 static int rtpcs_931x_setup_serdes(struct rtpcs_serdes *sds,
 				   phy_interface_t mode)
 {
@@ -2961,6 +3202,18 @@ static int rtpcs_931x_setup_serdes(struct rtpcs_serdes *sds,
 		else
 			rtpcs_931x_sds_fiber_mode_set(sds, mode);
 	}
+
+	/*
+	 * Train the receiver once the lane is in its final mode. The vendor
+	 * does this from dal_mango_construct_serdesConfig_init() for XSGMII
+	 * and both USXGMII submodes; without it a lane locks and reports link
+	 * but never decodes, which is fatal on boards whose bootloader cannot
+	 * bring the PHYs up at all.
+	 */
+	if (mode == PHY_INTERFACE_MODE_10G_QXGMII ||
+	    mode == PHY_INTERFACE_MODE_USXGMII ||
+	    mode == PHY_INTERFACE_MODE_XGMII)
+		rtpcs_931x_sds_rx_calibrate(sds);
 
 	return 0;
 }
