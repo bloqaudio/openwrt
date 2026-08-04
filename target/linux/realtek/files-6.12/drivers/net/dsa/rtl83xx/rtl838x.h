@@ -180,6 +180,18 @@
 #define RTL930X_MAC_FORCE_FC_EN			BIT(9)
 
 #define RTL931X_FORCE_EN			BIT(9)
+/*
+ * MAC_FORCE_MODE_CTRL field layout for RTL931x, per the vendor SDK
+ * (swcore_rtl9310.h RTL9310_MAC_FORCE_MODE_CTRL_SMI_*): the speed select is
+ * 4 bits at 12, duplex select at 11, link value at 9, and separate
+ * force-enable bits for speed/duplex/link at 3/2/0.
+ */
+#define RTL931X_SPEED_SHIFT			(12)
+#define RTL931X_SPEED_MASK			(0xf << RTL931X_SPEED_SHIFT)
+#define RTL931X_DUP_SEL				BIT(11)
+#define RTL931X_FORCE_LINK			BIT(9)
+#define RTL931X_FORCE_SPD_EN			BIT(3)
+#define RTL931X_FORCE_DUP_EN			BIT(2)
 #define RTL931X_FORCE_LINK_EN			BIT(0)
 #define RTL931X_DUPLEX_MODE			BIT(2)
 #define RTL931X_MAC_FORCE_FC_EN			BIT(4)

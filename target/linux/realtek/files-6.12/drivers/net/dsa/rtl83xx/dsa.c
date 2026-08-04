@@ -1256,6 +1256,24 @@ static void rtl93xx_phylink_mac_link_up(struct dsa_switch *ds, int port,
 			mcr |= RTL930X_DUPLEX_MODE;
 		if (dsa_port_is_cpu(dp) || !priv->ports[port].phy_is_integrated)
 			mcr |= RTL930X_FORCE_EN;
+	} else if (priv->family_id == RTL9310_FAMILY_ID) {
+		/*
+		 * Without this the register keeps whatever the bootloader left,
+		 * so a 2.5G RTL8224 link ends up served by a MAC still set to
+		 * 1G and the port receives nothing.
+		 */
+		mcr &= ~(RTL931X_SPEED_MASK | RTL931X_DUP_SEL |
+			 RTL931X_TX_PAUSE_EN | RTL931X_RX_PAUSE_EN);
+		mcr |= spdsel << RTL931X_SPEED_SHIFT;
+		mcr |= RTL931X_FORCE_SPD_EN | RTL931X_FORCE_DUP_EN |
+		       RTL931X_FORCE_LINK_EN | RTL931X_FORCE_LINK;
+
+		if (duplex == DUPLEX_FULL || priv->lagmembers & BIT_ULL(port))
+			mcr |= RTL931X_DUP_SEL;
+		if (tx_pause)
+			mcr |= RTL931X_TX_PAUSE_EN;
+		if (rx_pause)
+			mcr |= RTL931X_RX_PAUSE_EN;
 	}
 
 	pr_debug("%s port %d, mode %x, speed %d, duplex %d, txpause %d, rxpause %d: set mcr=%08x\n",
