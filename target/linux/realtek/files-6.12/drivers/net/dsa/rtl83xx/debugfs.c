@@ -974,19 +974,39 @@ static ssize_t rtl_dbg_phy_mmd_write(struct file *file, const char __user *buf,
 				     size_t count, loff_t *ppos)
 {
 	char kbuf[64];
-	u32 a, b, c;
+	u32 a, b, c, d;
+	int n;
 
 	if (count >= sizeof(kbuf))
 		return -EINVAL;
 	if (copy_from_user(kbuf, buf, count))
 		return -EFAULT;
 	kbuf[count] = 0;
-	if (sscanf(kbuf, "%i %i %i", &a, &b, &c) != 3)
+	/*
+	 * "<port> <mmd> <reg>"       select for reading
+	 * "<port> <mmd> <reg> <val>" write immediately
+	 */
+	n = sscanf(kbuf, "%i %i %i %i", &a, &b, &c, &d);
+	if (n < 3)
 		return -EINVAL;
 
 	rtl_dbg_phy_port = a;
 	rtl_dbg_phy_devad = b;
 	rtl_dbg_phy_reg = c;
+
+	if (n == 4) {
+		struct rtl838x_switch_priv *priv = rtl_dbg_priv;
+		const struct dsa_port *dp;
+
+		if (!priv || a > priv->cpu_port)
+			return -ENODEV;
+
+		dp = priv->ports[a].dp;
+		if (!dp || !dp->user || !dp->user->phydev)
+			return -ENODEV;
+
+		phy_write_mmd(dp->user->phydev, b, c, d);
+	}
 
 	return count;
 }
