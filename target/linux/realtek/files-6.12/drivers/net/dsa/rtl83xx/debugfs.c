@@ -920,6 +920,39 @@ err:
 	rtl838x_dbgfs_cleanup(priv);
 }
 
+
+/*
+ * Generic switch-register access for bring-up debugging. Write a hex offset
+ * (relative to the switch register base) into "reg_addr", then read or write
+ * "reg_val". Registers are 4-byte aligned. This is a debug convenience and
+ * should not be relied on by userspace tooling.
+ */
+static u32 rtl_dbg_reg_addr;
+
+static int rtl_dbg_reg_val_get(void *data, u64 *val)
+{
+	u32 off = rtl_dbg_reg_addr & ~0x3u;
+
+	*val = sw_r32(off);
+	return 0;
+}
+
+static int rtl_dbg_reg_val_set(void *data, u64 val)
+{
+	u32 off = rtl_dbg_reg_addr & ~0x3u;
+
+	sw_w32((u32)val, off);
+	return 0;
+}
+DEFINE_DEBUGFS_ATTRIBUTE(rtl_dbg_reg_val_fops, rtl_dbg_reg_val_get,
+			 rtl_dbg_reg_val_set, "0x%08llx\n");
+
+static void rtl_dbg_reg_init(struct dentry *dir)
+{
+	debugfs_create_x32("reg_addr", 0644, dir, &rtl_dbg_reg_addr);
+	debugfs_create_file("reg_val", 0644, dir, NULL, &rtl_dbg_reg_val_fops);
+}
+
 void rtl930x_dbgfs_init(struct rtl838x_switch_priv *priv)
 {
 	struct dentry *dbg_dir;
@@ -931,6 +964,8 @@ void rtl930x_dbgfs_init(struct rtl838x_switch_priv *priv)
 		dbg_dir = debugfs_create_dir(RTL838X_DRIVER_NAME, NULL);
 
 	priv->dbgfs_dir = dbg_dir;
+
+	rtl_dbg_reg_init(dbg_dir);
 
 	debugfs_create_file("drop_counters", 0400, dbg_dir, priv, &drop_counter_fops);
 
