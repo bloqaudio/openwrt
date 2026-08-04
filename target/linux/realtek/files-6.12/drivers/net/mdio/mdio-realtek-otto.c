@@ -1383,11 +1383,17 @@ static int rtmdio_931x_reset(struct mii_bus *bus)
 
 	pr_info("c45_mask: %08x, RTL931X_SMI_GLB_CTRL0 was %X", c45_mask, sw_r32(RTMDIO_931X_SMI_GLB_CTRL0));
 
-	/* We have a 10G PHY enable polling
-	 * sw_w32(0x01010000, RTL931X_SMI_10GPHY_POLLING_SEL2);
-	 * sw_w32(0x01E7C400, RTL931X_SMI_10GPHY_POLLING_SEL3);
-	 * sw_w32(0x01E7E820, RTL931X_SMI_10GPHY_POLLING_SEL4);
+	/*
+	 * 10G PHY poll selection. The vendor SDK programs these from the
+	 * RTL8224's poller metadata in _dal_mango_construct_macPollingPhy_init();
+	 * without them the MAC never learns per-channel link/speed from a
+	 * C45 multi-gig PHY.
 	 */
+	if (c45_mask) {
+		sw_w32(0x01010000, 0x0cf8);
+		sw_w32(0x01E7C400, 0x0cfc);
+		sw_w32(0x01E7E820, 0x0d00);
+	}
 	sw_w32_mask(GENMASK(7, 0), c45_mask, RTMDIO_931X_SMI_GLB_CTRL1);
 
 	return 0;
