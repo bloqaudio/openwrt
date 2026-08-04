@@ -1,0 +1,256 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+/dts-v1/;
+
+#include "rtl931x.dtsi"
+
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/leds/common.h>
+
+/*
+ * Hasivo S5800W-24GT-6S+ (board silkscreen S5800W-24GT-6SX V1.01)
+ *
+ * RTL9313 (model register 0x1b000004 reads 0x93130001), 512 MB DDR3,
+ * 32 MB MXIC SPI-NOR, 24x 2.5GBASE-T via 6x RTL8224 quad PHYs in
+ * 10G-QXGMII, 6x SFP+.
+ *
+ * The port map below comes from the vendor SDK hardware profile
+ * RTL9312_24X2P5G_6XGE (rtk-sdk/system/include/hwp/hw_profiles/
+ * rtl9312_24x2p5g_6xge.c) — the loader names exactly that profile for this
+ * topology — and its copper half is corroborated by the in-tree Plasma
+ * Cloud RTL9312 boards, which use the same 6x RTL8224 arrangement.
+ *
+ * PHY ADDRESSES are hardware-verified: driving the stock loader's RTK init
+ * programs SMI_PORT_ADDR (0x1b000c74), and reading it back gives exactly
+ * ports 0,1,4,5,...,44,45 -> addresses 0..23.
+ *
+ * SMI BUS/ADDRESS assignment was established by sweeping every bus against
+ * every address at boot and reading C45 PMA IDs. All 24 RTL8224 PHYs answer
+ * (ID 001c:cad0), split as:
+ *     SMI bus 0, addresses 0..11  -> ports 0,1,4,5,...,20,21
+ *     SMI bus 1, addresses 0..11  -> ports 24,25,28,29,...,44,45
+ * Each bus restarts at address 0. Note this matches NEITHER the vendor SDK
+ * profile (which claims one bus, addresses 0..23 — that is a Realtek
+ * reference board, not this one) NOR the Plasma Cloud boards (bus 1 at
+ * addresses 12..23). SMI_PORT_ADDR readback cannot settle this: it holds
+ * only addresses, and the bus-select register reads zero because the
+ * loader never programs it. Each bus in use also needs its own MDC/MDIO
+ * pin group muxed or its pins stay electrically dead.
+ *
+ * STILL UNVERIFIED: SFP+ cage i2c/LOS/mod-def0/tx-disable wiring, so no
+ * sfp nodes are declared yet and the SFP+ ports are left as plain
+ * in-band-status links (fine for DAC/fixed optics, no hotplug/DDM).
+ */
+
+/* RTL8224 quads are C45 and need an explicit SMI bus/address pair */
+#define HASIVO_PHY(p, b, a) \
+	phy##p: ethernet-phy@##p { \
+		reg = <##p>; \
+		compatible = "ethernet-phy-ieee802.3-c45"; \
+		rtl9300,smi-address = <b a>; \
+	};
+
+/*
+ * SFP+ cage without an sfp node (cage i2c/GPIO wiring not yet mapped).
+ * 1000base-x + in-band-status matches both in-tree rtl931x boards; revisit
+ * as 10gbase-r once the cages are described and 10G is actually wanted.
+ */
+#define HASIVO_SFP_PORT(p, l, s) \
+	port##p: port@##p { \
+		reg = <##p>; \
+		label = SWITCH_PORT_LABEL(l) ; \
+		pcs-handle = <&serdes##s>; \
+		phy-mode = "1000base-x"; \
+		managed = "in-band-status"; \
+		led-set = <1>; \
+	};
+
+/ {
+	compatible = "hasivo,s5800w-24gt-6sp", "realtek,rtl9313-soc";
+	model = "Hasivo S5800W-24GT-6S+";
+
+	chosen {
+		/* keep the loader's console; it runs at 38400, not 115200 */
+		bootargs = "console=ttyS0,38400";
+	};
+
+	memory@0 {
+		reg = <0x00000000 0x10000000>, /* low mem 256 MiB */
+		      <0x90000000 0x10000000>; /* high mem 256 MiB */
+	};
+
+	led_set@0 {
+		compatible = "realtek,rtl9300-leds";
+		active-low;
+
+		/* copper ports: 2.5G/1G/100M link + activity */
+		led_set0 = <(RTL93XX_LED_SET_2P5G | RTL93XX_LED_SET_LINK |
+			     RTL93XX_LED_SET_ACT)
+			    (RTL93XX_LED_SET_1G | RTL93XX_LED_SET_100M |
+			     RTL93XX_LED_SET_10M | RTL93XX_LED_SET_LINK |
+			     RTL93XX_LED_SET_ACT)>;
+
+		/* SFP+ cages */
+		led_set1 = <(RTL93XX_LED_SET_10G | RTL93XX_LED_SET_LINK |
+			     RTL93XX_LED_SET_ACT)
+			    (RTL93XX_LED_SET_1G | RTL93XX_LED_SET_LINK |
+			     RTL93XX_LED_SET_ACT)>;
+	};
+};
+
+&spi0 {
+	status = "okay";
+
+	flash@0 {
+		compatible = "jedec,spi-nor";
+		reg = <0>;
+		spi-max-frequency = <10000000>;
+
+		/* layout as reported by the stock loader's own 'flshow' */
+		partitions {
+			compatible = "fixed-partitions";
+			#address-cells = <1>;
+			#size-cells = <1>;
+
+			partition@0 {
+				label = "u-boot";
+				reg = <0x0 0xe0000>;
+				read-only;
+			};
+
+			partition@e0000 {
+				label = "u-boot-env";
+				reg = <0xe0000 0x10000>;
+				read-only;
+			};
+
+			partition@f0000 {
+				label = "sysinfo";
+				reg = <0xf0000 0x10000>;
+				read-only;
+			};
+
+			partition@100000 {
+				label = "vendor-cfg";
+				reg = <0x100000 0x100000>;
+				read-only;
+			};
+
+			partition@200000 {
+				label = "vendor-log";
+				reg = <0x200000 0x100000>;
+				read-only;
+			};
+
+			partition@300000 {
+				label = "firmware";
+				reg = <0x300000 0xe80000>;
+				compatible = "openwrt,uimage", "denx,uimage";
+				openwrt,ih-magic = <0x93000000>;
+			};
+
+			partition@1180000 {
+				label = "firmware2";
+				reg = <0x1180000 0xe80000>;
+				compatible = "openwrt,uimage", "denx,uimage";
+				openwrt,ih-magic = <0x93000000>;
+			};
+		};
+	};
+};
+
+&mdio_ctrl {
+	pinctrl-names = "default";
+	/* one MDC/MDIO pin group per SMI bus in use */
+	pinctrl-0 = <&pinmux_enable_mdc_mdio_0>,
+		    <&pinmux_enable_mdc_mdio_1>;
+};
+
+&mdio_bus0 {
+	/* 6x RTL8224, each a quad 2.5G C45 PHY at 4 consecutive SMI addresses */
+	HASIVO_PHY(0, 0, 0)
+	HASIVO_PHY(1, 0, 1)
+	HASIVO_PHY(4, 0, 2)
+	HASIVO_PHY(5, 0, 3)
+
+	HASIVO_PHY(8, 0, 4)
+	HASIVO_PHY(9, 0, 5)
+	HASIVO_PHY(12, 0, 6)
+	HASIVO_PHY(13, 0, 7)
+
+	HASIVO_PHY(16, 0, 8)
+	HASIVO_PHY(17, 0, 9)
+	HASIVO_PHY(20, 0, 10)
+	HASIVO_PHY(21, 0, 11)
+
+	HASIVO_PHY(24, 1, 0)
+	HASIVO_PHY(25, 1, 1)
+	HASIVO_PHY(28, 1, 2)
+	HASIVO_PHY(29, 1, 3)
+
+	HASIVO_PHY(32, 1, 4)
+	HASIVO_PHY(33, 1, 5)
+	HASIVO_PHY(36, 1, 6)
+	HASIVO_PHY(37, 1, 7)
+
+	HASIVO_PHY(40, 1, 8)
+	HASIVO_PHY(41, 1, 9)
+	HASIVO_PHY(44, 1, 10)
+	HASIVO_PHY(45, 1, 11)
+};
+
+&switch0 {
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		/* 24x 2.5GBASE-T, 4 ports per RTL8224 per SerDes */
+		SWITCH_PORT_SDS(0, 1, 2, 10g-qxgmii)
+		SWITCH_PORT_SDS(1, 2, 2, 10g-qxgmii)
+		SWITCH_PORT_SDS(4, 3, 2, 10g-qxgmii)
+		SWITCH_PORT_SDS(5, 4, 2, 10g-qxgmii)
+
+		SWITCH_PORT_SDS(8, 5, 3, 10g-qxgmii)
+		SWITCH_PORT_SDS(9, 6, 3, 10g-qxgmii)
+		SWITCH_PORT_SDS(12, 7, 3, 10g-qxgmii)
+		SWITCH_PORT_SDS(13, 8, 3, 10g-qxgmii)
+
+		SWITCH_PORT_SDS(16, 9, 4, 10g-qxgmii)
+		SWITCH_PORT_SDS(17, 10, 4, 10g-qxgmii)
+		SWITCH_PORT_SDS(20, 11, 4, 10g-qxgmii)
+		SWITCH_PORT_SDS(21, 12, 4, 10g-qxgmii)
+
+		SWITCH_PORT_SDS(24, 13, 5, 10g-qxgmii)
+		SWITCH_PORT_SDS(25, 14, 5, 10g-qxgmii)
+		SWITCH_PORT_SDS(28, 15, 5, 10g-qxgmii)
+		SWITCH_PORT_SDS(29, 16, 5, 10g-qxgmii)
+
+		SWITCH_PORT_SDS(32, 17, 6, 10g-qxgmii)
+		SWITCH_PORT_SDS(33, 18, 6, 10g-qxgmii)
+		SWITCH_PORT_SDS(36, 19, 6, 10g-qxgmii)
+		SWITCH_PORT_SDS(37, 20, 6, 10g-qxgmii)
+
+		SWITCH_PORT_SDS(40, 21, 7, 10g-qxgmii)
+		SWITCH_PORT_SDS(41, 22, 7, 10g-qxgmii)
+		SWITCH_PORT_SDS(44, 23, 7, 10g-qxgmii)
+		SWITCH_PORT_SDS(45, 24, 7, 10g-qxgmii)
+
+		/* 6x SFP+ */
+		HASIVO_SFP_PORT(48, 25, 8)
+		HASIVO_SFP_PORT(50, 26, 9)
+		HASIVO_SFP_PORT(52, 27, 10)
+		HASIVO_SFP_PORT(53, 28, 11)
+		HASIVO_SFP_PORT(54, 29, 12)
+		HASIVO_SFP_PORT(55, 30, 13)
+
+		port@56 {
+			ethernet = <&ethernet0>;
+			reg = <56>;
+			phy-mode = "internal";
+
+			fixed-link {
+				speed = <10000>;
+				full-duplex;
+			};
+		};
+	};
+};

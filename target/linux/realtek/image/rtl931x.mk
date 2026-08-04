@@ -30,3 +30,22 @@ define Device/plasmacloud_psx28
   DEVICE_PACKAGES += poemgr
 endef
 TARGET_DEVICES += plasmacloud_psx28
+
+define Device/hasivo_s5800w-24gt-6sp
+  SOC := rtl9313
+  UIMAGE_MAGIC := 0x93000000
+  DEVICE_VENDOR := Hasivo
+  DEVICE_MODEL := S5800W-24GT-6S+
+  IMAGE_SIZE := 14848k
+  BLOCKSIZE := 64k
+  KERNEL_INITRAMFS := \
+    kernel-bin | \
+    append-dtb | \
+    lzma | \
+    uImage lzma
+  KERNEL := kernel-bin | append-dtb | lzma | uImage lzma | pad-to $$(BLOCKSIZE)
+  IMAGES += factory.bin
+  IMAGE/factory.bin := append-kernel | append-rootfs | pad-rootfs | check-size
+  IMAGE/sysupgrade.bin := append-rootfs | pad-rootfs | sysupgrade-tar rootfs=$$$$@ | append-metadata
+endef
+TARGET_DEVICES += hasivo_s5800w-24gt-6sp
