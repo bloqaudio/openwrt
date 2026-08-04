@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
 #include <linux/debugfs.h>
+#include <linux/delay.h>
+#include <linux/phy.h>
+#include <linux/uaccess.h>
 #include <linux/kernel.h>
 #include <linux/string.h>
 #include <asm/mach-rtl838x/mach-rtl83xx.h>
@@ -947,10 +950,141 @@ static int rtl_dbg_reg_val_set(void *data, u64 val)
 DEFINE_DEBUGFS_ATTRIBUTE(rtl_dbg_reg_val_fops, rtl_dbg_reg_val_get,
 			 rtl_dbg_reg_val_set, "0x%08llx\n");
 
+
+/*
+ * Bring-up helpers for the indirect access engines.
+ *
+ * These sequences must run as one uninterrupted block: doing them from
+ * userspace one register poke at a time races the hardware PHY poller and
+ * returns garbage. Always pair a measurement with a known-value sanity read
+ * (RTL8224 PHY ID is MMD 1 regs 2/3 = 001c:cad0) to prove the path is sane.
+ *
+ * phy_mmd:  write "<port> <devad> <reg>", then read for the value.
+ * sds_read: write "<backing_sds> <page> <reg>", then read for the value.
+ */
+#define RTL931X_SDS_INDRT_ACCESS_CTRL	(0x5638)
+#define RTL931X_SDS_INDRT_DATA_CTRL	(0x563c)
+
+static DEFINE_MUTEX(rtl_dbg_indrt_lock);
+static struct rtl838x_switch_priv *rtl_dbg_priv;
+static u32 rtl_dbg_phy_port, rtl_dbg_phy_devad, rtl_dbg_phy_reg;
+static u32 rtl_dbg_sds_id, rtl_dbg_sds_page, rtl_dbg_sds_reg;
+
+static ssize_t rtl_dbg_phy_mmd_write(struct file *file, const char __user *buf,
+				     size_t count, loff_t *ppos)
+{
+	char kbuf[64];
+	u32 a, b, c;
+
+	if (count >= sizeof(kbuf))
+		return -EINVAL;
+	if (copy_from_user(kbuf, buf, count))
+		return -EFAULT;
+	kbuf[count] = 0;
+	if (sscanf(kbuf, "%i %i %i", &a, &b, &c) != 3)
+		return -EINVAL;
+
+	rtl_dbg_phy_port = a;
+	rtl_dbg_phy_devad = b;
+	rtl_dbg_phy_reg = c;
+
+	return count;
+}
+
+static ssize_t rtl_dbg_phy_mmd_read(struct file *file, char __user *buf,
+				    size_t count, loff_t *ppos)
+{
+	struct rtl838x_switch_priv *priv = rtl_dbg_priv;
+	const struct dsa_port *dp;
+	char out[80];
+	int val = -ENODEV;
+	int len;
+
+	if (!priv || rtl_dbg_phy_port > priv->cpu_port)
+		return -ENODEV;
+
+	dp = priv->ports[rtl_dbg_phy_port].dp;
+	if (dp && dp->user && dp->user->phydev)
+		val = phy_read_mmd(dp->user->phydev, rtl_dbg_phy_devad,
+				   rtl_dbg_phy_reg);
+
+	len = scnprintf(out, sizeof(out), "port %u mmd %u reg 0x%x = 0x%04x (%d)\n",
+			rtl_dbg_phy_port, rtl_dbg_phy_devad, rtl_dbg_phy_reg,
+			val >= 0 ? val : 0, val);
+
+	return simple_read_from_buffer(buf, count, ppos, out, len);
+}
+
+static const struct file_operations rtl_dbg_phy_mmd_fops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.read = rtl_dbg_phy_mmd_read,
+	.write = rtl_dbg_phy_mmd_write,
+};
+
+static ssize_t rtl_dbg_sds_write(struct file *file, const char __user *buf,
+				 size_t count, loff_t *ppos)
+{
+	char kbuf[64];
+	u32 a, b, c;
+
+	if (count >= sizeof(kbuf))
+		return -EINVAL;
+	if (copy_from_user(kbuf, buf, count))
+		return -EFAULT;
+	kbuf[count] = 0;
+	if (sscanf(kbuf, "%i %i %i", &a, &b, &c) != 3)
+		return -EINVAL;
+
+	rtl_dbg_sds_id = a;
+	rtl_dbg_sds_page = b;
+	rtl_dbg_sds_reg = c;
+
+	return count;
+}
+
+static ssize_t rtl_dbg_sds_read(struct file *file, char __user *buf,
+				size_t count, loff_t *ppos)
+{
+	char out[80];
+	u32 cmd;
+	int val = -ETIMEDOUT;
+	int len;
+
+	cmd = (rtl_dbg_sds_id << 2) | ((rtl_dbg_sds_page & 0x3f) << 7) |
+	      (rtl_dbg_sds_reg << 13) | 0x1;
+
+	mutex_lock(&rtl_dbg_indrt_lock);
+	sw_w32(cmd, RTL931X_SDS_INDRT_ACCESS_CTRL);
+	for (int i = 0; i < 100; i++) {
+		if (!(sw_r32(RTL931X_SDS_INDRT_ACCESS_CTRL) & 0x1)) {
+			val = sw_r32(RTL931X_SDS_INDRT_DATA_CTRL) & 0xffff;
+			break;
+		}
+		udelay(20);
+	}
+	mutex_unlock(&rtl_dbg_indrt_lock);
+
+	len = scnprintf(out, sizeof(out), "sds %u page 0x%x reg 0x%x = 0x%04x (%d)\n",
+			rtl_dbg_sds_id, rtl_dbg_sds_page, rtl_dbg_sds_reg,
+			val >= 0 ? val : 0, val);
+
+	return simple_read_from_buffer(buf, count, ppos, out, len);
+}
+
+static const struct file_operations rtl_dbg_sds_fops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.read = rtl_dbg_sds_read,
+	.write = rtl_dbg_sds_write,
+};
+
 static void rtl_dbg_reg_init(struct dentry *dir)
 {
 	debugfs_create_x32("reg_addr", 0644, dir, &rtl_dbg_reg_addr);
 	debugfs_create_file("reg_val", 0644, dir, NULL, &rtl_dbg_reg_val_fops);
+	debugfs_create_file("phy_mmd", 0644, dir, NULL, &rtl_dbg_phy_mmd_fops);
+	debugfs_create_file("sds_read", 0644, dir, NULL, &rtl_dbg_sds_fops);
 }
 
 void rtl930x_dbgfs_init(struct rtl838x_switch_priv *priv)
@@ -965,6 +1099,7 @@ void rtl930x_dbgfs_init(struct rtl838x_switch_priv *priv)
 
 	priv->dbgfs_dir = dbg_dir;
 
+	rtl_dbg_priv = priv;
 	rtl_dbg_reg_init(dbg_dir);
 
 	debugfs_create_file("drop_counters", 0400, dbg_dir, priv, &drop_counter_fops);

@@ -2853,9 +2853,32 @@ static int rtpcs_931x_setup_serdes(struct rtpcs_serdes *sds,
 
 			rtpcs_931x_sds_rx_reset(sds);
 
-			rtpcs_sds_write(sds, 0x7, 0x10, op_code);
-			rtpcs_sds_write(sds, 0x6, 0x1d, 0x0480);
-			rtpcs_sds_write(sds, 0x6, 0xe, 0x0400);
+			/*
+			 * The tail below was the 10GSXGMII sequence
+			 * (0x1d=0x0480, 0xe=0x0400) applied to every USXGMII
+			 * submode. For 10G-QXGMII the vendor's default
+			 * (non-8224QF) construction uses different analog
+			 * values and four QX channel-control writes, in a
+			 * specific order; without them the SerDes links but
+			 * never decodes the four QXGMII channels. See
+			 * _dal_mango_construct_init_usxgmii() default branch.
+			 */
+			if (mode == PHY_INTERFACE_MODE_10G_QXGMII) {
+				rtpcs_sds_write(sds, 0x6, 0x1d, 0x0600);
+				rtpcs_sds_write(sds, 0x6, 0x13, 0x68c1);
+				rtpcs_sds_write(sds, 0x6, 0x14, 0xf021);
+				rtpcs_sds_write(sds, 0x7, 0x10, op_code);
+				rtpcs_sds_write(sds, 0x7, 0x06, 0x1401);
+				rtpcs_sds_write(sds, 0x7, 0x08, 0x1401);
+				rtpcs_sds_write(sds, 0x7, 0x0a, 0x1401);
+				rtpcs_sds_write(sds, 0x7, 0x0c, 0x1401);
+				rtpcs_sds_write(sds, 0x6, 0x0e, 0x055a);
+				rtpcs_sds_write_bits(sds, 0x6, 0x3, 15, 15, 1);
+			} else {
+				rtpcs_sds_write(sds, 0x7, 0x10, op_code);
+				rtpcs_sds_write(sds, 0x6, 0x1d, 0x0480);
+				rtpcs_sds_write(sds, 0x6, 0xe, 0x0400);
+			}
 		}
 		break;
 
