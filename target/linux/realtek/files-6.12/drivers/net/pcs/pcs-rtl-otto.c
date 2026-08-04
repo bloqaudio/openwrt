@@ -2686,6 +2686,47 @@ static sds_config sds_config_10p3125g_cmu_type1[] = {
 	{ 0x2F, 0x0F, 0xA470 }, { 0x2F, 0x10, 0x8000 }, { 0x2F, 0x11, 0x037B }
 };
 
+/*
+ * 10G-QXGMII needs switch-core state that is global to the QXGMII groups, not
+ * per-SerDes: the group ability bits, the sparse MAC-to-channel mux, the
+ * submode selector and forced RXDV. The vendor SDK does this in
+ * _dal_mango_construct_mac_usxgmii_10gq() / _dal_mango_construct_serdesConfig_init();
+ * without it a port links on the copper side but never receives.
+ *
+ * Values below are for the 24x2.5G (6x RTL8224) arrangement.
+ */
+#define RTL931X_QX_GROUP_ABILITY_01	(0x13a4)
+#define RTL931X_QX_GROUP_ABILITY_23	(0x13a8)
+#define RTL931X_QX_GROUP_ABILITY_4	(0x13ac)
+#define RTL931X_QX_GROUP_ABILITY_5	(0x13b0)
+#define RTL931X_QX_CHANNEL_MUX_0	(0x13bc)
+#define RTL931X_QX_CHANNEL_MUX_1	(0x13c0)
+#define RTL931X_QX_SUBMODE		(0x13e8)
+#define RTL931X_MAC_FORCE_RXDV_LO	(0x0f6c)
+#define RTL931X_MAC_FORCE_RXDV_HI	(0x0f70)
+
+static void rtpcs_931x_setup_qxgmii_groups(struct rtpcs_ctrl *ctrl)
+{
+	static bool done;
+
+	if (done)
+		return;
+	done = true;
+
+	regmap_write(ctrl->map, RTL931X_QX_GROUP_ABILITY_01, 0x0f0f0f0f);
+	regmap_write(ctrl->map, RTL931X_QX_GROUP_ABILITY_23, 0x0f0f0f0f);
+	regmap_update_bits(ctrl->map, RTL931X_QX_GROUP_ABILITY_4, 0x00000f0f, 0x00000f0f);
+	regmap_update_bits(ctrl->map, RTL931X_QX_GROUP_ABILITY_5, 0x00000f0f, 0x00000f0f);
+
+	regmap_write(ctrl->map, RTL931X_QX_CHANNEL_MUX_0, 0x33f280a0);
+	regmap_write(ctrl->map, RTL931X_QX_CHANNEL_MUX_1, 0x001ff450);
+
+	regmap_update_bits(ctrl->map, RTL931X_QX_SUBMODE, 0x3fffffff, 0x04210842);
+
+	regmap_write(ctrl->map, RTL931X_MAC_FORCE_RXDV_LO, 0x00ffffff);
+	regmap_write(ctrl->map, RTL931X_MAC_FORCE_RXDV_HI, 0xffffffff);
+}
+
 static int rtpcs_931x_setup_serdes(struct rtpcs_serdes *sds,
 				   phy_interface_t mode)
 {
@@ -2772,8 +2813,12 @@ static int rtpcs_931x_setup_serdes(struct rtpcs_serdes *sds,
 		rtpcs_sds_write_bits(sds, 0x80, 0xE, 12, 12, 1);
 		break;
 
+	case PHY_INTERFACE_MODE_10G_QXGMII:
 	case PHY_INTERFACE_MODE_USXGMII: /* MII_USXGMII_10GSXGMII/10GDXGMII/10GQXGMII: */
 		u32 op_code = 0x6003;
+
+		if (mode == PHY_INTERFACE_MODE_10G_QXGMII)
+			rtpcs_931x_setup_qxgmii_groups(ctrl);
 
 		if (chiptype) {
 			rtpcs_sds_write_bits(sds, 0x6, 0x2, 12, 12, 1);
