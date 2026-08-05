@@ -1740,8 +1740,9 @@ static int rtl838x_eth_probe(struct platform_device *pdev)
 	rxringlen = rxringlen > MAX_RXLEN ? MAX_RXLEN : rxringlen;
 	txringlen = TXRINGLEN;
 
-	/* RTL9300: jumbo-sized ring buffers at reduced ring depths */
-	if (soc_info.family == RTL9300_FAMILY_ID) {
+	/* RTL93xx: jumbo-sized ring buffers at reduced ring depths */
+	if (soc_info.family == RTL9300_FAMILY_ID ||
+	    soc_info.family == RTL9310_FAMILY_ID) {
 		ring_buffer = RTL930X_RING_BUFFER;
 		rxringlen = RTL930X_RXRINGLEN;
 		txringlen = RTL930X_TXRINGLEN;

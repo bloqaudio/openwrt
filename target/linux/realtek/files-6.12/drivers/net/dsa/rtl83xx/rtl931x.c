@@ -812,6 +812,25 @@ static void rtl931x_vlan_profile_setup(int profile)
 	pr_debug("Leaving %s\n", __func__);
 }
 
+/* The two 14-bit fields (100M/10M and 1G/2.5G/5G/10G) reset to 12288; only
+ * ever RMW them, the global length-check enable is left untouched.
+ */
+void rtl931x_port_max_frame_set(int port, int frame_len)
+{
+	frame_len = min(frame_len, RTL931X_MAX_FRAME_LEN);
+
+	/* The per-port register array covers ports 0-55 only; the CPU port
+	 * has its own register with RX/TX length fields, which resets to
+	 * 1598 rather than the 12288 of the regular ports.
+	 */
+	if (port == 56)
+		sw_w32_mask(0x0fffffff, (frame_len << 14) | frame_len,
+			    RTL931X_MAC_L2_CPU_MAX_LEN_CTRL);
+	else
+		sw_w32_mask(0x0fffffff, (frame_len << 14) | frame_len,
+			    RTL931X_MAC_L2_PORT_MAX_LEN_CTRL(port));
+}
+
 static void rtl931x_l2_learning_setup(void)
 {
 	/* Portmask for flooding broadcast traffic */

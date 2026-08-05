@@ -29,6 +29,9 @@
 
 /* Silicon maximum frame length (Longan capacity: 12 KB) */
 #define RTL930X_MAX_FRAME_LEN			12288
+#define RTL931X_MAC_L2_PORT_MAX_LEN_CTRL(port)	(0x5554 + (((port) << 2)))
+#define RTL931X_MAC_L2_CPU_MAX_LEN_CTRL		(0x1368)
+#define RTL931X_MAX_FRAME_LEN			12288
 
 /* Header + up to two VLAN tags + FCS, counted towards the frame limit */
 #define RTL83XX_FRAME_OVERHEAD			(ETH_HLEN + 2 * VLAN_HLEN + ETH_FCS_LEN)
@@ -1508,6 +1511,7 @@ void rtl838x_dbgfs_init(struct rtl838x_switch_priv *priv);
 void rtl930x_dbgfs_init(struct rtl838x_switch_priv *priv);
 void rtl930x_storm_control_init(struct rtl838x_switch_priv *priv);
 void rtl930x_port_max_frame_set(int port, int frame_len);
+void rtl931x_port_max_frame_set(int port, int frame_len);
 void rtldsa_930x_qos_setup_default_dscp2queue_map(void);
 int rtl930x_qos_default_prio_get(int port);
 int rtl930x_qos_default_prio_set(struct rtl838x_switch_priv *priv, int port,

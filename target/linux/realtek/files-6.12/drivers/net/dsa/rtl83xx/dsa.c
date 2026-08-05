@@ -755,10 +755,12 @@ static int rtldsa_93xx_port_change_mtu(struct dsa_switch *ds, int port, int new_
 {
 	struct rtl838x_switch_priv *priv = ds->priv;
 
-	if (priv->family_id != RTL9300_FAMILY_ID)
+	if (priv->family_id == RTL9300_FAMILY_ID)
+		rtl930x_port_max_frame_set(port, new_mtu + RTL83XX_FRAME_OVERHEAD);
+	else if (priv->family_id == RTL9310_FAMILY_ID)
+		rtl931x_port_max_frame_set(port, new_mtu + RTL83XX_FRAME_OVERHEAD);
+	else
 		return -EOPNOTSUPP;
-
-	rtl930x_port_max_frame_set(port, new_mtu + RTL83XX_FRAME_OVERHEAD);
 
 	return 0;
 }
@@ -767,10 +769,12 @@ static int rtldsa_93xx_port_max_mtu(struct dsa_switch *ds, int port)
 {
 	struct rtl838x_switch_priv *priv = ds->priv;
 
-	if (priv->family_id != RTL9300_FAMILY_ID)
-		return ETH_DATA_LEN;
+	if (priv->family_id == RTL9300_FAMILY_ID)
+		return RTL930X_MAX_FRAME_LEN - RTL83XX_FRAME_OVERHEAD;
+	if (priv->family_id == RTL9310_FAMILY_ID)
+		return RTL931X_MAX_FRAME_LEN - RTL83XX_FRAME_OVERHEAD;
 
-	return RTL930X_MAX_FRAME_LEN - RTL83XX_FRAME_OVERHEAD;
+	return ETH_DATA_LEN;
 }
 
 static int rtldsa_93xx_port_get_default_prio(struct dsa_switch *ds, int port)
