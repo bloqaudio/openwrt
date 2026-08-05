@@ -46,6 +46,5 @@ define Device/hasivo_s5800w-24gt-6sp
   KERNEL := kernel-bin | append-dtb | lzma | uImage lzma | pad-to $$(BLOCKSIZE)
   IMAGES += factory.bin
   IMAGE/factory.bin := append-kernel | append-rootfs | pad-rootfs | check-size
-  IMAGE/sysupgrade.bin := append-rootfs | pad-rootfs | sysupgrade-tar rootfs=$$$$@ | append-metadata
 endef
 TARGET_DEVICES += hasivo_s5800w-24gt-6sp
