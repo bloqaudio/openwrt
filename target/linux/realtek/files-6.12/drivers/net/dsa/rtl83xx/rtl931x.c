@@ -850,6 +850,30 @@ static void rtldsa_931x_enable_learning(int port, bool enable)
 		    RTL931X_L2_LRN_PORT_CONSTRT_CTRL + port * 4);
 }
 
+/* Unknown-multicast flood portmasks live in the VLAN profiles: three
+ * two-word masks per profile (words 1/2 = L2, 3/4 = IPv4, 5/6 = IPv6;
+ * first word of each pair carries ports 32-56, second ports 0-31). The
+ * bridge flag is per-port while profiles are per-VLAN, so update the bit
+ * in all 16 profiles.
+ */
+static void rtldsa_931x_enable_mcast_flood(int port, bool enable)
+{
+	int word = (port < 32) ? 2 : 1;
+	u32 bit = BIT(port & 0x1f);
+
+	for (int profile = 0; profile < 16; profile++)
+		for (int pair = 0; pair < 3; pair++)
+			sw_w32_mask(bit, enable ? bit : 0,
+				    RTL931X_VLAN_PROFILE_SET(profile) +
+				    (pair * 2 + word) * 4);
+}
+
+static void rtldsa_931x_enable_bcast_flood(int port, bool enable)
+{
+	rtl839x_mask_port_reg_be(BIT_ULL(port), enable ? BIT_ULL(port) : 0,
+				 RTL931X_L2_BC_FLD_PMSK);
+}
+
 static void rtldsa_931x_enable_flood(int port, bool enable)
 {
 	/* 0: forward
@@ -1866,6 +1890,8 @@ const struct rtl838x_reg rtl931x_reg = {
 	.led_init = rtldsa_931x_led_init,
 	.enable_learning = rtldsa_931x_enable_learning,
 	.enable_flood = rtldsa_931x_enable_flood,
+	.enable_mcast_flood = rtldsa_931x_enable_mcast_flood,
+	.enable_bcast_flood = rtldsa_931x_enable_bcast_flood,
 	.set_receive_management_action = rtldsa_931x_set_receive_management_action,
 	.qos_init = rtldsa_931x_qos_init,
 };
