@@ -50,9 +50,11 @@
 	};
 
 /*
- * SFP+ cage without an sfp node (cage i2c/GPIO wiring not yet mapped).
- * 10gbase-r, hardware-validated against a 10G DAC peer; without cage
- * presence signals an empty cage still reports a phantom link.
+ * SFP+ cage, 10gbase-r (hardware-validated against a 10G DAC peer).
+ * Cage i2c mapped by module walk: cage 25..30 = i2c master 1 SDA0..5.
+ * Only cages 25/26 have a detectable MOD-ABS line (GPIO 9/11); the
+ * others rely on the sfp core's EEPROM-poll presence detection. No
+ * LOS/tx-disable lines were found.
  */
 #define HASIVO_SFP_PORT(p, l, s) \
 	port##p: port@##p { \
@@ -61,6 +63,7 @@
 		pcs-handle = <&serdes##s>; \
 		phy-mode = "10gbase-r"; \
 		managed = "in-band-status"; \
+		sfp = <&sfp##l>; \
 		led-set = <1>; \
 	};
 
@@ -308,59 +311,67 @@
 &serdes13 {
 	realtek,pnswap-tx;
 };
-	i2c@1 {
+
+&i2c_mst1 {
+	status = "okay";
+
+	i2c_sfp25: i2c@0 {
+		reg = <0>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+	};
+	i2c_sfp26: i2c@1 {
 		reg = <1>;
 		#address-cells = <1>;
 		#size-cells = <0>;
 	};
-	i2c@2 {
+	i2c_sfp27: i2c@2 {
 		reg = <2>;
 		#address-cells = <1>;
 		#size-cells = <0>;
 	};
-	i2c@3 {
+	i2c_sfp28: i2c@3 {
 		reg = <3>;
 		#address-cells = <1>;
 		#size-cells = <0>;
 	};
-	i2c@4 {
+	i2c_sfp29: i2c@4 {
 		reg = <4>;
 		#address-cells = <1>;
 		#size-cells = <0>;
 	};
-	i2c@5 {
+	i2c_sfp30: i2c@5 {
 		reg = <5>;
 		#address-cells = <1>;
 		#size-cells = <0>;
 	};
-	i2c@6 {
-		reg = <6>;
-		#address-cells = <1>;
-		#size-cells = <0>;
+};
+
+/ {
+	sfp25: sfp-p25 {
+		compatible = "sff,sfp";
+		i2c-bus = <&i2c_sfp25>;
+		mod-def0-gpio = <&gpio0 9 GPIO_ACTIVE_LOW>;
 	};
-	i2c@7 {
-		reg = <7>;
-		#address-cells = <1>;
-		#size-cells = <0>;
+	sfp26: sfp-p26 {
+		compatible = "sff,sfp";
+		i2c-bus = <&i2c_sfp26>;
+		mod-def0-gpio = <&gpio0 11 GPIO_ACTIVE_LOW>;
 	};
-	i2c@8 {
-		reg = <8>;
-		#address-cells = <1>;
-		#size-cells = <0>;
+	sfp27: sfp-p27 {
+		compatible = "sff,sfp";
+		i2c-bus = <&i2c_sfp27>;
 	};
-	i2c@9 {
-		reg = <9>;
-		#address-cells = <1>;
-		#size-cells = <0>;
+	sfp28: sfp-p28 {
+		compatible = "sff,sfp";
+		i2c-bus = <&i2c_sfp28>;
 	};
-	i2c@10 {
-		reg = <10>;
-		#address-cells = <1>;
-		#size-cells = <0>;
+	sfp29: sfp-p29 {
+		compatible = "sff,sfp";
+		i2c-bus = <&i2c_sfp29>;
 	};
-	i2c@11 {
-		reg = <11>;
-		#address-cells = <1>;
-		#size-cells = <0>;
+	sfp30: sfp-p30 {
+		compatible = "sff,sfp";
+		i2c-bus = <&i2c_sfp30>;
 	};
 };
