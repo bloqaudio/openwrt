@@ -2409,6 +2409,7 @@ static void rtpcs_931x_sds_fiber_mode_set(struct rtpcs_serdes *sds,
 		break; */
 
 	case PHY_INTERFACE_MODE_USXGMII:
+	case PHY_INTERFACE_MODE_10G_QXGMII:
 		val = 0x1B;
 		break;
 	default:
@@ -3408,10 +3409,19 @@ static int rtpcs_931x_setup_serdes(struct rtpcs_serdes *sds,
 	regmap_read(ctrl->map, RTL931X_PS_SERDES_OFF_MODE_CTRL_ADDR, &val);
 	pr_debug("%s: RTL931X_PS_SERDES_OFF_MODE_CTRL_ADDR 0x%08X\n", __func__, val);
 
+	/*
+	 * 10G-QXGMII takes the fiber path like the other USXGMII submodes:
+	 * the vendor keeps SERDES_MODE_CTRL at 0x9f for these lanes and
+	 * selects the actual 10.3125G operation through the analog SerDes
+	 * mode field instead. Without this write the lane stays at its
+	 * reset rate and never decodes, which every bootloader-constructed
+	 * setup hides by having written the field already.
+	 */
 	if (mode == PHY_INTERFACE_MODE_XGMII ||
 	    mode == PHY_INTERFACE_MODE_QSGMII ||
 	    mode == PHY_INTERFACE_MODE_SGMII ||
-	    mode == PHY_INTERFACE_MODE_USXGMII) {
+	    mode == PHY_INTERFACE_MODE_USXGMII ||
+	    mode == PHY_INTERFACE_MODE_10G_QXGMII) {
 		if (mode == PHY_INTERFACE_MODE_XGMII)
 			rtpcs_931x_sds_mii_mode_set(sds, mode);
 		else
