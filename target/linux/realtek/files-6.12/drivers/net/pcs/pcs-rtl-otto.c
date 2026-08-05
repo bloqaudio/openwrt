@@ -3421,7 +3421,9 @@ static int rtpcs_931x_setup_serdes(struct rtpcs_serdes *sds,
 	    mode == PHY_INTERFACE_MODE_QSGMII ||
 	    mode == PHY_INTERFACE_MODE_SGMII ||
 	    mode == PHY_INTERFACE_MODE_USXGMII ||
-	    mode == PHY_INTERFACE_MODE_10G_QXGMII) {
+	    mode == PHY_INTERFACE_MODE_10G_QXGMII ||
+	    mode == PHY_INTERFACE_MODE_10GBASER ||
+	    mode == PHY_INTERFACE_MODE_10GKR) {
 		if (mode == PHY_INTERFACE_MODE_XGMII)
 			rtpcs_931x_sds_mii_mode_set(sds, mode);
 		else
@@ -3437,7 +3439,9 @@ static int rtpcs_931x_setup_serdes(struct rtpcs_serdes *sds,
 	 */
 	if (mode == PHY_INTERFACE_MODE_10G_QXGMII ||
 	    mode == PHY_INTERFACE_MODE_USXGMII ||
-	    mode == PHY_INTERFACE_MODE_XGMII)
+	    mode == PHY_INTERFACE_MODE_XGMII ||
+	    mode == PHY_INTERFACE_MODE_10GBASER ||
+	    mode == PHY_INTERFACE_MODE_10GKR)
 		rtpcs_931x_sds_rx_calibrate(sds);
 
 	return 0;
@@ -3465,6 +3469,20 @@ static void rtpcs_pcs_get_state(struct phylink_pcs *pcs, struct phylink_link_sta
 		return;
 
 	state->link = 1;
+
+	/*
+	 * Fixed-speed SerDes modes: the MAC speed status only reflects the
+	 * (possibly stale) forced MAC configuration, not the line. Report
+	 * the speed the interface mode implies so phylink programs the MAC
+	 * to match the lane instead of echoing the old value back.
+	 */
+	if (state->interface == PHY_INTERFACE_MODE_10GBASER ||
+	    state->interface == PHY_INTERFACE_MODE_10GKR) {
+		state->speed = SPEED_10000;
+		state->duplex = DUPLEX_FULL;
+		return;
+	}
+
 	state->duplex = rtpcs_regmap_read_bits(ctrl, ctrl->cfg->mac_link_dup_sts, port, port);
 
 	speed = rtpcs_regmap_read_bits(ctrl, ctrl->cfg->mac_link_spd_sts,
