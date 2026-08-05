@@ -45,6 +45,22 @@
 #define RTL9300_COMPARE_DLY_SHIFT	(0)
 #define RTL9300_COMPARE_DLY_MASK	GENMASK(RTL9300_COMPARE_DLY_SHIFT + 15, RTL9300_COMPARE_DLY_SHIFT)
 
+#define RTL9310_TM0_CTRL0		0x80
+#define RTL9310_TM0_CTRL1		0x84
+#define RTL9310_TM0_CTRL2		0x88
+#define RTL9310_TM0_CTRL4		0x90
+#define RTL9310_TM0_RESULT0		0xa0
+#define RTL9310_TM0_RESULT_LATCH	0xb0
+#define RTL9310_TM_RSTB			BIT(31)
+#define RTL9310_TM_DIGT_ORDER_SEL	BIT(28)
+#define RTL9310_TM_REG_A		0x7467000
+#define RTL9310_TM_REG_B_MASK		GENMASK(31, 10)
+#define RTL9310_TM_REG_B		0x380fff
+#define RTL9310_TM_ADC_OSR_SEL_MASK	GENMASK(2, 0)
+#define RTL9310_TM_ADC_OSR_SEL		1
+#define RTL9310_TM_CT_OUT_MASK		GENMASK(18, 0)
+#define RTL9310_TM_CT_SIGN		BIT(18)
+
 struct realtek_thermal_priv {
 	struct regmap *regmap;
 	bool enabled;
@@ -144,6 +160,61 @@ static const struct thermal_zone_device_ops rtl9300_ops = {
 	.get_temp = rtl9300_get_temp,
 };
 
+/*
+ * The RTL9310 thermal meter is a sigma-delta ADC whose calibration
+ * constants and mode bits are not usable at their reset values (the
+ * result register reads zero). The values below are the vendor's
+ * "current temperature" configuration; the result is in units of
+ * 1/1024 degree C with a sign flag in bit 18.
+ */
+static void rtl9310_thermal_init(struct realtek_thermal_priv *priv)
+{
+	int ret;
+
+	ret = regmap_write(priv->regmap, RTL9310_TM0_RESULT_LATCH, 1);
+	ret |= regmap_write(priv->regmap, RTL9310_TM0_CTRL0, RTL9310_TM_REG_A);
+	ret |= regmap_update_bits(priv->regmap, RTL9310_TM0_CTRL1,
+				  RTL9310_TM_REG_B_MASK | RTL9310_TM_ADC_OSR_SEL_MASK,
+				  FIELD_PREP(RTL9310_TM_REG_B_MASK, RTL9310_TM_REG_B) |
+				  FIELD_PREP(RTL9310_TM_ADC_OSR_SEL_MASK, RTL9310_TM_ADC_OSR_SEL));
+	ret |= regmap_update_bits(priv->regmap, RTL9310_TM0_CTRL2,
+				  RTL9310_TM_DIGT_ORDER_SEL, RTL9310_TM_DIGT_ORDER_SEL);
+	ret |= regmap_update_bits(priv->regmap, RTL9310_TM0_CTRL4,
+				  RTL9310_TM_RSTB, RTL9310_TM_RSTB);
+
+	priv->enabled = !ret;
+}
+
+static int rtl9310_get_temp(struct thermal_zone_device *tz, int *res)
+{
+	struct realtek_thermal_priv *priv = thermal_zone_device_priv(tz);
+	u32 val;
+	int ret;
+
+	if (!priv->enabled)
+		rtl9310_thermal_init(priv);
+
+	ret = regmap_read(priv->regmap, RTL9310_TM0_RESULT0, &val);
+	if (ret)
+		return ret;
+
+	val &= RTL9310_TM_CT_OUT_MASK;
+	if (!val)	/* ADC has no valid flag; it reads 0 until settled */
+		return -EAGAIN;
+
+	if (val & RTL9310_TM_CT_SIGN)
+		*res = -((int)((val & (RTL9310_TM_CT_SIGN - 1)) ^
+			       (RTL9310_TM_CT_SIGN - 1)) * 1000 / 1024);
+	else
+		*res = val * 1000 / 1024;
+
+	return 0;
+}
+
+static const struct thermal_zone_device_ops rtl9310_ops = {
+	.get_temp = rtl9310_get_temp,
+};
+
 static int realtek_thermal_probe(struct platform_device *pdev)
 {
 	struct realtek_thermal_priv *priv;
@@ -171,6 +242,7 @@ static const struct of_device_id realtek_sensor_ids[] = {
 	{ .compatible = "realtek,rtl8380-thermal", .data = &rtl8380_ops, },
 	{ .compatible = "realtek,rtl8390-thermal", .data = &rtl8390_ops, },
 	{ .compatible = "realtek,rtl9300-thermal", .data = &rtl9300_ops, },
+	{ .compatible = "realtek,rtl9310-thermal", .data = &rtl9310_ops, },
 	{ /* sentinel */ }
 };
 MODULE_DEVICE_TABLE(of, realtek_sensor_ids);
