@@ -965,6 +965,14 @@ static int rtl931x_pie_data_fill(enum template_field_id field_type, struct pie_r
 		*data = pr->spm >> 16;
 		*data_m = pr->spm_m >> 16;
 		break;
+	case TEMPLATE_FIELD_SPM2:
+		*data = pr->spm >> 32;
+		*data_m = pr->spm_m >> 32;
+		break;
+	case TEMPLATE_FIELD_SPM3:
+		*data = pr->spm >> 48;
+		*data_m = pr->spm_m >> 48;
+		break;
 	case TEMPLATE_FIELD_OTAG:
 		*data = pr->otag;
 		*data_m = pr->otag_m;
@@ -1108,20 +1116,18 @@ static int rtl931x_pie_data_fill(enum template_field_id field_type, struct pie_r
  */
 static void rtl931x_write_pie_templated(u32 r[], struct pie_rule *pr, enum template_field_id t[])
 {
-	for (int i = 0; i < N_FIXED_FIELDS; i++) {
+	for (int i = 0; i < N_FIXED_FIELDS_RTL931X; i++) {
 		u16 data, data_m;
+		int dbit = 480 + 16 * i;	/* FIELD_i */
+		int mbit = 240 + 16 * i;	/* BMSK_FIELD_i */
 
 		rtl931x_pie_data_fill(t[i], pr, &data, &data_m);
 
-		/* On the RTL9300, the mask fields are not word aligned! */
-		if (!(i % 2)) {
-			r[5 - i / 2] = data;
-			r[12 - i / 2] |= ((u32)data_m << 8);
-		} else {
-			r[5 - i / 2] |= ((u32)data) << 16;
-			r[12 - i / 2] |= ((u32)data_m) << 24;
-			r[11 - i / 2] |= ((u32)data_m) >> 8;
-		}
+		/* The 704-bit entry sits in r[0..21] top-down; both the data
+		 * and mask fields are half-word aligned on the RTL931X.
+		 */
+		r[21 - dbit / 32] |= ((u32)data) << (dbit % 32);
+		r[21 - mbit / 32] |= ((u32)data_m) << (mbit % 32);
 	}
 }
 
@@ -1348,17 +1354,24 @@ static int rtl931x_pie_verify_template(struct rtl838x_switch_priv *priv,
 	if (ether_addr_to_u64(pr->dmac) && !rtl931x_pie_templ_has(t, TEMPLATE_FIELD_DMAC0))
 		return -1;
 
-	/* The source port mask used for per-port scoping can only be
-	 * programmed via SPM0/SPM1 (ports 0-31); without the matching
-	 * template fields the rule would match on all ports.
+	/* The source port mask used for per-port scoping spans SPM0-3
+	 * (16 ports each); without the matching template field the rule
+	 * would match on more ports than requested.
 	 */
-	if (pr->spm_m & 0xffffffff00000000ULL)
+	if ((pr->spm_m & 0xffffULL) &&
+	    !rtl931x_pie_templ_has(t, TEMPLATE_FIELD_SPM0))
 		return -1;
 
-	if ((pr->spm_m & 0xffff) && !rtl931x_pie_templ_has(t, TEMPLATE_FIELD_SPM0))
+	if ((pr->spm_m & 0xffff0000ULL) &&
+	    !rtl931x_pie_templ_has(t, TEMPLATE_FIELD_SPM1))
 		return -1;
 
-	if ((pr->spm_m & 0xffff0000) && !rtl931x_pie_templ_has(t, TEMPLATE_FIELD_SPM1))
+	if ((pr->spm_m & 0xffff00000000ULL) &&
+	    !rtl931x_pie_templ_has(t, TEMPLATE_FIELD_SPM2))
+		return -1;
+
+	if ((pr->spm_m & 0xffff000000000000ULL) &&
+	    !rtl931x_pie_templ_has(t, TEMPLATE_FIELD_SPM3))
 		return -1;
 
 	/* TODO: Check more */
