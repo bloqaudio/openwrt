@@ -712,7 +712,7 @@ static int rtl93xx_setup(struct dsa_switch *ds)
 	else if (priv->family_id == RTL9310_FAMILY_ID)
 		rtl931x_print_matrix();
 
-	/* TODO: Initialize statistics */
+	rtl83xx_init_stats(priv);
 	rtldsa_init_counters(priv);
 
 	rtl83xx_vlan_setup(priv);
