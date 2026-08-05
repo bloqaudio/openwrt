@@ -51,15 +51,15 @@
 
 /*
  * SFP+ cage without an sfp node (cage i2c/GPIO wiring not yet mapped).
- * 1000base-x + in-band-status matches both in-tree rtl931x boards; revisit
- * as 10gbase-r once the cages are described and 10G is actually wanted.
+ * 10gbase-r, hardware-validated against a 10G DAC peer; without cage
+ * presence signals an empty cage still reports a phantom link.
  */
 #define HASIVO_SFP_PORT(p, l, s) \
 	port##p: port@##p { \
 		reg = <##p>; \
 		label = SWITCH_PORT_LABEL(l) ; \
 		pcs-handle = <&serdes##s>; \
-		phy-mode = "1000base-x"; \
+		phy-mode = "10gbase-r"; \
 		managed = "in-band-status"; \
 		led-set = <1>; \
 	};
@@ -307,4 +307,60 @@
 
 &serdes13 {
 	realtek,pnswap-tx;
+};
+	i2c@1 {
+		reg = <1>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+	};
+	i2c@2 {
+		reg = <2>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+	};
+	i2c@3 {
+		reg = <3>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+	};
+	i2c@4 {
+		reg = <4>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+	};
+	i2c@5 {
+		reg = <5>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+	};
+	i2c@6 {
+		reg = <6>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+	};
+	i2c@7 {
+		reg = <7>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+	};
+	i2c@8 {
+		reg = <8>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+	};
+	i2c@9 {
+		reg = <9>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+	};
+	i2c@10 {
+		reg = <10>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+	};
+	i2c@11 {
+		reg = <11>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+	};
 };
