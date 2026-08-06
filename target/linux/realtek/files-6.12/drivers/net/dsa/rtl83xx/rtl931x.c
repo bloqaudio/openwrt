@@ -880,6 +880,106 @@ static void rtldsa_931x_enable_flood(int port, bool enable)
 				 RTL931X_L2_UNKN_UC_FLD_PMSK);
 }
 
+static const u32 rtl931x_storm_ctrl_base[] = {
+	[RTLDSA_STORM_UC] = RTL931X_STORM_PORT_UC_CTRL(0),
+	[RTLDSA_STORM_MC] = RTL931X_STORM_PORT_MC_CTRL(0),
+	[RTLDSA_STORM_BC] = RTL931X_STORM_PORT_BC_CTRL(0),
+};
+
+static const u32 rtl931x_storm_lb_rst_base[] = {
+	[RTLDSA_STORM_UC] = RTL931X_STORM_PORT_UC_LB_RST(0),
+	[RTLDSA_STORM_MC] = RTL931X_STORM_PORT_MC_LB_RST(0),
+	[RTLDSA_STORM_BC] = RTL931X_STORM_PORT_BC_LB_RST(0),
+};
+
+/* Program the per-port storm control rate of one traffic class, in packets
+ * per second; 0 disables the limiter. One RATE unit is exactly 1 pps, as the
+ * setup programs the PPS leaky-bucket tick/token values the SDK derives for
+ * the running system clock (dal_mango_construct.c). The disable path
+ * restores the measured reset posture (rate wide open, burst 0x8000, EN
+ * clear) instead of zeros, and the enable path programs the SDK packet-mode
+ * default burst: on RTL930x a zeroed burst silently blocked the class
+ * entirely, and the reset burst of 0x8000 packets would make a fresh limiter
+ * look broken for its first 32K packets. The TYPE selection is a separate
+ * knob and is preserved here. The leaky bucket is reset after any change,
+ * as it keeps stale credit otherwise (SDK
+ * dal_mango_rate_portStormCtrlRate_set).
+ */
+int rtl931x_storm_port_rate_set(struct rtl838x_switch_priv *priv, int port,
+				enum rtldsa_storm_class class, u32 pps)
+{
+	u32 addr, v;
+
+	if (class < RTLDSA_STORM_UC || class > RTLDSA_STORM_BC ||
+	    port < 0 || port >= priv->cpu_port)
+		return -EINVAL;
+	if (pps > RTL931X_STORM_RATE_M)
+		return -ERANGE;
+
+	addr = rtl931x_storm_ctrl_base[class] + (port << 3);
+
+	mutex_lock(&priv->reg_mutex);
+	v = sw_r32(addr) & RTL931X_STORM_TYPE_INCL_KNOWN;
+	if (pps)
+		v |= RTL931X_STORM_EN | pps;
+	else
+		v |= RTL931X_STORM_RATE_M;
+	sw_w32(v, addr);
+	sw_w32(pps ? RTL931X_STORM_DFLT_BURST_PPS : RTL931X_STORM_RESET_BURST,
+	       addr + 4);
+	sw_w32(BIT(port % 32),
+	       rtl931x_storm_lb_rst_base[class] + ((port >> 5) << 2));
+	mutex_unlock(&priv->reg_mutex);
+
+	return 0;
+}
+
+u32 rtl931x_storm_port_rate_get(int port, enum rtldsa_storm_class class)
+{
+	u32 v;
+
+	if (class < RTLDSA_STORM_UC || class > RTLDSA_STORM_BC)
+		return 0;
+
+	v = sw_r32(rtl931x_storm_ctrl_base[class] + (port << 3));
+
+	return (v & RTL931X_STORM_EN) ? (v & RTL931X_STORM_RATE_M) : 0;
+}
+
+/* Select whether the UC/MC limiter counts unknown-destination traffic only
+ * or all traffic of the class (SDK dal_mango_rate_portStormCtrlTypeSel_set:
+ * STORM_SEL_UNKNOWN vs STORM_SEL_UNKNOWN_AND_KNOWN). Broadcast always counts
+ * everything and has no TYPE bit. The unknown-only multicast mode is the
+ * only mechanism this family offers for containing unknown multicast, as
+ * there is no per-port unknown-multicast flood control in the silicon.
+ */
+int rtl931x_storm_port_type_set(struct rtl838x_switch_priv *priv, int port,
+				enum rtldsa_storm_class class, bool incl_known)
+{
+	if (class < RTLDSA_STORM_UC || class > RTLDSA_STORM_BC ||
+	    port < 0 || port >= priv->cpu_port)
+		return -EINVAL;
+	if (class == RTLDSA_STORM_BC)
+		return -EOPNOTSUPP;
+
+	mutex_lock(&priv->reg_mutex);
+	sw_w32_mask(RTL931X_STORM_TYPE_INCL_KNOWN,
+		    incl_known ? RTL931X_STORM_TYPE_INCL_KNOWN : 0,
+		    rtl931x_storm_ctrl_base[class] + (port << 3));
+	mutex_unlock(&priv->reg_mutex);
+
+	return 0;
+}
+
+bool rtl931x_storm_port_type_get(int port, enum rtldsa_storm_class class)
+{
+	if (class < RTLDSA_STORM_UC || class >= RTLDSA_STORM_BC)
+		return false;
+
+	return !!(sw_r32(rtl931x_storm_ctrl_base[class] + (port << 3)) &
+		  RTL931X_STORM_TYPE_INCL_KNOWN);
+}
+
 static u64 rtl931x_read_mcast_pmask(int idx)
 {
 	u64 portmask;

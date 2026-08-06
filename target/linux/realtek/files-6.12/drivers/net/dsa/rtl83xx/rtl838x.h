@@ -33,6 +33,12 @@
 #define RTL931X_MAC_L2_CPU_MAX_LEN_CTRL		(0x1368)
 #define RTL931X_MAX_FRAME_LEN			12288
 
+/* System clock select, used to derive the leaky-bucket tick/token values
+ * (SDK dal_mango_construct.c): 0 = 650 MHz, 1 = 325 MHz, 2 = 175 MHz
+ */
+#define RTL931X_MAC_L2_GLOBAL_CTRL2		(0x1358)
+#define RTL931X_SYS_CLK_SEL_M			GENMASK(14, 13)
+
 /* Header + up to two VLAN tags + FCS, counted towards the frame limit */
 #define RTL83XX_FRAME_OVERHEAD			(ETH_HLEN + 2 * VLAN_HLEN + ETH_FCS_LEN)
 
@@ -402,6 +408,54 @@
 #define RTL930X_STORM_TYPE_INCL_KNOWN		BIT(25)
 #define RTL930X_STORM_BURST_M			GENMASK(15, 0)
 #define RTL930X_STORM_DFLT_BURST_PPS		(255)
+
+/* RTL931X (Mango) storm control (SDK swcore_rtl9310.h, dal_mango_rate.c).
+ * Same leaky-bucket shape as RTL930x at new addresses. The per-port 64-bit
+ * entries hold the high word at the lower address: RATE/EN/TYPE at base + 0,
+ * BURST at base + 4. The pps/bps mode select, the leaky-bucket resets and
+ * the exceed flags are one bit per port, 32 ports per word on this 57-port
+ * family. TYPE selects unknown-DA-only (0) vs all traffic of the class (1)
+ * and exists only for UC and MC.
+ */
+#define RTL931X_STORM_CTRL			(0xB000)
+#define RTL931X_STORM_LB_CTRL			(0xB004)
+#define RTL931X_STORM_LB_PPS_CTRL		(0xB008)
+#define RTL931X_STORM_LB_PPS_TICK_M		GENMASK(15, 4)
+#define RTL931X_STORM_LB_PPS_TKN_M		GENMASK(3, 0)
+#define RTL931X_STORM_PORT_CTRL(p)		(0xB00C + (((p) >> 5) << 2))
+#define RTL931X_STORM_PORT_UC_CTRL(p)		(0xB014 + (((p) << 3)))
+#define RTL931X_STORM_PORT_MC_CTRL(p)		(0xB1EC + (((p) << 3)))
+#define RTL931X_STORM_PORT_BC_CTRL(p)		(0xB3C4 + (((p) << 3)))
+#define RTL931X_STORM_PORT_UC_LB_RST(p)		(0xB1DC + (((p) >> 5) << 2))
+#define RTL931X_STORM_PORT_MC_LB_RST(p)		(0xB3B4 + (((p) >> 5) << 2))
+#define RTL931X_STORM_PORT_BC_LB_RST(p)		(0xB58C + (((p) >> 5) << 2))
+#define RTL931X_STORM_PORT_UC_EXCEED(p)		(0xB1E4 + (((p) >> 5) << 2))
+#define RTL931X_STORM_PORT_MC_EXCEED(p)		(0xB3BC + (((p) >> 5) << 2))
+#define RTL931X_STORM_PORT_BC_EXCEED(p)		(0xB594 + (((p) >> 5) << 2))
+#define RTL931X_STORM_RATE_M			GENMASK(23, 0)
+#define RTL931X_STORM_EN			BIT(24)
+#define RTL931X_STORM_TYPE_INCL_KNOWN		BIT(25)
+#define RTL931X_STORM_BURST_M			GENMASK(15, 0)
+/* Measured silicon reset posture: rate wide open (RATE_M), burst 0x8000 */
+#define RTL931X_STORM_RESET_BURST		(0x8000)
+/* SDK default burst in packet mode (MANGO_STORM_PPS_DFLT_BURST_SIZE) */
+#define RTL931X_STORM_DFLT_BURST_PPS		(255)
+/* PPS leaky-bucket tick/token per system clock (SDK dal_mango_construct.h);
+ * with these values one RATE unit is exactly 1 pps
+ */
+#define RTL931X_STORM_LB_PPS_TICK_650M		(39)
+#define RTL931X_STORM_LB_PPS_TKN_650M		(1)
+#define RTL931X_STORM_LB_PPS_TICK_325M		(77)
+#define RTL931X_STORM_LB_PPS_TKN_325M		(1)
+#define RTL931X_STORM_LB_PPS_TICK_175M		(42)
+#define RTL931X_STORM_LB_PPS_TKN_175M		(1)
+
+/* Storm control traffic classes */
+enum rtldsa_storm_class {
+	RTLDSA_STORM_UC = 0,
+	RTLDSA_STORM_MC,
+	RTLDSA_STORM_BC,
+};
 #define RTL839X_TBL_ACCESS_CTRL_2		(0x611C)
 #define RTL839X_TBL_ACCESS_DATA_2(i)		(0x6120 + (((i) << 2)))
 #define RTL839X_IGR_BWCTRL_PORT_CTRL_10G_0(p)	(0x1618 + (((p) << 3)))
@@ -1581,6 +1635,12 @@ struct rtl838x_switch_priv {
 void rtl838x_dbgfs_init(struct rtl838x_switch_priv *priv);
 void rtl930x_dbgfs_init(struct rtl838x_switch_priv *priv);
 void rtl930x_storm_control_init(struct rtl838x_switch_priv *priv);
+int rtl931x_storm_port_rate_set(struct rtl838x_switch_priv *priv, int port,
+				enum rtldsa_storm_class class, u32 pps);
+u32 rtl931x_storm_port_rate_get(int port, enum rtldsa_storm_class class);
+int rtl931x_storm_port_type_set(struct rtl838x_switch_priv *priv, int port,
+				enum rtldsa_storm_class class, bool incl_known);
+bool rtl931x_storm_port_type_get(int port, enum rtldsa_storm_class class);
 void rtl930x_port_max_frame_set(int port, int frame_len);
 void rtl931x_port_max_frame_set(int port, int frame_len);
 void rtldsa_930x_qos_setup_default_dscp2queue_map(void);
