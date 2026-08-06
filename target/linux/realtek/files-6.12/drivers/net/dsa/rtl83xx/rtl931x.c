@@ -2096,7 +2096,10 @@ static void rtldsa_931x_qos_init(struct rtl838x_switch_priv *priv)
 	sw_w32(v, RTL931X_PRI_SEL_TBL_CTRL(0) + 4);
 	sw_w32(0, RTL931X_PRI_SEL_TBL_CTRL(0));
 
-	rtldsa_931x_qos_setup_default_dscp2queue_map();
+	/* The DSCP defaults are programmed from rtl93xx_setup(): the DSA
+	 * core seeds the dcbnl app table from hardware when the user ports
+	 * are created, before this init runs.
+	 */
 	rtldsa_931x_qos_set_scheduling_queue_weights(priv);
 }
 

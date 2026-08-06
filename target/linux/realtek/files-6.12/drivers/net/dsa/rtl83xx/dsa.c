@@ -748,6 +748,17 @@ static int rtl93xx_setup(struct dsa_switch *ds)
 		ds->dscp_prio_mapping_is_global = true;
 	}
 
+	if (priv->family_id == RTL9310_FAMILY_ID) {
+		/* See the RTL9300 branch above: the DSCP defaults must be in
+		 * hardware before the DSA core seeds the dcbnl app table at
+		 * user-port creation.
+		 */
+		rtldsa_931x_qos_setup_default_dscp2queue_map();
+
+		/* The DSCP-to-internal-priority table is switch-global */
+		ds->dscp_prio_mapping_is_global = true;
+	}
+
 	return 0;
 }
 
@@ -781,10 +792,12 @@ static int rtldsa_93xx_port_get_default_prio(struct dsa_switch *ds, int port)
 {
 	struct rtl838x_switch_priv *priv = ds->priv;
 
-	if (priv->family_id != RTL9300_FAMILY_ID)
-		return -EOPNOTSUPP;
+	if (priv->family_id == RTL9300_FAMILY_ID)
+		return rtl930x_qos_default_prio_get(port);
+	if (priv->family_id == RTL9310_FAMILY_ID)
+		return rtl931x_qos_default_prio_get(port);
 
-	return rtl930x_qos_default_prio_get(port);
+	return -EOPNOTSUPP;
 }
 
 static int rtldsa_93xx_port_set_default_prio(struct dsa_switch *ds, int port,
@@ -792,10 +805,12 @@ static int rtldsa_93xx_port_set_default_prio(struct dsa_switch *ds, int port,
 {
 	struct rtl838x_switch_priv *priv = ds->priv;
 
-	if (priv->family_id != RTL9300_FAMILY_ID)
-		return -EOPNOTSUPP;
+	if (priv->family_id == RTL9300_FAMILY_ID)
+		return rtl930x_qos_default_prio_set(priv, port, prio);
+	if (priv->family_id == RTL9310_FAMILY_ID)
+		return rtl931x_qos_default_prio_set(priv, port, prio);
 
-	return rtl930x_qos_default_prio_set(priv, port, prio);
+	return -EOPNOTSUPP;
 }
 
 static int rtldsa_93xx_port_get_dscp_prio(struct dsa_switch *ds, int port,
@@ -803,10 +818,12 @@ static int rtldsa_93xx_port_get_dscp_prio(struct dsa_switch *ds, int port,
 {
 	struct rtl838x_switch_priv *priv = ds->priv;
 
-	if (priv->family_id != RTL9300_FAMILY_ID)
-		return -EOPNOTSUPP;
+	if (priv->family_id == RTL9300_FAMILY_ID)
+		return rtl930x_qos_dscp_prio_get(dscp);
+	if (priv->family_id == RTL9310_FAMILY_ID)
+		return rtl931x_qos_dscp_prio_get(dscp);
 
-	return rtl930x_qos_dscp_prio_get(dscp);
+	return -EOPNOTSUPP;
 }
 
 static int rtldsa_93xx_port_add_dscp_prio(struct dsa_switch *ds, int port,
@@ -814,28 +831,38 @@ static int rtldsa_93xx_port_add_dscp_prio(struct dsa_switch *ds, int port,
 {
 	struct rtl838x_switch_priv *priv = ds->priv;
 
-	if (priv->family_id != RTL9300_FAMILY_ID)
-		return -EOPNOTSUPP;
+	if (priv->family_id == RTL9300_FAMILY_ID)
+		return rtl930x_qos_dscp_prio_set(priv, dscp, prio);
+	if (priv->family_id == RTL9310_FAMILY_ID)
+		return rtl931x_qos_dscp_prio_set(priv, dscp, prio);
 
-	return rtl930x_qos_dscp_prio_set(priv, dscp, prio);
+	return -EOPNOTSUPP;
 }
 
 static int rtldsa_93xx_port_del_dscp_prio(struct dsa_switch *ds, int port,
 					  u8 dscp, u8 prio)
 {
 	struct rtl838x_switch_priv *priv = ds->priv;
+	int cur;
 
-	if (priv->family_id != RTL9300_FAMILY_ID)
+	if (priv->family_id != RTL9300_FAMILY_ID &&
+	    priv->family_id != RTL9310_FAMILY_ID)
 		return -EOPNOTSUPP;
 
 	/* The DSCP map is switch-global: another port may have re-mapped
 	 * this DSCP since the app entry was added. Only a mapping that
 	 * still matches is restored to the default (dscp >> 3).
 	 */
-	if (rtl930x_qos_dscp_prio_get(dscp) != prio)
+	if (priv->family_id == RTL9300_FAMILY_ID)
+		cur = rtl930x_qos_dscp_prio_get(dscp);
+	else
+		cur = rtl931x_qos_dscp_prio_get(dscp);
+	if (cur != prio)
 		return 0;
 
-	return rtl930x_qos_dscp_prio_set(priv, dscp, dscp >> 3);
+	if (priv->family_id == RTL9300_FAMILY_ID)
+		return rtl930x_qos_dscp_prio_set(priv, dscp, dscp >> 3);
+	return rtl931x_qos_dscp_prio_set(priv, dscp, dscp >> 3);
 }
 
 /* ETS band to hardware queue: band 0 is the highest-priority band in
