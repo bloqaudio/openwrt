@@ -879,17 +879,13 @@ static void rtldsa_931x_enable_bcast_flood(int port, bool enable)
 				 RTL931X_L2_BC_FLD_PMSK);
 }
 
+/* Unknown-unicast flooding is gated per egress port by the flood portmask;
+ * the learn-limit exceed action shares no relationship with it.
+ */
 static void rtldsa_931x_enable_flood(int port, bool enable)
 {
-	/* 0: forward
-	 * 1: drop
-	 * 2: trap to local CPU
-	 * 3: copy to local CPU
-	 * 4: trap to master CPU
-	 * 5: copy to master CPU
-	 */
-	sw_w32_mask(GENMASK(2, 0), enable ? 0 : 1,
-		    RTL931X_L2_LRN_PORT_CONSTRT_CTRL + port * 4);
+	rtl839x_mask_port_reg_be(BIT_ULL(port), enable ? BIT_ULL(port) : 0,
+				 RTL931X_L2_UNKN_UC_FLD_PMSK);
 }
 
 static u64 rtl931x_read_mcast_pmask(int idx)
