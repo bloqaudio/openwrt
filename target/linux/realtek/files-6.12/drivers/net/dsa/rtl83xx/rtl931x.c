@@ -604,6 +604,7 @@ static void rtl931x_fill_l2_entry(u32 r[], struct rtl838x_l2_entry *e)
 		e->is_remote_forward = !!(r[2] & BIT(17));
 		e->mc_portmask_index = (r[2] >> 18) & 0xfff;
 		e->l2_tunnel_list_id = (r[2] >> 4) & 0x1fff;
+		e->vid = e->rvid;
 	}
 }
 
@@ -656,6 +657,10 @@ static void rtl931x_fill_l2_row(u32 r[], struct rtl838x_l2_entry *e)
 			r[3] |= (e->l2_tunnel_id & 0xf) << 28;
 		}
 	} else { /* L2_MULTICAST */
+		/* Local forwarding must be enabled for the portmask to apply;
+		 * remote forwarding is only meaningful in stacked setups.
+		 */
+		r[2] |= BIT(31);
 		r[2] |= (e->mc_portmask_index & 0xfff) << 18;
 	}
 }
