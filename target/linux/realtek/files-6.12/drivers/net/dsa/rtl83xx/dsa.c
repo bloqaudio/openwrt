@@ -866,16 +866,20 @@ static int rtldsa_93xx_port_del_dscp_prio(struct dsa_switch *ds, int port,
 }
 
 /* ETS band to hardware queue: band 0 is the highest-priority band in
- * sch_ets (tried first), while on RTL930x queue 7 is served first, so
+ * sch_ets (tried first), while the hardware serves queue 7 first, so
  * band b maps to queue 7 - b. The priomap is not programmable per port
- * (the internal-priority-to-queue map RTL930X_QM_INTPRI2QID_CTRL is
- * switch-global and stays at its identity boot default); classification
- * into queues is controlled by the DCBNL DSCP/default-prio surface.
+ * (the internal-priority-to-queue map QM_INTPRI2QID_CTRL is switch-global
+ * and stays at its identity boot default); classification into queues is
+ * controlled by the DCBNL DSCP/default-prio surface.
  */
-static int rtldsa_930x_tc_setup_qdisc_ets(struct dsa_switch *ds, int port,
+static int rtldsa_93xx_tc_setup_qdisc_ets(struct dsa_switch *ds, int port,
 					  struct tc_ets_qopt_offload *qopt)
 {
+	struct rtl838x_switch_priv *priv = ds->priv;
 	struct tc_ets_qopt_offload_replace_params *p = &qopt->replace_params;
+	bool is_rtl931x = priv->family_id == RTL9310_FAMILY_ID;
+	u32 weight_max = is_rtl931x ? RTL931X_SCHED_Q_WEIGHT_MAX :
+				      RTL930X_SCHED_Q_WEIGHT_MAX;
 	int band;
 
 	if (qopt->parent != TC_H_ROOT)
@@ -885,7 +889,10 @@ static int rtldsa_930x_tc_setup_qdisc_ets(struct dsa_switch *ds, int port,
 	case TC_ETS_REPLACE:
 		break;
 	case TC_ETS_DESTROY:
-		rtl930x_qos_port_sched_defaults(port);
+		if (is_rtl931x)
+			rtl931x_qos_port_sched_defaults(port);
+		else
+			rtl930x_qos_port_sched_defaults(port);
 		return 0;
 	default:
 		return -EOPNOTSUPP;
@@ -897,19 +904,26 @@ static int rtldsa_930x_tc_setup_qdisc_ets(struct dsa_switch *ds, int port,
 	for (band = 0; band < p->bands; band++) {
 		if (!p->quanta[band])
 			continue;
-		if (!p->weights[band] ||
-		    p->weights[band] > RTL930X_SCHED_Q_WEIGHT_MAX)
+		if (!p->weights[band] || p->weights[band] > weight_max)
 			return -EINVAL;
 	}
 
 	for (band = 0; band < p->bands; band++) {
 		int queue = MAX_PRIOS - 1 - band;
 
-		if (p->quanta[band])
-			rtl930x_qos_queue_sched_set(port, queue,
-						    p->weights[band], false);
-		else
-			rtl930x_qos_queue_sched_set(port, queue, 1, true);
+		if (p->quanta[band]) {
+			if (is_rtl931x)
+				rtl931x_qos_queue_sched_set(port, queue,
+							    p->weights[band], false);
+			else
+				rtl930x_qos_queue_sched_set(port, queue,
+							    p->weights[band], false);
+		} else {
+			if (is_rtl931x)
+				rtl931x_qos_queue_sched_set(port, queue, 1, true);
+			else
+				rtl930x_qos_queue_sched_set(port, queue, 1, true);
+		}
 	}
 
 	return 0;
@@ -1019,16 +1033,20 @@ static int rtldsa_93xx_port_setup_tc(struct dsa_switch *ds, int port,
 {
 	struct rtl838x_switch_priv *priv = ds->priv;
 
-	if (priv->family_id != RTL9300_FAMILY_ID)
-		return -EOPNOTSUPP;
-
 	switch (type) {
 	case TC_SETUP_QDISC_ETS:
-		return rtldsa_930x_tc_setup_qdisc_ets(ds, port, type_data);
+		if (priv->family_id == RTL9300_FAMILY_ID ||
+		    priv->family_id == RTL9310_FAMILY_ID)
+			return rtldsa_93xx_tc_setup_qdisc_ets(ds, port, type_data);
+		return -EOPNOTSUPP;
 	case TC_SETUP_QDISC_TBF:
-		return rtldsa_930x_tc_setup_qdisc_tbf(ds, port, type_data);
+		if (priv->family_id == RTL9300_FAMILY_ID)
+			return rtldsa_930x_tc_setup_qdisc_tbf(ds, port, type_data);
+		return -EOPNOTSUPP;
 	case TC_SETUP_QDISC_RED:
-		return rtldsa_930x_tc_setup_qdisc_red(ds, port, type_data);
+		if (priv->family_id == RTL9300_FAMILY_ID)
+			return rtldsa_930x_tc_setup_qdisc_red(ds, port, type_data);
+		return -EOPNOTSUPP;
 	default:
 		return -EOPNOTSUPP;
 	}

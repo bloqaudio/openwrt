@@ -553,15 +553,21 @@ static ssize_t sched_algo_read(struct file *filp, char __user *buffer,
 			       size_t count, loff_t *ppos)
 {
 	struct rtl838x_port *p = filp->private_data;
+	struct rtl838x_switch_priv *priv = p->dp->ds->priv;
 	char buf[8];
+	int wrr;
 
 	if (*ppos != 0)
 		return 0;
 
+	if (priv->family_id == RTL9310_FAMILY_ID)
+		wrr = rtl931x_qos_sched_algo_get(p->dp->index);
+	else
+		wrr = rtl930x_qos_sched_algo_get(p->dp->index);
+
 	return simple_read_from_buffer(buffer, count, ppos, buf,
 			scnprintf(buf, sizeof(buf), "%s\n",
-				  rtl930x_qos_sched_algo_get(p->dp->index) ?
-				  "wrr" : "wfq"));
+				  wrr ? "wrr" : "wfq"));
 }
 
 static ssize_t sched_algo_write(struct file *filp, const char __user *buffer,
@@ -585,12 +591,19 @@ static ssize_t sched_algo_write(struct file *filp, const char __user *buffer,
 	b[len] = '\0';
 
 	mutex_lock(&priv->reg_mutex);
-	if (sysfs_streq(b, "wrr"))
-		rtl930x_qos_sched_algo_set(p->dp->index, true);
-	else if (sysfs_streq(b, "wfq"))
-		rtl930x_qos_sched_algo_set(p->dp->index, false);
-	else
+	if (sysfs_streq(b, "wrr")) {
+		if (priv->family_id == RTL9310_FAMILY_ID)
+			rtl931x_qos_sched_algo_set(p->dp->index, true);
+		else
+			rtl930x_qos_sched_algo_set(p->dp->index, true);
+	} else if (sysfs_streq(b, "wfq")) {
+		if (priv->family_id == RTL9310_FAMILY_ID)
+			rtl931x_qos_sched_algo_set(p->dp->index, false);
+		else
+			rtl930x_qos_sched_algo_set(p->dp->index, false);
+	} else {
 		len = -EINVAL;
+	}
 	mutex_unlock(&priv->reg_mutex);
 
 	return len;
@@ -1126,16 +1139,19 @@ void rtl930x_dbgfs_init(struct rtl838x_switch_priv *priv)
 
 	debugfs_create_file("l2_table", 0400, dbg_dir, priv, &l2_table_fops);
 
-	if (priv->family_id != RTL9300_FAMILY_ID)
-		return;
+	if (priv->family_id == RTL9300_FAMILY_ID) {
+		/* Per-port storm-control exceed flags, one bit per port, write 1 to clear */
+		debugfs_create_x32("storm_exceed_uc", 0644, dbg_dir,
+				   (u32 *)(RTL838X_SW_BASE + RTL930X_STORM_PORT_UC_EXCEED));
+		debugfs_create_x32("storm_exceed_mc", 0644, dbg_dir,
+				   (u32 *)(RTL838X_SW_BASE + RTL930X_STORM_PORT_MC_EXCEED));
+		debugfs_create_x32("storm_exceed_bc", 0644, dbg_dir,
+				   (u32 *)(RTL838X_SW_BASE + RTL930X_STORM_PORT_BC_EXCEED));
+	}
 
-	/* Per-port storm-control exceed flags, one bit per port, write 1 to clear */
-	debugfs_create_x32("storm_exceed_uc", 0644, dbg_dir,
-			   (u32 *)(RTL838X_SW_BASE + RTL930X_STORM_PORT_UC_EXCEED));
-	debugfs_create_x32("storm_exceed_mc", 0644, dbg_dir,
-			   (u32 *)(RTL838X_SW_BASE + RTL930X_STORM_PORT_MC_EXCEED));
-	debugfs_create_x32("storm_exceed_bc", 0644, dbg_dir,
-			   (u32 *)(RTL838X_SW_BASE + RTL930X_STORM_PORT_BC_EXCEED));
+	if (priv->family_id != RTL9300_FAMILY_ID &&
+	    priv->family_id != RTL9310_FAMILY_ID)
+		return;
 
 	for (int i = 0; i < priv->cpu_port; i++) {
 		if (!(priv->ports[i].phy || priv->pcs[i]) || !priv->ports[i].dp)
@@ -1144,15 +1160,17 @@ void rtl930x_dbgfs_init(struct rtl838x_switch_priv *priv)
 		port_dir = debugfs_create_dir(priv->ports[i].dp->name, dbg_dir);
 		debugfs_create_u32("id", 0444, port_dir,
 				   (u32 *)&priv->ports[i].dp->index);
-		debugfs_create_file("storm_rate_uc", 0600, port_dir,
-				    &priv->ports[i], &storm_rate_uc_fops);
-		debugfs_create_file("storm_rate_mc", 0600, port_dir,
-				    &priv->ports[i], &storm_rate_mc_fops);
-		debugfs_create_file("storm_rate_bc", 0600, port_dir,
-				    &priv->ports[i], &storm_rate_bc_fops);
+		if (priv->family_id == RTL9300_FAMILY_ID) {
+			debugfs_create_file("storm_rate_uc", 0600, port_dir,
+					    &priv->ports[i], &storm_rate_uc_fops);
+			debugfs_create_file("storm_rate_mc", 0600, port_dir,
+					    &priv->ports[i], &storm_rate_mc_fops);
+			debugfs_create_file("storm_rate_bc", 0600, port_dir,
+					    &priv->ports[i], &storm_rate_bc_fops);
+			debugfs_create_file("remark", 0400, port_dir,
+					    &priv->ports[i], &remark_fops);
+		}
 		debugfs_create_file("sched_algo", 0600, port_dir,
 				    &priv->ports[i], &sched_algo_fops);
-		debugfs_create_file("remark", 0400, port_dir,
-				    &priv->ports[i], &remark_fops);
 	}
 }
