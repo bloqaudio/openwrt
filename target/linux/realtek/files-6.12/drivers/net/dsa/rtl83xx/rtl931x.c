@@ -1997,13 +1997,19 @@ int rtl931x_qos_port_shaper_set(struct rtl838x_switch_priv *priv, int port,
 			return -EINVAL;
 	}
 
+	/* 64-bit entry, high word first: the low address carries RATE
+	 * (bits 32-51) and EN (bit 52), the high address carries BURST.
+	 * Disabling restores the reset posture (rate wide open, reset
+	 * burst) rather than zeros, because the burst cap gates egress
+	 * even with the enable bit clear.
+	 */
 	mutex_lock(&priv->reg_mutex);
 	if (rate_bytes_ps) {
-		sw_w32(burst & RTL931X_EGBW_Q_BURST_M, addr);
-		sw_w32(RTL931X_EGBW_Q_EN | rate, addr + 4);
+		sw_w32(RTL931X_EGBW_Q_EN | rate, addr);
+		sw_w32(burst & RTL931X_EGBW_Q_BURST_M, addr + 4);
 	} else {
-		sw_w32(RTL931X_EGBW_LB_RESET_BURST, addr);
-		sw_w32(RTL931X_EGBW_Q_RATE_M, addr + 4);
+		sw_w32(RTL931X_EGBW_Q_RATE_M, addr);
+		sw_w32(RTL931X_EGBW_LB_RESET_BURST, addr + 4);
 	}
 	mutex_unlock(&priv->reg_mutex);
 

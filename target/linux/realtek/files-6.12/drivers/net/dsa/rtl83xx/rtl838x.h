@@ -736,7 +736,7 @@ typedef enum {
  * the vendor init for all ports and queues; the burst cap gates egress
  * even with EN clear, so "disabled" must restore it rather than write 0.
  */
-#define RTL931X_EGBW_LB_RESET_BURST		(0x4000)
+#define RTL931X_EGBW_LB_RESET_BURST		(0x1194)
 #define RTL931X_EGBW_Q_RATE_M			GENMASK(19, 0)
 #define RTL931X_EGBW_Q_EN			BIT(20)
 #define RTL931X_EGBW_Q_BURST_M			GENMASK(15, 0)
