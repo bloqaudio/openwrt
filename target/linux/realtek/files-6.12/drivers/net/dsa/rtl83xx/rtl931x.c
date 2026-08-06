@@ -949,9 +949,18 @@ u32 rtl931x_storm_port_rate_get(int port, enum rtldsa_storm_class class)
 /* Select whether the UC/MC limiter counts unknown-destination traffic only
  * or all traffic of the class (SDK dal_mango_rate_portStormCtrlTypeSel_set:
  * STORM_SEL_UNKNOWN vs STORM_SEL_UNKNOWN_AND_KNOWN). Broadcast always counts
- * everything and has no TYPE bit. The unknown-only multicast mode is the
- * only mechanism this family offers for containing unknown multicast, as
- * there is no per-port unknown-multicast flood control in the silicon.
+ * everything and has no TYPE bit.
+ *
+ * The bit behaves exactly as documented for unicast: measured against an
+ * unlearned destination MAC, unknown-only limits the flooded traffic and
+ * leaves learnt traffic untouched, and clearing the selection then limits
+ * both. Multicast is different -- unknown-only was measured to match no
+ * traffic at all, with and without IGMP snooping, so a multicast limiter
+ * left in that mode is silently dead. That is the same silicon gap seen
+ * from the flood-mask side, where no per-port unknown-multicast flood
+ * control has any effect: this family never classifies multicast as
+ * unknown. Multicast is therefore pinned to counting everything, and
+ * asking for unknown-only is refused rather than quietly doing nothing.
  */
 int rtl931x_storm_port_type_set(struct rtl838x_switch_priv *priv, int port,
 				enum rtldsa_storm_class class, bool incl_known)
@@ -960,6 +969,8 @@ int rtl931x_storm_port_type_set(struct rtl838x_switch_priv *priv, int port,
 	    port < 0 || port >= priv->cpu_port)
 		return -EINVAL;
 	if (class == RTLDSA_STORM_BC)
+		return -EOPNOTSUPP;
+	if (class == RTLDSA_STORM_MC && !incl_known)
 		return -EOPNOTSUPP;
 
 	mutex_lock(&priv->reg_mutex);
@@ -982,7 +993,9 @@ bool rtl931x_storm_port_type_get(int port, enum rtldsa_storm_class class)
 
 /* Bring per-port storm control into a known state: PPS mode on all ports,
  * every limiter disabled in the measured reset posture (rate wide open,
- * burst 0x8000, EN clear), unknown-destination-only for UC/MC (TYPE clear).
+ * burst 0x8000, EN clear), unknown-destination-only for UC (TYPE clear) and
+ * count-everything for MC, whose unknown-only mode matches no traffic on
+ * this family (see rtl931x_storm_port_type_set).
  * Unlike Longan, whose SDK never touches the storm leaky-bucket timers, the
  * Mango SDK programs the global PPS tick/token at init from the system
  * clock (dal_mango_construct.c); with those values one RATE unit is exactly
@@ -1023,10 +1036,13 @@ void rtl931x_storm_control_init(struct rtl838x_switch_priv *priv)
 	sw_w32(0, RTL931X_STORM_PORT_CTRL(32));
 
 	/* Reset posture on every port and class, with a leaky-bucket reset */
-	for (int p = 0; p < priv->cpu_port; p++)
+	for (int p = 0; p < priv->cpu_port; p++) {
 		for (enum rtldsa_storm_class c = RTLDSA_STORM_UC;
 		     c <= RTLDSA_STORM_BC; c++)
 			rtl931x_storm_port_rate_set(priv, p, c, 0);
+
+		rtl931x_storm_port_type_set(priv, p, RTLDSA_STORM_MC, true);
+	}
 
 	/* Clear stale exceed flags (write-1-to-clear, two words per class) */
 	sw_w32((u32)port_mask, RTL931X_STORM_PORT_UC_EXCEED(0));
