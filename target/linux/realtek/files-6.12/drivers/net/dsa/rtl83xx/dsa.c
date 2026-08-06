@@ -988,11 +988,16 @@ static int rtldsa_93xx_tc_setup_qdisc_tbf(struct dsa_switch *ds, int port,
  * queue 7 - b, so parent classid minor m means queue 8 - m). ECN
  * marking cannot be offloaded, the engine only drops.
  */
-static int rtldsa_930x_tc_setup_qdisc_red(struct dsa_switch *ds, int port,
+static int rtldsa_93xx_tc_setup_qdisc_red(struct dsa_switch *ds, int port,
 					  struct tc_red_qopt_offload *qopt)
 {
 	struct rtl838x_switch_priv *priv = ds->priv;
 	struct tc_red_qopt_offload_params *p = &qopt->set;
+	bool is_rtl931x = priv->family_id == RTL9310_FAMILY_ID;
+	u32 page_bytes = is_rtl931x ? RTL931X_SWRED_PAGE_BYTES :
+				      RTL930X_SWRED_PAGE_BYTES;
+	u32 thr_max = is_rtl931x ? RTL931X_SWRED_THR_MAX_PAGES :
+				   RTL930X_SWRED_THR_MAX_PAGES;
 	u32 min_pages, max_pages;
 	u8 probability;
 	int queue = -1;
@@ -1009,7 +1014,10 @@ static int rtldsa_930x_tc_setup_qdisc_red(struct dsa_switch *ds, int port,
 	case TC_RED_REPLACE:
 		break;
 	case TC_RED_DESTROY:
-		rtl930x_qos_swred_disable(priv, port);
+		if (is_rtl931x)
+			rtl931x_qos_swred_disable(priv, port);
+		else
+			rtl930x_qos_swred_disable(priv, port);
 		return 0;
 	default:
 		return -EOPNOTSUPP;
@@ -1019,7 +1027,10 @@ static int rtldsa_930x_tc_setup_qdisc_red(struct dsa_switch *ds, int port,
 		return -EOPNOTSUPP;
 
 	if (p->is_nodrop) {
-		rtl930x_qos_swred_disable(priv, port);
+		if (is_rtl931x)
+			rtl931x_qos_swred_disable(priv, port);
+		else
+			rtl930x_qos_swred_disable(priv, port);
 		return 0;
 	}
 
@@ -1029,9 +1040,9 @@ static int rtldsa_930x_tc_setup_qdisc_red(struct dsa_switch *ds, int port,
 	/* Thresholds are programmed in units of 256-byte pages, the
 	 * 2^32 fixed-point drop probability maps onto a rate of 0-255.
 	 */
-	min_pages = DIV_ROUND_UP(p->min, RTL930X_SWRED_PAGE_BYTES);
-	max_pages = p->max / RTL930X_SWRED_PAGE_BYTES;
-	if (!min_pages || !max_pages || max_pages > RTL930X_SWRED_THR_MAX_PAGES)
+	min_pages = DIV_ROUND_UP(p->min, page_bytes);
+	max_pages = p->max / page_bytes;
+	if (!min_pages || !max_pages || max_pages > thr_max)
 		return -EINVAL;
 
 	probability = ((u64)p->probability * 255 +
@@ -1039,6 +1050,9 @@ static int rtldsa_930x_tc_setup_qdisc_red(struct dsa_switch *ds, int port,
 	if (!probability)
 		return -EINVAL;
 
+	if (is_rtl931x)
+		return rtl931x_qos_swred_set(priv, port, queue, min_pages,
+					     max_pages, probability);
 	return rtl930x_qos_swred_set(priv, port, queue, min_pages, max_pages,
 				     probability);
 }
@@ -1060,8 +1074,9 @@ static int rtldsa_93xx_port_setup_tc(struct dsa_switch *ds, int port,
 			return rtldsa_93xx_tc_setup_qdisc_tbf(ds, port, type_data);
 		return -EOPNOTSUPP;
 	case TC_SETUP_QDISC_RED:
-		if (priv->family_id == RTL9300_FAMILY_ID)
-			return rtldsa_930x_tc_setup_qdisc_red(ds, port, type_data);
+		if (priv->family_id == RTL9300_FAMILY_ID ||
+		    priv->family_id == RTL9310_FAMILY_ID)
+			return rtldsa_93xx_tc_setup_qdisc_red(ds, port, type_data);
 		return -EOPNOTSUPP;
 	default:
 		return -EOPNOTSUPP;
