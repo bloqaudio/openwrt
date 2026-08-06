@@ -1760,7 +1760,7 @@ static void rtldsa_931x_qos_set_group_selector(int port, int group)
 		    RTL931X_PORT_TBL_IDX_CTRL(port));
 }
 
-static void rtldsa_931x_qos_setup_default_dscp2queue_map(void)
+void rtldsa_931x_qos_setup_default_dscp2queue_map(void)
 {
 	u32 queue;
 
@@ -1782,6 +1782,280 @@ static void rtldsa_931x_qos_prio2queue_matrix(int *min_queues)
 		v |= i << (min_queues[i] * 3);
 
 	sw_w32(v, RTL931X_QM_INTPRI2QID_CTRL);
+}
+
+/* Default (port-based) internal priority of a port: 3 bits per port in
+ * PRI_SEL_REMAP_PORT (SDK dal_mango_qos_priRemap_set, PRI_SRC_PB_PRI).
+ */
+int rtl931x_qos_default_prio_get(int port)
+{
+	return (sw_r32(RTL931X_PRI_SEL_PORT_PRI(port)) >> ((port % 10) * 3)) & 0x7;
+}
+
+int rtl931x_qos_default_prio_set(struct rtl838x_switch_priv *priv, int port,
+				 u8 prio)
+{
+	if (prio >= MAX_PRIOS)
+		return -EINVAL;
+
+	mutex_lock(&priv->reg_mutex);
+	sw_w32_mask(0x7 << ((port % 10) * 3), prio << ((port % 10) * 3),
+		    RTL931X_PRI_SEL_PORT_PRI(port));
+	mutex_unlock(&priv->reg_mutex);
+
+	return 0;
+}
+
+/* DSCP to internal priority remapping: 3 bits per DSCP value in
+ * PRI_SEL_REMAP_DSCP (SDK dal_mango_qos_priRemap_set, PRI_SRC_DSCP). The
+ * table is global to the switch, the caller-facing DSA op is per port.
+ */
+int rtl931x_qos_dscp_prio_get(int dscp)
+{
+	return (sw_r32(RTL931X_REMAP_DSCP(dscp)) >>
+		RTL93XX_REMAP_DSCP_INTPRI_DSCP_OFFSET(dscp)) & 0x7;
+}
+
+int rtl931x_qos_dscp_prio_set(struct rtl838x_switch_priv *priv, int dscp,
+			      u8 prio)
+{
+	if (prio >= MAX_PRIOS)
+		return -EINVAL;
+
+	mutex_lock(&priv->reg_mutex);
+	sw_w32_mask(RTL93XX_REMAP_DSCP_INTPRI_DSCP_MASK(dscp),
+		    prio << RTL93XX_REMAP_DSCP_INTPRI_DSCP_OFFSET(dscp),
+		    RTL931X_REMAP_DSCP(dscp));
+	mutex_unlock(&priv->reg_mutex);
+
+	return 0;
+}
+
+/* Per-queue scheduling control: WEIGHT (1-127, shared by WFQ and WRR)
+ * and STRICT_EN, marking the queue strict-priority instead of weighted
+ * (SDK dal_mango_qos_schedulingQueue_set and
+ * dal_mango_qos_portQueueStrictEnable_set). STRICT_EN is bit 8 on this
+ * family (bit 7 on RTL930x). Ports 0-51 are served by register SET0,
+ * ports 52-55 by SET1.
+ */
+void rtl931x_qos_queue_sched_set(int port, int queue, u8 weight, bool strict)
+{
+	u32 v = weight & RTL931X_SCHED_Q_WEIGHT_M;
+
+	if (strict)
+		v |= RTL931X_SCHED_Q_STRICT_EN;
+
+	if (port < 52)
+		sw_w32(v, RTL931X_SCHED_PORT_Q_CTRL_SET0(port, queue));
+	else
+		sw_w32(v, RTL931X_SCHED_PORT_Q_CTRL_SET1(port, queue));
+}
+
+/* Weighted scheduling algorithm of a port: 0 = WFQ (byte-count),
+ * 1 = WRR (packet-count), one bit per port in SCHED_PORT_ALGO_CTRL, 32
+ * ports per word (SDK dal_mango_qos_schedulingAlgorithm_set).
+ * Strict-priority queues always win over weighted queues regardless of
+ * this selection.
+ */
+int rtl931x_qos_sched_algo_get(int port)
+{
+	return !!(sw_r32(RTL931X_SCHED_PORT_ALGO_CTRL(port)) & BIT(port % 32));
+}
+
+void rtl931x_qos_sched_algo_set(int port, bool wrr)
+{
+	sw_w32_mask(BIT(port % 32), wrr ? BIT(port % 32) : 0,
+		    RTL931X_SCHED_PORT_ALGO_CTRL(port));
+}
+
+/* Boot-time default scheduling of a port: all queues weighted with
+ * weight 1, weighted algorithm WFQ.
+ */
+void rtl931x_qos_port_sched_defaults(int port)
+{
+	for (int q = 0; q < 8; q++)
+		rtl931x_qos_queue_sched_set(port, q, 1, false);
+
+	rtl931x_qos_sched_algo_set(port, false);
+}
+
+void rtl931x_qos_sched_defaults(struct rtl838x_switch_priv *priv)
+{
+	struct dsa_port *dp;
+
+	dsa_switch_for_each_user_port(dp, priv->ds)
+		rtl931x_qos_port_sched_defaults(dp->index);
+}
+
+/* Set a field of up to 32 bits at entry bit position lsp in a table entry
+ * held as words[0] = entry bits 31:0. Fields may straddle a word boundary
+ * (the 20-bit rate fields do for odd queues).
+ */
+static void rtl931x_qos_entry_field_set(u32 *words, int lsp, int len, u32 val)
+{
+	u32 mask = BIT(len) - 1;
+	int w = lsp >> 5;
+	int off = lsp & 31;
+
+	words[w] &= ~(mask << off);
+	words[w] |= (val & mask) << off;
+	if (off + len > 32) {
+		int rem = off + len - 32;
+
+		words[w + 1] &= ~(BIT(rem) - 1);
+		words[w + 1] |= (val & mask) >> (len - rem);
+	}
+}
+
+/* Program the maximum egress bandwidth leaky bucket of a queue. The
+ * per-queue buckets live in the EGR_Q_BW table, one 29-word entry per
+ * port (SDK dal_mango_rate_portEgrQueueBwCtrl{Enable,Rate,BurstSize}_set);
+ * the table data window is big-endian, so data register i holds entry
+ * bits [32 * (28 - i) + 31 : 32 * (28 - i)]. A rate of 0 disables the
+ * bucket and restores the reset posture: rate wide open, SDK default
+ * burst. The burst cap gates egress even with the enable bit clear, so
+ * disabling by writing zeros would block the queue entirely. The SDK
+ * requires the burst to hold at least 8 tokens of the global leaky-bucket
+ * tick/token register EGBW_LB_CTRL; the same is enforced here.
+ */
+int rtl931x_qos_queue_shaper_set(struct rtl838x_switch_priv *priv, int port,
+				 int queue, u64 rate_bytes_ps, u32 burst)
+{
+	u32 entry[RTL931X_EGR_Q_BW_WORDS];
+	struct table_reg *r;
+	u32 rate = 0, tkn;
+
+	if (rate_bytes_ps) {
+		rate = DIV_ROUND_UP_ULL(rate_bytes_ps * 8, 16000);
+		if (!rate || rate > RTL931X_EGBW_Q_RATE_M)
+			return -EINVAL;
+
+		tkn = sw_r32(RTL931X_EGBW_LB_CTRL) & RTL931X_EGBW_LB_TKN_M;
+		if (burst < 8 * tkn || burst > RTL931X_EGBW_Q_BURST_M)
+			return -EINVAL;
+	}
+
+	r = rtl_table_get(RTL9310_TBL_4, 0);
+	rtl_table_read(r, port);
+	for (int w = 0; w < RTL931X_EGR_Q_BW_WORDS; w++)
+		entry[w] = sw_r32(rtl_table_data(r, RTL931X_EGR_Q_BW_WORDS - 1 - w));
+
+	if (rate_bytes_ps) {
+		rtl931x_qos_entry_field_set(entry,
+					    RTL931X_EGR_Q_BW_MAX_BW_LSP(queue),
+					    RTL931X_EGR_Q_BW_MAX_BW_LEN, rate);
+		rtl931x_qos_entry_field_set(entry,
+					    RTL931X_EGR_Q_BW_MAX_LB_BURST_LSP(queue),
+					    RTL931X_EGR_Q_BW_MAX_LB_BURST_LEN, burst);
+		rtl931x_qos_entry_field_set(entry,
+					    RTL931X_EGR_Q_BW_MAX_BW_EN_LSP(queue),
+					    1, 1);
+	} else {
+		rtl931x_qos_entry_field_set(entry,
+					    RTL931X_EGR_Q_BW_MAX_BW_LSP(queue),
+					    RTL931X_EGR_Q_BW_MAX_BW_LEN,
+					    RTL931X_EGBW_Q_RATE_M);
+		rtl931x_qos_entry_field_set(entry,
+					    RTL931X_EGR_Q_BW_MAX_LB_BURST_LSP(queue),
+					    RTL931X_EGR_Q_BW_MAX_LB_BURST_LEN,
+					    RTL931X_EGBW_LB_RESET_BURST);
+		rtl931x_qos_entry_field_set(entry,
+					    RTL931X_EGR_Q_BW_MAX_BW_EN_LSP(queue),
+					    1, 0);
+	}
+
+	for (int w = 0; w < RTL931X_EGR_Q_BW_WORDS; w++)
+		sw_w32(entry[w], rtl_table_data(r, RTL931X_EGR_Q_BW_WORDS - 1 - w));
+	rtl_table_write(r, port);
+	rtl_table_release(r);
+
+	return 0;
+}
+
+/* Program the port-level maximum egress bandwidth leaky bucket. A rate of
+ * 0 disables the bucket and restores the reset posture (rate wide open,
+ * SDK default burst), as the burst cap gates egress even with the enable
+ * bit clear. The SDK never writes the port rate directly: it keeps a
+ * shadow and refills the hardware rate with the number of fitting
+ * share-mode assured queue rates on top ([SS-972] in dal_mango_rate.c).
+ * Assured queue bandwidth is never programmed by this driver, so the
+ * refill term is always zero and writing the rate directly is equivalent.
+ */
+int rtl931x_qos_port_shaper_set(struct rtl838x_switch_priv *priv, int port,
+				u64 rate_bytes_ps, u32 burst)
+{
+	u32 addr = RTL931X_EGBW_PORT_CTRL(port);
+	u32 rate = 0, tkn;
+
+	if (rate_bytes_ps) {
+		rate = DIV_ROUND_UP_ULL(rate_bytes_ps * 8, 16000);
+		if (!rate || rate > RTL931X_EGBW_Q_RATE_M)
+			return -EINVAL;
+
+		tkn = sw_r32(RTL931X_EGBW_LB_CTRL) & RTL931X_EGBW_LB_TKN_M;
+		if (burst < 8 * tkn || burst > RTL931X_EGBW_Q_BURST_M)
+			return -EINVAL;
+	}
+
+	mutex_lock(&priv->reg_mutex);
+	if (rate_bytes_ps) {
+		sw_w32(burst & RTL931X_EGBW_Q_BURST_M, addr);
+		sw_w32(RTL931X_EGBW_Q_EN | rate, addr + 4);
+	} else {
+		sw_w32(RTL931X_EGBW_LB_RESET_BURST, addr);
+		sw_w32(RTL931X_EGBW_Q_RATE_M, addr + 4);
+	}
+	mutex_unlock(&priv->reg_mutex);
+
+	return 0;
+}
+
+/* Program the SWRED thresholds and drop probability of a queue (all
+ * queues if queue is negative) and switch the port from tail drop to
+ * SWRED. The threshold and drop-rate tables are global to the switch and
+ * shared by all SWRED-enabled ports, so the queues that are not being
+ * configured are explicitly set to a never-drop configuration (maximum
+ * thresholds, drop rate 0) instead of being left at unknown reset or
+ * stale values. Cross-port use with differing parameters is
+ * last-writer-wins per queue; users should keep RED parameters consistent
+ * across ports. The same values are written to all three drop
+ * precedences: nothing in the driver assigns drop precedences today, so
+ * all traffic is DP 0, and tc-red has no drop-precedence concept either.
+ */
+int rtl931x_qos_swred_set(struct rtl838x_switch_priv *priv, int port, int queue,
+			  u32 min_pages, u32 max_pages, u8 probability)
+{
+	u32 v = FIELD_PREP(RTL931X_SWRED_THR_MAX_M, max_pages) |
+		FIELD_PREP(RTL931X_SWRED_THR_MIN_M, min_pages);
+	u32 never = FIELD_PREP(RTL931X_SWRED_THR_MAX_M, RTL931X_SWRED_THR_MAX_PAGES) |
+		    FIELD_PREP(RTL931X_SWRED_THR_MIN_M, RTL931X_SWRED_THR_MAX_PAGES);
+	u32 rate = probability | (probability << 8) | (probability << 16);
+
+	if (min_pages > max_pages || max_pages > RTL931X_SWRED_THR_MAX_PAGES)
+		return -EINVAL;
+
+	mutex_lock(&priv->reg_mutex);
+	for (int q = 0; q < 8; q++) {
+		u32 thr = (queue >= 0 && q != queue) ? never : v;
+
+		sw_w32((queue >= 0 && q != queue) ? 0 : rate,
+		       RTL931X_SWRED_Q_DROP_RATE(q));
+		for (int dp = 0; dp < RTL931X_SWRED_DROP_PRECEDENCES; dp++)
+			sw_w32(thr, RTL931X_SWRED_Q_THR(q, dp));
+	}
+	sw_w32_mask(RTL931X_FC_EGR_DROP_ALGO_SWRED, RTL931X_FC_EGR_DROP_ALGO_SWRED,
+		    RTL931X_FC_PORT_EGR_DROP_CTRL(port));
+	mutex_unlock(&priv->reg_mutex);
+
+	return 0;
+}
+
+void rtl931x_qos_swred_disable(struct rtl838x_switch_priv *priv, int port)
+{
+	mutex_lock(&priv->reg_mutex);
+	sw_w32_mask(RTL931X_FC_EGR_DROP_ALGO_SWRED, 0,
+		    RTL931X_FC_PORT_EGR_DROP_CTRL(port));
+	mutex_unlock(&priv->reg_mutex);
 }
 
 static void rtldsa_931x_qos_set_scheduling_queue_weights(struct rtl838x_switch_priv *priv)

@@ -701,6 +701,77 @@ typedef enum {
 /* port: 52-55, index: 0-11 */
 #define RTL931X_SCHED_PORT_Q_CTRL_SET1(port, index) \
 						((0x2F08 + ((port) - 52) * 48) + ((index) * 4))
+/* One bit per port, 32 ports per word: 0 = WFQ (byte-count),
+ * 1 = WRR (packet-count)
+ * (SDK swcore_rtl9310.h RTL9310_SCHED_PORT_ALGO_CTRL_ADDR,
+ * dal_mango_qos_schedulingAlgorithm_set).
+ */
+#define RTL931X_SCHED_PORT_ALGO_CTRL(port)	(0x3048 + (((port) >> 5) << 2))
+/* Per-queue fields of RTL931X_SCHED_PORT_Q_CTRL_SET{0,1}: STRICT_EN is
+ * bit 8 on this family (bit 7 on RTL930x).
+ */
+#define RTL931X_SCHED_Q_WEIGHT_M		GENMASK(6, 0)
+#define RTL931X_SCHED_Q_STRICT_EN		BIT(8)
+#define RTL931X_SCHED_Q_WEIGHT_MAX		127
+
+/* Default (port-based) internal priority: 3 bits per port, 10 ports per
+ * word (SDK swcore_rtl9310.h RTL9310_PRI_SEL_REMAP_PORT_ADDR,
+ * dal_mango_qos_priRemap_set with PRI_SRC_PB_PRI).
+ */
+#define RTL931X_PRI_SEL_PORT_PRI(p)		(0x900C + (((p / 10) << 2)))
+
+/* Port egress bandwidth leaky bucket, a 64-bit entry per port. Low word:
+ * BURST bits [15:0] (bytes); high word: RATE bits [19:0] (1 LSB = 16 Kbps)
+ * and EN bit 20 (SDK swcore_rtl9310.h RTL9310_EGBW_PORT_CTRL_ADDR,
+ * dal_mango_rate_portEgrBwCtrl{Enable,Rate,BurstSize}_set). The word order
+ * is the reverse of RTL930x, where EN|RATE is the low word.
+ */
+#define RTL931X_EGBW_PORT_CTRL(port)		(0x2164 + ((port) << 3))
+#define RTL931X_EGBW_LB_CTRL			(0x2160)
+/* TKN is the low half of EGBW_LB_CTRL on this family (the high half on
+ * RTL930x).
+ */
+#define RTL931X_EGBW_LB_TKN_M			GENMASK(15, 0)
+/* SDK default burst (RTK_DEFAULT_EGR_BANDWIDTH_PORT_BURST), programmed by
+ * the vendor init for all ports and queues; the burst cap gates egress
+ * even with EN clear, so "disabled" must restore it rather than write 0.
+ */
+#define RTL931X_EGBW_LB_RESET_BURST		(0x4000)
+#define RTL931X_EGBW_Q_RATE_M			GENMASK(19, 0)
+#define RTL931X_EGBW_Q_EN			BIT(20)
+#define RTL931X_EGBW_Q_BURST_M			GENMASK(15, 0)
+/* Per-queue egress bandwidth table EGR_Q_BW (RTL9310_TBL_4 type 0, one
+ * 29-word entry per port 0-55, 12 queues). Entry bit positions of the
+ * maximum-bandwidth fields of queue q (SDK rtk_mango_tableField_list.c
+ * RTL9310_EGR_Q_BW_FIELDS). The assured-bandwidth fields higher up in the
+ * entry are left untouched.
+ */
+#define RTL931X_EGR_Q_BW_WORDS			29
+#define RTL931X_EGR_Q_BW_MAX_BW_EN_LSP(q)	(28 + (q))
+#define RTL931X_EGR_Q_BW_MAX_BW_LSP(q)		(40 + (q) * 20)
+#define RTL931X_EGR_Q_BW_MAX_BW_LEN		20
+#define RTL931X_EGR_Q_BW_MAX_LB_BURST_LSP(q)	(280 + (q) * 16)
+#define RTL931X_EGR_Q_BW_MAX_LB_BURST_LEN	16
+
+/* SWRED (simple WRED): the per-port congestion avoidance algorithm select
+ * (0 = tail drop, 1 = SWRED) lives in the flow-control block on this
+ * family (SDK dal_mango_qos_portCongAvoidAlgo_set,
+ * swcore_rtl9310.h RTL9310_FC_PORT_EGR_DROP_CTRL_ADDR). Drop rates are 8
+ * bits per drop precedence, packed into one word per queue; thresholds are
+ * 13 bits per drop precedence in units of 256-byte pages, one word per
+ * queue and precedence, all of it global to the switch
+ * (SDK dal_mango_qos_congAvoidGlobalQueueConfig_set,
+ * swcore_rtl9310.h RTL9310_SWRED_Q_DROP_RATE_ADDR / RTL9310_SWRED_Q_THR_ADDR).
+ */
+#define RTL931X_FC_PORT_EGR_DROP_CTRL(p)	(0xA800 + ((p) << 2))
+#define RTL931X_FC_EGR_DROP_ALGO_SWRED		BIT(2)
+#define RTL931X_SWRED_Q_DROP_RATE(q)		(0x27C4 + ((q) << 2))
+#define RTL931X_SWRED_Q_THR(q, dp)		(0x27F4 + ((q) * 12) + ((dp) << 2))
+#define RTL931X_SWRED_THR_MAX_M			GENMASK(28, 16)
+#define RTL931X_SWRED_THR_MIN_M			GENMASK(12, 0)
+#define RTL931X_SWRED_PAGE_BYTES		256
+#define RTL931X_SWRED_THR_MAX_PAGES		8191
+#define RTL931X_SWRED_DROP_PRECEDENCES		3
 
 #define RTL930X_QM_INTPRI2QID_CTRL		(0xA320)
 #define RTL931X_QM_INTPRI2QID_CTRL		(0xA9D0)
@@ -1531,6 +1602,25 @@ int rtl930x_qos_port_shaper_set(struct rtl838x_switch_priv *priv, int port,
 int rtl930x_qos_swred_set(struct rtl838x_switch_priv *priv, int port, int queue,
 			  u32 min_pages, u32 max_pages, u8 probability);
 void rtl930x_qos_swred_disable(struct rtl838x_switch_priv *priv, int port);
+void rtldsa_931x_qos_setup_default_dscp2queue_map(void);
+int rtl931x_qos_default_prio_get(int port);
+int rtl931x_qos_default_prio_set(struct rtl838x_switch_priv *priv, int port,
+				 u8 prio);
+int rtl931x_qos_dscp_prio_get(int dscp);
+int rtl931x_qos_dscp_prio_set(struct rtl838x_switch_priv *priv, int dscp,
+			      u8 prio);
+void rtl931x_qos_queue_sched_set(int port, int queue, u8 weight, bool strict);
+int rtl931x_qos_sched_algo_get(int port);
+void rtl931x_qos_sched_algo_set(int port, bool wrr);
+void rtl931x_qos_port_sched_defaults(int port);
+void rtl931x_qos_sched_defaults(struct rtl838x_switch_priv *priv);
+int rtl931x_qos_queue_shaper_set(struct rtl838x_switch_priv *priv, int port,
+				 int queue, u64 rate_bytes_ps, u32 burst);
+int rtl931x_qos_port_shaper_set(struct rtl838x_switch_priv *priv, int port,
+				u64 rate_bytes_ps, u32 burst);
+int rtl931x_qos_swred_set(struct rtl838x_switch_priv *priv, int port, int queue,
+			  u32 min_pages, u32 max_pages, u8 probability);
+void rtl931x_qos_swred_disable(struct rtl838x_switch_priv *priv, int port);
 
 void rtldsa_counters_lock_register(struct rtl838x_switch_priv *priv, int port)
 	__acquires(&priv->ports[port].counters.lock);
