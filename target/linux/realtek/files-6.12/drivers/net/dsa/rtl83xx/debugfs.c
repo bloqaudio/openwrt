@@ -446,9 +446,12 @@ static const struct file_operations port_egress_fops = {
 	.write = port_egress_rate_write,
 };
 
-/* RTL930X per-port storm control. The debugfs value is plain packets per
- * second (decimal or 0x-prefixed), 0 = disabled. The hardware counts in
- * tokens of 1014/1000 packets, so the value is rescaled on the way in/out.
+/* RTL930X/RTL931X per-port storm control. The debugfs value is plain
+ * packets per second (decimal or 0x-prefixed), 0 = disabled. On RTL930x the
+ * hardware counts in tokens of 1014/1000 packets, so the value is rescaled
+ * on the way in/out; on RTL931x the PPS leaky-bucket tick/token is
+ * programmed at switch setup so that one rate unit is exactly 1 pps, and
+ * the register access goes through the rtl931x storm accessors.
  */
 static u32 rtl930x_storm_pps_to_tkn(u32 pps)
 {
@@ -460,27 +463,45 @@ static u32 rtl930x_storm_tkn_to_pps(u32 tkn)
 	return (tkn / 1000) * 1014 + ((tkn % 1000) * 1014 + 500) / 1000;
 }
 
-static ssize_t rtl930x_storm_rate_common_read(struct file *filp, char __user *buffer,
-					      size_t count, loff_t *ppos, u32 ctrl_base)
+static const u32 rtl930x_storm_ctrl_base[] = {
+	[RTLDSA_STORM_UC] = RTL930X_STORM_PORT_UC_CTRL(0),
+	[RTLDSA_STORM_MC] = RTL930X_STORM_PORT_MC_CTRL(0),
+	[RTLDSA_STORM_BC] = RTL930X_STORM_PORT_BC_CTRL(0),
+};
+
+static const u32 rtl930x_storm_lb_rst[] = {
+	[RTLDSA_STORM_UC] = RTL930X_STORM_PORT_UC_LB_RST,
+	[RTLDSA_STORM_MC] = RTL930X_STORM_PORT_MC_LB_RST,
+	[RTLDSA_STORM_BC] = RTL930X_STORM_PORT_BC_LB_RST,
+};
+
+static ssize_t rtl93xx_storm_rate_read(struct file *filp, char __user *buffer,
+				       size_t count, loff_t *ppos,
+				       enum rtldsa_storm_class class)
 {
 	struct rtl838x_port *p = filp->private_data;
+	struct rtl838x_switch_priv *priv = p->dp->ds->priv;
 	char buf[16];
 	u32 v, pps = 0;
 
 	if (*ppos != 0)
 		return 0;
 
-	v = sw_r32(ctrl_base + (p->dp->index << 3));
-	if (v & RTL930X_STORM_EN)
-		pps = rtl930x_storm_tkn_to_pps(v & RTL930X_STORM_RATE_M);
+	if (priv->family_id == RTL9310_FAMILY_ID) {
+		pps = rtl931x_storm_port_rate_get(p->dp->index, class);
+	} else {
+		v = sw_r32(rtl930x_storm_ctrl_base[class] + (p->dp->index << 3));
+		if (v & RTL930X_STORM_EN)
+			pps = rtl930x_storm_tkn_to_pps(v & RTL930X_STORM_RATE_M);
+	}
 
 	return simple_read_from_buffer(buffer, count, ppos, buf,
 				       scnprintf(buf, sizeof(buf), "%u\n", pps));
 }
 
-static ssize_t rtl930x_storm_rate_common_write(struct file *filp, const char __user *buffer,
-					       size_t count, loff_t *ppos,
-					       u32 ctrl_base, u32 rst_reg)
+static ssize_t rtl93xx_storm_rate_write(struct file *filp, const char __user *buffer,
+					size_t count, loff_t *ppos,
+					enum rtldsa_storm_class class)
 {
 	struct rtl838x_port *p = filp->private_data;
 	struct rtl838x_switch_priv *priv = p->dp->ds->priv;
@@ -488,6 +509,7 @@ static ssize_t rtl930x_storm_rate_common_write(struct file *filp, const char __u
 	char b[32];
 	ssize_t len;
 	u32 pps, v;
+	int ret;
 
 	if (*ppos != 0)
 		return -EINVAL;
@@ -503,35 +525,37 @@ static ssize_t rtl930x_storm_rate_common_write(struct file *filp, const char __u
 	if (kstrtouint(strim(b), 0, &pps))
 		return -EINVAL;
 
+	if (priv->family_id == RTL9310_FAMILY_ID) {
+		ret = rtl931x_storm_port_rate_set(priv, port, class, pps);
+		return ret ? ret : len;
+	}
+
 	if (pps > RTL930X_STORM_RATE_M)
 		return -ERANGE;
 
 	mutex_lock(&priv->reg_mutex);
-	v = sw_r32(ctrl_base + (port << 3));
+	v = sw_r32(rtl930x_storm_ctrl_base[class] + (port << 3));
 	v &= ~(RTL930X_STORM_RATE_M | RTL930X_STORM_EN);
 	if (pps)
 		v |= RTL930X_STORM_EN | rtl930x_storm_pps_to_tkn(pps);
-	sw_w32(v, ctrl_base + (port << 3));
+	sw_w32(v, rtl930x_storm_ctrl_base[class] + (port << 3));
 	/* The leaky bucket keeps stale credit unless reset after a change */
-	sw_w32(BIT(port), rst_reg);
+	sw_w32(BIT(port), rtl930x_storm_lb_rst[class]);
 	mutex_unlock(&priv->reg_mutex);
 
 	return len;
 }
 
-#define RTL930X_STORM_RATE_FOPS(_type, _TYPE)					\
+#define RTL93XX_STORM_RATE_FOPS(_type, _class)					\
 static ssize_t storm_rate_##_type##_read(struct file *filp, char __user *buffer, \
 					 size_t count, loff_t *ppos)		\
 {										\
-	return rtl930x_storm_rate_common_read(filp, buffer, count, ppos,	\
-					      RTL930X_STORM_PORT_##_TYPE##_CTRL(0)); \
+	return rtl93xx_storm_rate_read(filp, buffer, count, ppos, _class);	\
 }										\
 static ssize_t storm_rate_##_type##_write(struct file *filp, const char __user *buffer, \
 					  size_t count, loff_t *ppos)		\
 {										\
-	return rtl930x_storm_rate_common_write(filp, buffer, count, ppos,	\
-					       RTL930X_STORM_PORT_##_TYPE##_CTRL(0), \
-					       RTL930X_STORM_PORT_##_TYPE##_LB_RST); \
+	return rtl93xx_storm_rate_write(filp, buffer, count, ppos, _class);	\
 }										\
 static const struct file_operations storm_rate_##_type##_fops = {		\
 	.owner = THIS_MODULE,							\
@@ -540,9 +564,152 @@ static const struct file_operations storm_rate_##_type##_fops = {		\
 	.write = storm_rate_##_type##_write,					\
 }
 
-RTL930X_STORM_RATE_FOPS(uc, UC);
-RTL930X_STORM_RATE_FOPS(mc, MC);
-RTL930X_STORM_RATE_FOPS(bc, BC);
+RTL93XX_STORM_RATE_FOPS(uc, RTLDSA_STORM_UC);
+RTL93XX_STORM_RATE_FOPS(mc, RTLDSA_STORM_MC);
+RTL93XX_STORM_RATE_FOPS(bc, RTLDSA_STORM_BC);
+
+/* RTL931X per-port storm type selection for UC/MC: "unknown" limits only
+ * traffic whose destination is not in the FDB, "all" limits all traffic of
+ * the class. Broadcast has no TYPE bit. The unknown-only multicast mode is
+ * the only mechanism this family offers for containing unknown multicast.
+ */
+static ssize_t rtl931x_storm_type_read(struct file *filp, char __user *buffer,
+				       size_t count, loff_t *ppos,
+				       enum rtldsa_storm_class class)
+{
+	struct rtl838x_port *p = filp->private_data;
+	char buf[16];
+
+	if (*ppos != 0)
+		return 0;
+
+	return simple_read_from_buffer(buffer, count, ppos, buf,
+				scnprintf(buf, sizeof(buf), "%s\n",
+					  rtl931x_storm_port_type_get(p->dp->index, class) ?
+					  "all" : "unknown"));
+}
+
+static ssize_t rtl931x_storm_type_write(struct file *filp, const char __user *buffer,
+					size_t count, loff_t *ppos,
+					enum rtldsa_storm_class class)
+{
+	struct rtl838x_port *p = filp->private_data;
+	struct rtl838x_switch_priv *priv = p->dp->ds->priv;
+	char b[16];
+	ssize_t len;
+	int ret;
+
+	if (*ppos != 0)
+		return -EINVAL;
+
+	if (count >= sizeof(b))
+		return -ENOSPC;
+
+	len = simple_write_to_buffer(b, sizeof(b) - 1, ppos, buffer, count);
+	if (len < 0)
+		return len;
+
+	b[len] = '\0';
+
+	if (sysfs_streq(b, "unknown"))
+		ret = rtl931x_storm_port_type_set(priv, p->dp->index, class, false);
+	else if (sysfs_streq(b, "all"))
+		ret = rtl931x_storm_port_type_set(priv, p->dp->index, class, true);
+	else
+		return -EINVAL;
+
+	return ret ? ret : len;
+}
+
+#define RTL931X_STORM_TYPE_FOPS(_type, _class)					\
+static ssize_t storm_type_##_type##_read(struct file *filp, char __user *buffer, \
+					 size_t count, loff_t *ppos)		\
+{										\
+	return rtl931x_storm_type_read(filp, buffer, count, ppos, _class);	\
+}										\
+static ssize_t storm_type_##_type##_write(struct file *filp, const char __user *buffer, \
+					  size_t count, loff_t *ppos)		\
+{										\
+	return rtl931x_storm_type_write(filp, buffer, count, ppos, _class);	\
+}										\
+static const struct file_operations storm_type_##_type##_fops = {		\
+	.owner = THIS_MODULE,							\
+	.open = simple_open,							\
+	.read = storm_type_##_type##_read,					\
+	.write = storm_type_##_type##_write,					\
+}
+
+RTL931X_STORM_TYPE_FOPS(uc, RTLDSA_STORM_UC);
+RTL931X_STORM_TYPE_FOPS(mc, RTLDSA_STORM_MC);
+
+/* RTL931X storm-control exceed flags, one bit per port across two words,
+ * write 1 to clear (the RTL930x equivalents are single-word x32 files)
+ */
+static ssize_t rtl931x_storm_exceed_read(struct file *filp, char __user *buffer,
+					 size_t count, loff_t *ppos, u32 base)
+{
+	char buf[24];
+	u64 v;
+
+	if (*ppos != 0)
+		return 0;
+
+	v = sw_r32(base) | ((u64)sw_r32(base + 4) << 32);
+
+	return simple_read_from_buffer(buffer, count, ppos, buf,
+				       scnprintf(buf, sizeof(buf), "0x%016llx\n", v));
+}
+
+static ssize_t rtl931x_storm_exceed_write(struct file *filp, const char __user *buffer,
+					  size_t count, loff_t *ppos, u32 base)
+{
+	char b[24];
+	ssize_t len;
+	u64 v;
+
+	if (*ppos != 0)
+		return -EINVAL;
+
+	if (count >= sizeof(b))
+		return -ENOSPC;
+
+	len = simple_write_to_buffer(b, sizeof(b) - 1, ppos, buffer, count);
+	if (len < 0)
+		return len;
+
+	b[len] = '\0';
+	if (kstrtou64(strim(b), 0, &v))
+		return -EINVAL;
+
+	sw_w32((u32)v, base);
+	sw_w32((u32)(v >> 32), base + 4);
+
+	return len;
+}
+
+#define RTL931X_STORM_EXCEED_FOPS(_type, _TYPE)					\
+static ssize_t storm_exceed_##_type##_read(struct file *filp, char __user *buffer, \
+					   size_t count, loff_t *ppos)		\
+{										\
+	return rtl931x_storm_exceed_read(filp, buffer, count, ppos,		\
+					 RTL931X_STORM_PORT_##_TYPE##_EXCEED(0)); \
+}										\
+static ssize_t storm_exceed_##_type##_write(struct file *filp, const char __user *buffer, \
+					    size_t count, loff_t *ppos)		\
+{										\
+	return rtl931x_storm_exceed_write(filp, buffer, count, ppos,		\
+					  RTL931X_STORM_PORT_##_TYPE##_EXCEED(0)); \
+}										\
+static const struct file_operations storm_exceed_##_type##_fops = {		\
+	.owner = THIS_MODULE,							\
+	.open = simple_open,							\
+	.read = storm_exceed_##_type##_read,					\
+	.write = storm_exceed_##_type##_write,					\
+}
+
+RTL931X_STORM_EXCEED_FOPS(uc, UC);
+RTL931X_STORM_EXCEED_FOPS(mc, MC);
+RTL931X_STORM_EXCEED_FOPS(bc, BC);
 
 /* Weighted scheduling algorithm per port: "wfq" (byte-count) or "wrr"
  * (packet-count). There is no kernel API for the WFQ/WRR distinction
@@ -1147,6 +1314,14 @@ void rtl930x_dbgfs_init(struct rtl838x_switch_priv *priv)
 				   (u32 *)(RTL838X_SW_BASE + RTL930X_STORM_PORT_MC_EXCEED));
 		debugfs_create_x32("storm_exceed_bc", 0644, dbg_dir,
 				   (u32 *)(RTL838X_SW_BASE + RTL930X_STORM_PORT_BC_EXCEED));
+	} else if (priv->family_id == RTL9310_FAMILY_ID) {
+		/* Same flags, but 57 ports need two words per class */
+		debugfs_create_file("storm_exceed_uc", 0644, dbg_dir,
+				    NULL, &storm_exceed_uc_fops);
+		debugfs_create_file("storm_exceed_mc", 0644, dbg_dir,
+				    NULL, &storm_exceed_mc_fops);
+		debugfs_create_file("storm_exceed_bc", 0644, dbg_dir,
+				    NULL, &storm_exceed_bc_fops);
 	}
 
 	if (priv->family_id != RTL9300_FAMILY_ID &&
@@ -1160,13 +1335,23 @@ void rtl930x_dbgfs_init(struct rtl838x_switch_priv *priv)
 		port_dir = debugfs_create_dir(priv->ports[i].dp->name, dbg_dir);
 		debugfs_create_u32("id", 0444, port_dir,
 				   (u32 *)&priv->ports[i].dp->index);
-		if (priv->family_id == RTL9300_FAMILY_ID) {
+		if (priv->family_id == RTL9300_FAMILY_ID ||
+		    priv->family_id == RTL9310_FAMILY_ID) {
 			debugfs_create_file("storm_rate_uc", 0600, port_dir,
 					    &priv->ports[i], &storm_rate_uc_fops);
 			debugfs_create_file("storm_rate_mc", 0600, port_dir,
 					    &priv->ports[i], &storm_rate_mc_fops);
 			debugfs_create_file("storm_rate_bc", 0600, port_dir,
 					    &priv->ports[i], &storm_rate_bc_fops);
+		}
+		if (priv->family_id == RTL9310_FAMILY_ID) {
+			/* UC/MC type select: unknown-destination-only vs all */
+			debugfs_create_file("storm_type_uc", 0600, port_dir,
+					    &priv->ports[i], &storm_type_uc_fops);
+			debugfs_create_file("storm_type_mc", 0600, port_dir,
+					    &priv->ports[i], &storm_type_mc_fops);
+		}
+		if (priv->family_id == RTL9300_FAMILY_ID) {
 			debugfs_create_file("remark", 0400, port_dir,
 					    &priv->ports[i], &remark_fops);
 		}
