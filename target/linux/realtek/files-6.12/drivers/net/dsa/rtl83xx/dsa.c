@@ -1908,7 +1908,6 @@ static void rtldsa_port_disable(struct dsa_switch *ds, int port)
 	if (!dsa_is_user_port(ds, port))
 		return;
 
-	/* BUG: This does not work on RTL931X */
 	/* remove port from switch mask of CPU_PORT */
 	priv->r->traffic_disable(priv->cpu_port, port);
 
