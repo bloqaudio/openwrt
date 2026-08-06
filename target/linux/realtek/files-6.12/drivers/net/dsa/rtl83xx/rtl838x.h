@@ -1635,6 +1635,7 @@ struct rtl838x_switch_priv {
 void rtl838x_dbgfs_init(struct rtl838x_switch_priv *priv);
 void rtl930x_dbgfs_init(struct rtl838x_switch_priv *priv);
 void rtl930x_storm_control_init(struct rtl838x_switch_priv *priv);
+void rtl931x_storm_control_init(struct rtl838x_switch_priv *priv);
 int rtl931x_storm_port_rate_set(struct rtl838x_switch_priv *priv, int port,
 				enum rtldsa_storm_class class, u32 pps);
 u32 rtl931x_storm_port_rate_get(int port, enum rtldsa_storm_class class);

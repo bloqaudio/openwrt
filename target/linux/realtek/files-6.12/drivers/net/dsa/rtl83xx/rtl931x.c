@@ -980,6 +980,63 @@ bool rtl931x_storm_port_type_get(int port, enum rtldsa_storm_class class)
 		  RTL931X_STORM_TYPE_INCL_KNOWN);
 }
 
+/* Bring per-port storm control into a known state: PPS mode on all ports,
+ * every limiter disabled in the measured reset posture (rate wide open,
+ * burst 0x8000, EN clear), unknown-destination-only for UC/MC (TYPE clear).
+ * Unlike Longan, whose SDK never touches the storm leaky-bucket timers, the
+ * Mango SDK programs the global PPS tick/token at init from the system
+ * clock (dal_mango_construct.c); with those values one RATE unit is exactly
+ * 1 pps. The reset values are logged first, for reference. STORM_LB_CTRL
+ * (the byte-mode timer) is left alone as all ports are pinned to packet
+ * mode. The CPU port is left untouched so trapped/injected traffic is
+ * never storm-limited.
+ */
+void rtl931x_storm_control_init(struct rtl838x_switch_priv *priv)
+{
+	u64 port_mask = GENMASK_ULL(priv->cpu_port - 1, 0);
+	u32 tick, tkn;
+
+	pr_info("%s: STORM_LB_CTRL %08x, STORM_LB_PPS_CTRL %08x\n", __func__,
+		sw_r32(RTL931X_STORM_LB_CTRL), sw_r32(RTL931X_STORM_LB_PPS_CTRL));
+
+	switch (FIELD_GET(RTL931X_SYS_CLK_SEL_M,
+			  sw_r32(RTL931X_MAC_L2_GLOBAL_CTRL2))) {
+	case 1: /* 325 MHz */
+		tick = RTL931X_STORM_LB_PPS_TICK_325M;
+		tkn = RTL931X_STORM_LB_PPS_TKN_325M;
+		break;
+	case 2: /* 175 MHz */
+		tick = RTL931X_STORM_LB_PPS_TICK_175M;
+		tkn = RTL931X_STORM_LB_PPS_TKN_175M;
+		break;
+	default: /* 650 MHz */
+		tick = RTL931X_STORM_LB_PPS_TICK_650M;
+		tkn = RTL931X_STORM_LB_PPS_TKN_650M;
+		break;
+	}
+	sw_w32(FIELD_PREP(RTL931X_STORM_LB_PPS_TICK_M, tick) |
+	       FIELD_PREP(RTL931X_STORM_LB_PPS_TKN_M, tkn),
+	       RTL931X_STORM_LB_PPS_CTRL);
+
+	/* All ports count packets (PPS), not bytes: two mode words */
+	sw_w32(0, RTL931X_STORM_PORT_CTRL(0));
+	sw_w32(0, RTL931X_STORM_PORT_CTRL(32));
+
+	/* Reset posture on every port and class, with a leaky-bucket reset */
+	for (int p = 0; p < priv->cpu_port; p++)
+		for (enum rtldsa_storm_class c = RTLDSA_STORM_UC;
+		     c <= RTLDSA_STORM_BC; c++)
+			rtl931x_storm_port_rate_set(priv, p, c, 0);
+
+	/* Clear stale exceed flags (write-1-to-clear, two words per class) */
+	sw_w32((u32)port_mask, RTL931X_STORM_PORT_UC_EXCEED(0));
+	sw_w32((u32)(port_mask >> 32), RTL931X_STORM_PORT_UC_EXCEED(32));
+	sw_w32((u32)port_mask, RTL931X_STORM_PORT_MC_EXCEED(0));
+	sw_w32((u32)(port_mask >> 32), RTL931X_STORM_PORT_MC_EXCEED(32));
+	sw_w32((u32)port_mask, RTL931X_STORM_PORT_BC_EXCEED(0));
+	sw_w32((u32)(port_mask >> 32), RTL931X_STORM_PORT_BC_EXCEED(32));
+}
+
 static u64 rtl931x_read_mcast_pmask(int idx)
 {
 	u64 portmask;

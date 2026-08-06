@@ -749,6 +749,8 @@ static int rtl93xx_setup(struct dsa_switch *ds)
 	}
 
 	if (priv->family_id == RTL9310_FAMILY_ID) {
+		rtl931x_storm_control_init(priv);
+
 		/* See the RTL9300 branch above: the DSCP defaults must be in
 		 * hardware before the DSA core seeds the dcbnl app table at
 		 * user-port creation.
