@@ -934,11 +934,12 @@ static int rtldsa_93xx_tc_setup_qdisc_ets(struct dsa_switch *ds, int port,
  * classid minor m shapes queue 8 - m); TBF at the root shapes the
  * whole port.
  */
-static int rtldsa_930x_tc_setup_qdisc_tbf(struct dsa_switch *ds, int port,
+static int rtldsa_93xx_tc_setup_qdisc_tbf(struct dsa_switch *ds, int port,
 					  struct tc_tbf_qopt_offload *qopt)
 {
 	struct rtl838x_switch_priv *priv = ds->priv;
 	struct tc_tbf_qopt_offload_replace_params *p = &qopt->replace_params;
+	bool is_rtl931x = priv->family_id == RTL9310_FAMILY_ID;
 	int queue = -1;
 
 	if (qopt->parent != TC_H_ROOT) {
@@ -951,16 +952,30 @@ static int rtldsa_930x_tc_setup_qdisc_tbf(struct dsa_switch *ds, int port,
 
 	switch (qopt->command) {
 	case TC_TBF_REPLACE:
-		if (queue < 0)
+		if (queue < 0) {
+			if (is_rtl931x)
+				return rtl931x_qos_port_shaper_set(priv, port,
+							p->rate.rate_bytes_ps,
+							p->max_size);
 			return rtl930x_qos_port_shaper_set(priv, port,
-						p->rate.rate_bytes_ps,
-						p->max_size);
+							p->rate.rate_bytes_ps,
+							p->max_size);
+		}
+		if (is_rtl931x)
+			return rtl931x_qos_queue_shaper_set(priv, port, queue,
+							    p->rate.rate_bytes_ps,
+							    p->max_size);
 		return rtl930x_qos_queue_shaper_set(priv, port, queue,
 						    p->rate.rate_bytes_ps,
 						    p->max_size);
 	case TC_TBF_DESTROY:
-		if (queue < 0)
+		if (queue < 0) {
+			if (is_rtl931x)
+				return rtl931x_qos_port_shaper_set(priv, port, 0, 0);
 			return rtl930x_qos_port_shaper_set(priv, port, 0, 0);
+		}
+		if (is_rtl931x)
+			return rtl931x_qos_queue_shaper_set(priv, port, queue, 0, 0);
 		return rtl930x_qos_queue_shaper_set(priv, port, queue, 0, 0);
 	default:
 		return -EOPNOTSUPP;
@@ -1040,8 +1055,9 @@ static int rtldsa_93xx_port_setup_tc(struct dsa_switch *ds, int port,
 			return rtldsa_93xx_tc_setup_qdisc_ets(ds, port, type_data);
 		return -EOPNOTSUPP;
 	case TC_SETUP_QDISC_TBF:
-		if (priv->family_id == RTL9300_FAMILY_ID)
-			return rtldsa_930x_tc_setup_qdisc_tbf(ds, port, type_data);
+		if (priv->family_id == RTL9300_FAMILY_ID ||
+		    priv->family_id == RTL9310_FAMILY_ID)
+			return rtldsa_93xx_tc_setup_qdisc_tbf(ds, port, type_data);
 		return -EOPNOTSUPP;
 	case TC_SETUP_QDISC_RED:
 		if (priv->family_id == RTL9300_FAMILY_ID)
