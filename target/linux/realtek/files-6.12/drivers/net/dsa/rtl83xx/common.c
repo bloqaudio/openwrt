@@ -1675,7 +1675,8 @@ static int rtl83xx_l3_neigh6_route_add(struct rtl838x_switch_priv *priv,
 	struct rtl83xx_route *r;
 	int slot, if_id;
 
-	if (!priv->r->host_route_write || !priv->r->set_l3_router_mac)
+	if (!priv->r->host_route_write || !priv->r->set_l3_router_mac ||
+	    !priv->r->route_write)
 		return -EOPNOTSUPP;
 
 	/* Same egress-VLAN rules as for IPv4: SVI neighbours carry their
@@ -1893,12 +1894,18 @@ static int rtldsa_fib4_add(struct rtl838x_switch_priv *priv,
 		return -ENODEV;
 	}
 
-	/* Allocate route or host-route entry (if hardware supports this) */
+	/* Allocate route or host-route entry (if hardware supports this).
+	 * A family without prefix-route ops offloads host routes only;
+	 * anything else stays on the software path, reached via the
+	 * catch-all trap entry.
+	 */
 	rtl83xx_route_key4(nh->fib_nh_gw4, &key);
 	if (info->dst_len == 32 && priv->r->host_route_write)
 		route = rtl83xx_host_route_alloc(priv, &key);
-	else
+	else if (priv->r->route_write)
 		route = rtl83xx_route_alloc(priv, &key);
+	else
+		return 0;
 
 	if (route)
 		dev_info(priv->dev, "route hashtable extended for gw %pI4\n", &nh->fib_nh_gw4);
@@ -1977,6 +1984,13 @@ static int rtldsa_fib6_check(struct rtl838x_switch_priv *priv,
 	struct net_device *ndev = rt->fib6_nh->fib_nh_dev;
 	struct in6_addr *gw6 = &rt->fib6_nh->fib_nh_gw6;
 	int addr_type, vlan;
+
+	/* IPv6 offload needs the prefix-route ops (gateway routes and the
+	 * prefix-region rewrite) and the v6 host hash. A family without
+	 * them keeps all IPv6 routing in software.
+	 */
+	if (!priv->r->route_write)
+		return -EINVAL;
 
 	if (rt->nh || rt->fib6_nsiblings || rt->fib6_type != RTN_UNICAST || !ndev) {
 		pr_debug("%s: skip multipath/non-unicast IPv6 route\n", __func__);

@@ -2568,6 +2568,135 @@ static void rtldsa_931x_qos_init(struct rtl838x_switch_priv *priv)
 	rtldsa_931x_qos_set_scheduling_queue_weights(priv);
 }
 
+#ifdef CONFIG_NET_DSA_RTL83XX_RTL930X_L3_OFFLOAD
+
+/* RTL931x (Mango) Layer-3 offload.
+ *
+ * All table layouts and register values derive from the Mango SDK:
+ * table geometry from rtk_mango_table_list.c, field offsets from
+ * rtk_mango_tableField_list.c, register field positions from
+ * swcore_rtl9310.h, init sequence from dal_mango_l3.c.
+ *
+ * All L3 tables are accessed via table access set 2 (RTL9310_TBL_2):
+ *   type 2: L3_ROUTER_MAC           1024 entries x 5 words (ternary)
+ *   type 3: L3_HOST_ROUTE_IPUC      12288 entries x 4 words
+ *   type 4: L3_PREFIX_ROUTE_IPUC    12288 entries x 6 words (ternary)
+ *   type 6: L3_NEXTHOP              8192 entries x 1 word
+ *   type 7: L3_IGR_INTF             1024 entries x 2 words
+ *   type 8: L3_EGR_INTF             1024 entries x 4 words
+ * The host and prefix tables share one physical table with per-format
+ * views (types 3-5); the SDK addresses entries logically (0..12287) and
+ * the hardware row holds 8 slots of which 6 are usable, so the logical
+ * index converts to a physical address with ((idx / 6) * 8) + (idx % 6)
+ * (SDK DAL_MANGO_L3_ENTRY_IDX_TO_ADDR).
+ * Table data words are big-endian: data word 0 (the lowest address) holds
+ * the highest-numbered entry bits; the SDK documents bit positions within
+ * the entry.
+ */
+
+/* Index of the catch-all prefix entry trapping IPv4 route-lookup misses
+ * to the CPU. Mango has no unicast route-miss action: L3_IPUC_ROUTE_CTRL
+ * carries only exception actions (swcore_rtl9310.h) and the ingress
+ * interface table exposes LU_MIS acts only for IPMC/IP6MC
+ * (rtk_mango_tableField_list.c, rtk_l3_intfCtrlType_t). The prefix TCAM
+ * returns the lowest matching index, so the catch-all sits at the very
+ * top where any specific route programmed later will shadow it.
+ */
+#define RTL931X_L3_ROUTE_IDX_CATCHALL_IP4	12287
+
+static int rtl931x_l3_setup(struct rtl838x_switch_priv *priv)
+{
+	struct table_reg *r;
+
+	for (int i = 0; i < MAX_INTF_MTUS; i++)
+		priv->intf_mtu_count[i] = priv->intf_mtus[i] = 0;
+
+	/* MTU slot 0 is the reserved default-interface MTU (SDK
+	 * DAL_MANGO_L3_RESERVED_INTF_MTU_IDX), slot 1 serves the driver's
+	 * egress interfaces. MANGO_L3_INTF_IP_MTUr @0xF1E0 and
+	 * MANGO_L3_INTF_IP6_MTUr @0xF220, 16 slots, MTU value in bits 13:0.
+	 */
+	priv->intf_mtus[0] = DEFAULT_MTU;
+	priv->intf_mtus[1] = DEFAULT_MTU;
+	for (int i = 0; i < 2; i++) {
+		sw_w32_mask(0x3fff, DEFAULT_MTU, RTL931X_L3_INTF_IP_MTU(i));
+		sw_w32_mask(0x3fff, DEFAULT_MTU, RTL931X_L3_INTF_IP6_MTU(i));
+	}
+
+	/* Host table hash algorithms (MANGO_L3_HOST_TBL_CTRLr @0xF004):
+	 * table 0 -> algorithm 0 (XOR), table 1 -> algorithm 1 (carry-fold
+	 * sum), as in dal_mango_l3_init(). Masked write: the MC algorithm
+	 * selects and the lookup-mode bits keep their reset values.
+	 */
+	sw_w32_mask(0x3 << 2, BIT(3), RTL931X_L3_HOST_TBL_CTRL);
+
+	/* MANGO_L3_IP_ROUTE_CTRLr @0xF000:
+	 * - NON_IP_ACT = TRAP2CPU: non-IP traffic to a router MAC (e.g.
+	 *   ARP) must reach the CPU so the switch stays reachable.
+	 * - NH_AGE_OUT_ACT = TRAP2CPU: a packet whose nexthop L2 entry was
+	 *   invalidated traps so the kernel re-resolves the neighbour
+	 *   instead of being silently dropped.
+	 * - NH_ERR_ACT = TRAP2CPU: same for a nexthop pointing at an
+	 *   invalid or reserved entry.
+	 */
+	sw_w32_mask((0x3 << 10) | (0x7 << 6) | (0x3 << 4),
+		    (0x1 << 10) | (0x1 << 6) | (0x1 << 4),
+		    RTL931X_L3_IP_ROUTE_CTRL);
+
+	/* MANGO_L3_IPUC_ROUTE_CTRLr @0xF008:
+	 * - GLB_EN: enable IPv4 unicast routing.
+	 * - TTL_FAIL_ACT / MTU_FAIL_ACT = TRAP2CPU: expired-TTL and
+	 *   over-MTU packets must reach the CPU for ICMP time-exceeded /
+	 *   fragmentation-needed (traceroute, PMTUD).
+	 * - HDR_OPT_ACT = FORWARD (2): route packets carrying IP options.
+	 * - DMAC_BC_ACT = TRAP2CPU: IP-broadcast through the router MAC
+	 *   (e.g. DHCP) must not be dropped in hardware.
+	 * BAD_SIP/BAD_DIP/ZERO_SIP/DMAC_MC acts keep their reset values.
+	 */
+	sw_w32_mask(BIT(0) | (0x3 << 7) | (0x7 << 11) | (0x3 << 14) | (0x3 << 16),
+		    BIT(0) | (0x1 << 7) | (0x2 << 11) | (0x1 << 14) | (0x1 << 16),
+		    RTL931X_L3_IPUC_ROUTE_CTRL);
+
+	/* Enable the L3 TCAMs (MANGO_ALE_L3_MISC_CTRLr @0xF2E8): prefix
+	 * TCAM blocks 0-5 (L3_TCAM_BLK_EN = 0x3F) and the router-MAC TCAM
+	 * (ROUTER_MAC_TCAM_EN, bit 7). Without these nothing routes and no
+	 * error is signalled anywhere (dal_mango_l3_init()).
+	 */
+	sw_w32_mask(0x3f | BIT(7), 0x3f | BIT(7), RTL931X_ALE_L3_MISC_CTRL);
+
+	/* Reserve nexthop 0 (dal_mango_l3_init): DMAC_IDX = 0xFFFC is the
+	 * invalid/tunnel DMAC index, egress interface 0 is the reserved
+	 * default-bridging interface. MANGO_L3_NEXTHOPt entry: DMAC_IDX
+	 * bits 31:16, L3_EGR_INTF_IDX bits 15:6.
+	 */
+	r = rtl_table_get(RTL9310_TBL_2, 6);
+	sw_w32(0xfffc << 16, rtl_table_data(r, 0));
+	rtl_table_write(r, 0);
+	rtl_table_release(r);
+
+	/* Catch-all IPv4 prefix entry (see the index comment above):
+	 * valid, entry type IPv4-UC with the type bits cared
+	 * (BMSK_ENTRY_TYPE = 3), all other masks 0, DFLT_ROUTE, action
+	 * TRAP2CPU. A router-MAC-matched packet missing the host table
+	 * falls through to this entry and reaches the CPU instead of being
+	 * silently dropped.
+	 */
+	r = rtl_table_get(RTL9310_TBL_2, 4);
+	sw_w32(BIT(31), rtl_table_data(r, 0));		/* VALID, FMT 0, type IPUC, VRF 0, IP 0 */
+	sw_w32(0x3 << 8, rtl_table_data(r, 1));		/* BMSK_ENTRY_TYPE = 3 */
+	sw_w32(0, rtl_table_data(r, 2));		/* BMSK_IP = 0 */
+	sw_w32(BIT(21) | (ROUTE_ACT_TRAP2CPU << 17),	/* DFLT_ROUTE | ACT */
+	       rtl_table_data(r, 3));
+	sw_w32(0, rtl_table_data(r, 4));
+	sw_w32(0, rtl_table_data(r, 5));
+	rtl_table_write(r, RTL931X_L3_ROUTE_IDX_CATCHALL_IP4);
+	rtl_table_release(r);
+
+	return 0;
+}
+
+#endif /* CONFIG_NET_DSA_RTL83XX_RTL930X_L3_OFFLOAD */
+
 const struct rtl838x_reg rtl931x_reg = {
 	.mask_port_reg_be = rtl839x_mask_port_reg_be,
 	.set_port_reg_be = rtl839x_set_port_reg_be,
@@ -2638,6 +2767,9 @@ const struct rtl838x_reg rtl931x_reg = {
 	.pie_rule_rm = rtl931x_pie_rule_rm,
 	.packet_cntr_read = rtl931x_packet_cntr_read,
 	.packet_cntr_clear = rtl931x_packet_cntr_clear,
+#ifdef CONFIG_NET_DSA_RTL83XX_RTL930X_L3_OFFLOAD
+	.l3_setup = rtl931x_l3_setup,
+#endif
 	.l2_learning_setup = rtl931x_l2_learning_setup,
 	.led_init = rtldsa_931x_led_init,
 	.enable_learning = rtldsa_931x_enable_learning,
