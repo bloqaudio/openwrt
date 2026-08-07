@@ -2803,6 +2803,203 @@ static void rtl931x_set_l3_egress_mac(u32 idx, u64 mac)
 	rtl_table_release(r);
 }
 
+/* IPv4 host-route hash, translated from the Mango SDK
+ * (_dal_mango_l3_hostHash0_ret/_hostHash1_ret). The 10-bit hash folds
+ * the VRF ID into the key; for a unicast host the SDK hashes
+ * {vrf, sip = 0, dip, vid = 0}, so only the VRF and DIP rows
+ * contribute. Algorithm 0 XORs the VRF row with the four DIP groups;
+ * algorithm 1 sums the four DIP groups with end-around carry into
+ * 10 bits and XORs the VRF row in.
+ */
+static u32 rtl931x_l3_hash4(u32 vrf, u32 ip, int algorithm)
+{
+	u32 h;
+
+	if (!algorithm) {
+		h = ((vrf & 0x1f) << 5) | ((vrf >> 5) & 0x7);
+		h ^= (ip >> 30) & 0x3;
+		h ^= (ip >> 20) & 0x3ff;
+		h ^= (ip >> 10) & 0x3ff;
+		h ^= ip & 0x3ff;
+	} else {
+		h = (ip >> 30) & 0x3;
+		for (int g = 20; ; g -= 10) {
+			h += (ip >> g) & 0x3ff;
+			h = (h & 0x3ff) + (h >> 10);
+			if (!g)
+				break;
+		}
+		h ^= ((vrf & 0xf) << 6) | ((vrf >> 4) & 0xf);
+	}
+
+	return h;
+}
+
+/* Read a host route entry from the L3 host table using its logical
+ * index. Only IPv4 unicast entries are decoded.
+ */
+static void rtl931x_host_route_read(int idx, struct rtl83xx_route *rt)
+{
+	u32 v, w;
+	/* Access the host table (L3_HOST_ROUTE_IPUC view) via access set 2 */
+	struct table_reg *r = rtl_table_get(RTL9310_TBL_2, 3);
+
+	/* Logical index to physical address: 6 usable slots per 8-slot row */
+	idx = ((idx / 6) * 8) + (idx % 6);
+
+	rtl_table_read(r, idx);
+	/* L3_HOST_ROUTE_IPUC entry, 128 bits (MANGO_L3_HOST_ROUTE_IPUCt):
+	 * word 0: VALID 31, FMT 30, ENTRY_TYPE 29:28, VRF_ID 27:20,
+	 *         IP[31:12] 19:0
+	 * word 1: IP[11:0] 31:20, DST_NULL_INTF 10, ACT 9:7, ECMP_EN 6,
+	 *         NH_ECMP_IDX[12:7] 5:0
+	 * word 2: NH_ECMP_IDX[6:0] 31:25, TTL_DEC 24, TTL_CHK 23,
+	 *         QOS_EN 22, QOS_PRI 21:19
+	 * word 3: HIT 15
+	 */
+	v = sw_r32(rtl_table_data(r, 0));
+	rt->attr.valid = !!(v & BIT(31));
+	if (!rt->attr.valid)
+		goto out;
+	rt->attr.type = (v >> 28) & 0x3;
+	if (rt->attr.type != 0) { /* Only IPv4 unicast routes */
+		pr_warn("%s: route type %d not supported\n", __func__, rt->attr.type);
+		goto out;
+	}
+	w = sw_r32(rtl_table_data(r, 1));
+	rt->dst_ip = ((v & 0xfffff) << 12) | (w >> 20);
+
+	rt->attr.dst_null = !!(w & BIT(10));
+	rt->attr.action = (w >> 7) & 0x7;
+	rt->nh.id = ((w & 0x3f) << 7) | (sw_r32(rtl_table_data(r, 2)) >> 25);
+	v = sw_r32(rtl_table_data(r, 2));
+	rt->attr.ttl_dec = !!(v & BIT(24));
+	rt->attr.ttl_check = !!(v & BIT(23));
+	rt->attr.qos_as = !!(v & BIT(22));
+	rt->attr.qos_prio = (v >> 19) & 0x7;
+	rt->attr.hit = !!(sw_r32(rtl_table_data(r, 3)) & BIT(15));
+
+out:
+	rtl_table_release(r);
+}
+
+/* Write a host route entry using its logical index. Only IPv4 unicast
+ * routes are supported; invalidation clears the entire entry so the
+ * VALID bit really goes away.
+ */
+static void rtl931x_host_route_write(int idx, struct rtl83xx_route *rt)
+{
+	struct table_reg *r = rtl_table_get(RTL9310_TBL_2, 3);
+
+	if (rt->attr.valid && rt->attr.type != 0) {
+		pr_warn("%s: route type %d not supported\n", __func__, rt->attr.type);
+		rtl_table_release(r);
+		return;
+	}
+
+	idx = ((idx / 6) * 8) + (idx % 6);
+
+	if (!rt->attr.valid) {
+		for (int i = 0; i < 4; i++)
+			sw_w32(0, rtl_table_data(r, i));
+	} else {
+		sw_w32(BIT(31) | ((rt->dst_ip >> 12) & 0xfffff),
+		       rtl_table_data(r, 0));
+		sw_w32(((rt->dst_ip & 0xfff) << 20) |
+		       (rt->attr.dst_null ? BIT(10) : 0) |
+		       ((rt->attr.action & 0x7) << 7) |
+		       ((rt->nh.id >> 7) & 0x3f),
+		       rtl_table_data(r, 1));
+		sw_w32(((rt->nh.id & 0x7f) << 25) |
+		       (rt->attr.ttl_dec ? BIT(24) : 0) |
+		       (rt->attr.ttl_check ? BIT(23) : 0) |
+		       (rt->attr.qos_as ? BIT(22) : 0) |
+		       ((rt->attr.qos_prio & 0x7) << 19),
+		       rtl_table_data(r, 2));
+		sw_w32(rt->attr.hit ? BIT(15) : 0, rtl_table_data(r, 3));
+	}
+
+	rtl_table_write(r, idx);
+	rtl_table_release(r);
+}
+
+/* Find the logical host-table slot for an IPv4 route. With must_exist
+ * the slot already holding this destination is located (for updates and
+ * invalidation); otherwise the first free slot in the two hash rows is
+ * returned. The scanned slot's own VALID bit decides, never the
+ * candidate route's.
+ */
+static int rtl931x_find_l3_slot(struct rtl83xx_route *rt, bool must_exist)
+{
+	struct rtl83xx_route route_entry;
+	int algorithm, addr, idx;
+	u32 hash;
+
+	/* Only IPv4 host entries are supported */
+	if (rt->attr.type != 0)
+		return -1;
+
+	for (int t = 0; t < 2; t++) {
+		algorithm = (sw_r32(RTL931X_L3_HOST_TBL_CTRL) >> (2 + t)) & 0x1;
+		hash = rtl931x_l3_hash4(0, rt->dst_ip, algorithm);
+
+		for (int s = 0; s < 6; s++) {
+			addr = (t << 13) | ((hash & 0x3ff) << 3) | s;
+			idx = ((addr / 8) * 6) + (addr % 8);
+
+			memset(&route_entry, 0, sizeof(route_entry));
+			rtl931x_host_route_read(idx, &route_entry);
+
+			if (!must_exist) {
+				if (!route_entry.attr.valid)
+					return idx;
+				continue;
+			}
+			if (route_entry.attr.valid &&
+			    route_entry.attr.type == rt->attr.type &&
+			    route_entry.dst_ip == rt->dst_ip)
+				return idx;
+		}
+	}
+
+	return -1;
+}
+
+/* Get the destination L2 index and the egress interface of a nexthop
+ * entry from the L3_NEXTHOP table. The Mango nexthop couples L3 to the
+ * L2 FDB: DMAC_IDX is the physical index of the L2 entry holding the
+ * destination MAC (the SDK's _dal_mango_l2_nexthop_add returns exactly
+ * this (hash row << 2) | bucket format, which the shared
+ * rtl83xx_l2_nexthop_add() also produces), the special values are
+ * 0xFFFC invalid/tunnel, 0xFFFD trap-to-master, 0xFFFE trap-to-CPU,
+ * 0xFFFF drop.
+ */
+static void rtl931x_get_l3_nexthop(int idx, u16 *dmac_id, u16 *interface)
+{
+	struct table_reg *r = rtl_table_get(RTL9310_TBL_2, 6);
+	u32 v;
+
+	rtl_table_read(r, idx);
+	v = sw_r32(rtl_table_data(r, 0));
+	rtl_table_release(r);
+
+	*dmac_id = (v >> 16) & 0xffff;
+	*interface = (v >> 6) & 0x3ff;
+}
+
+/* Set the destination L2 index and the egress interface of a nexthop
+ * entry in the L3_NEXTHOP table; see rtl931x_get_l3_nexthop().
+ */
+static void rtl931x_set_l3_nexthop(int idx, u16 dmac_id, u16 interface)
+{
+	struct table_reg *r = rtl_table_get(RTL9310_TBL_2, 6);
+
+	sw_w32(((u32)dmac_id << 16) | ((interface & 0x3ff) << 6),
+	       rtl_table_data(r, 0));
+	rtl_table_write(r, idx);
+	rtl_table_release(r);
+}
+
 static int rtl931x_l3_setup(struct rtl838x_switch_priv *priv)
 {
 	struct table_reg *r;
@@ -2973,6 +3170,10 @@ const struct rtl838x_reg rtl931x_reg = {
 	.set_l3_egress_intf = rtl931x_set_l3_egress_intf,
 	.get_l3_egress_mac = rtl931x_get_l3_egress_mac,
 	.set_l3_egress_mac = rtl931x_set_l3_egress_mac,
+	.host_route_write = rtl931x_host_route_write,
+	.find_l3_slot = rtl931x_find_l3_slot,
+	.set_l3_nexthop = rtl931x_set_l3_nexthop,
+	.get_l3_nexthop = rtl931x_get_l3_nexthop,
 #endif
 	.l2_learning_setup = rtl931x_l2_learning_setup,
 	.led_init = rtldsa_931x_led_init,
