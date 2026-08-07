@@ -946,6 +946,11 @@ typedef enum {
 #define RTL931X_L3_IPUC_ROUTE_CTRL		(0xF008)
 #define RTL931X_L3_INTF_IP_MTU(i)		(0xF1E0 + ((i) << 2))
 #define RTL931X_L3_INTF_IP6_MTU(i)		(0xF220 + ((i) << 2))
+#define RTL931X_L3_ENTRY_MV_CTRL		(0xF260)
+#define RTL931X_L3_ENTRY_MV_PARAM		(0xF264)
+#define RTL931X_L3_HW_LU_KEY_CTRL		(0xF29C)
+#define RTL931X_L3_HW_LU_KEY_DIP_CTRL		(0xF2B0)
+#define RTL931X_L3_HW_LU_CTRL			(0xF2C0)
 #define RTL931X_ALE_L3_MISC_CTRL		(0xF2E8)
 
 /* Port LED Control */

@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
 #include <asm/mach-rtl838x/mach-rtl83xx.h>
+#include <linux/delay.h>
 #include <linux/etherdevice.h>
+#include <linux/inetdevice.h>
 #include <linux/iopoll.h>
 #include <linux/sort.h>
 
@@ -2965,6 +2967,483 @@ static int rtl931x_find_l3_slot(struct rtl83xx_route *rt, bool must_exist)
 	return -1;
 }
 
+/* IPv4 prefix routes (L3_PREFIX_ROUTE_IPUC view, access set 2 type 4,
+ * ternary, 6 words per entry). The prefix TCAM returns the LOWEST
+ * matching address, so longest-prefix-first ordering is a software
+ * discipline: entries are kept sorted by descending prefix length and
+ * the hardware move engine shuffles the boundaries on every insert or
+ * delete. The algorithm and the bookkeeping are translated from the
+ * Mango SDK (__dal_mango_l3_routeEntry_alloc/_free, dal_mango_l3.c),
+ * not from Longan: Longan moves whole blocks per engine command and
+ * keeps different histogram arrays, Mango chains single-entry moves
+ * because a multi-entry move would straddle the 2 dead addresses of
+ * each 8-address TCAM block.
+ *
+ * Region layout (SDK dal_mango_l3.c, L3_ROUTE_TBL_* macros):
+ * - IPv4 grows UP from index 0, longest prefix at the lowest index,
+ *   the default route at the highest used v4 index.
+ * - IPv6 grows DOWN from the top in 3-entry strides (out of scope, not
+ *   programmed; the counters exist so the free-space accounting and the
+ *   region boundary are correct from the start). The v6 histogram
+ *   counts in the OPPOSITE direction to the v4 one:
+ *   ip_pflen[i] counts entries with prefix_len <= i, the SDK's v6
+ *   array entries_before_exclude_pfLen[i] counts prefix_len > i.
+ * - The very top entry is the static catch-all programmed at setup.
+ *
+ * The route pool is shared with OpenFlow (same physical TCAM, FMT != 0
+ * entries via the FT_L3_TCAM_0 view, SDK RTK_DEFAULT_L3_OPENFLOW_CUTLINE
+ * in rtk/default.h). The shipped default cutline assigns the whole pool
+ * to L3 routing; nothing here programs OpenFlow entries, and route
+ * entries set BMSK_FMT so the two uses can never match each other.
+ *
+ * The shared L3 code addresses prefix routes by their software route id
+ * (0..MAX_ROUTES-1), not by a table position: route_read/route_write
+ * receive the id, and route_lookup_hw must return something the other
+ * two accept, so it returns the id as well. The id-to-position mapping
+ * below decouples the shared first-free-id allocation from the sorted
+ * hardware order.
+ */
+#define RTL931X_L3_ROUTE_TBL_SIZE		12288
+/* dal_mango_l3_init: the RTL9311E variant clamps the table (SDK
+ * DAL_MANGO_L3_ROUTE_TBL_SIZE_FOR_RTL9311E). Only the accounting is
+ * clamped here; the variant is otherwise untested.
+ */
+#define RTL931X_L3_ROUTE_TBL_SIZE_9311E		768
+
+struct rtl931x_l3_prefix_tbl {
+	int size;		/* usable entries (9311E clamps) */
+	int ip_cnt;		/* v4 entries in use, region [0, ip_cnt) */
+	u16 ip_pflen[32];	/* ip_pflen[i] = v4 entries with prefix_len <= i */
+	int ip6_cnt;		/* v6 entries in use (unused, region reserved) */
+	u16 ip6_pflen[128];	/* v6 entries with prefix_len > i (unused) */
+	s16 id2pos[MAX_ROUTES];	/* shared route id -> table position, -1 = none */
+	s16 pos2id[RTL931X_L3_ROUTE_TBL_SIZE];	/* position -> id, -1 = none */
+};
+
+static struct rtl931x_l3_prefix_tbl rtl931x_ptbl;
+
+/* The SDK addresses route entries logically (0..size-1); the hardware
+ * row holds 8 addresses of which 6 are usable
+ * (DAL_MANGO_L3_ENTRY_IDX_TO_ADDR/_ADDR_TO_IDX, dal_mango_l3.h).
+ */
+static inline int rtl931x_l3_idx_to_addr(int idx)
+{
+	return ((idx / 6) * 8) + (idx % 6);
+}
+
+static inline int rtl931x_l3_addr_to_idx(int addr)
+{
+	return ((addr / 8) * 6) + (addr % 8);
+}
+
+/* Move len prefix-table entries from src to dst with the hardware move
+ * engine (SDK __dal_mango_l3_routeEntry_move). MANGO_L3_ENTRY_MV_CTRLr
+ * @0xF260: TO 29:16, FROM 15:2 (both PACKED TCAM addresses, not logical
+ * indices), CMD 1 (1 = move, 0 = clear), EXEC 0; MANGO_L3_ENTRY_MV_PARAMr
+ * @0xF264: LEN 13:0 as a plain entry count (swcore_rtl9310.h). For an
+ * upward move (src < dst) FROM/TO name the END of each block so the
+ * engine copies the tail first and the overlap cannot clobber. The SDK
+ * polls EXEC 512 times before and after; a pre-move timeout is a hard
+ * failure there, and so is a post-move timeout here: the table contents
+ * are unknown afterwards and only the log records it.
+ */
+static int rtl931x_l3_route_move(int dst, int src, int len)
+{
+	u32 from, to;
+	int i;
+
+	if (src > dst) {
+		from = rtl931x_l3_idx_to_addr(src);
+		to = rtl931x_l3_idx_to_addr(dst);
+	} else {
+		from = rtl931x_l3_idx_to_addr(src + len - 1);
+		to = rtl931x_l3_idx_to_addr(dst + len - 1);
+	}
+
+	for (i = 0; i < 512; i++) {
+		if (!(sw_r32(RTL931X_L3_ENTRY_MV_CTRL) & BIT(0)))
+			break;
+	}
+	if (i == 512) {
+		pr_err("%s: move engine busy, move %d->%d len %d refused\n",
+		       __func__, src, dst, len);
+		return -EBUSY;
+	}
+
+	sw_w32_mask(0x3fff, len, RTL931X_L3_ENTRY_MV_PARAM);
+	sw_w32((to << 16) | (from << 2) | BIT(1) | BIT(0),
+	       RTL931X_L3_ENTRY_MV_CTRL);
+
+	for (i = 0; i < 512; i++) {
+		if (!(sw_r32(RTL931X_L3_ENTRY_MV_CTRL) & BIT(0)))
+			return 0;
+	}
+	pr_err("%s: move %d->%d len %d timed out, prefix table state unknown\n",
+	       __func__, src, dst, len);
+	return -ETIMEDOUT;
+}
+
+/* Clear len prefix-table entries starting at base (SDK
+ * __dal_mango_l3_routeEntry_clear): same engine, CMD = 0, only FROM.
+ */
+static int rtl931x_l3_route_clear(int base, int len)
+{
+	int i;
+
+	for (i = 0; i < 512; i++) {
+		if (!(sw_r32(RTL931X_L3_ENTRY_MV_CTRL) & BIT(0)))
+			break;
+	}
+	if (i == 512) {
+		pr_err("%s: move engine busy, clear %d len %d refused\n",
+		       __func__, base, len);
+		return -EBUSY;
+	}
+
+	sw_w32_mask(0x3fff, len, RTL931X_L3_ENTRY_MV_PARAM);
+	sw_w32((rtl931x_l3_idx_to_addr(base) << 2) | BIT(0),
+	       RTL931X_L3_ENTRY_MV_CTRL);
+
+	for (i = 0; i < 512; i++) {
+		if (!(sw_r32(RTL931X_L3_ENTRY_MV_CTRL) & BIT(0)))
+			return 0;
+	}
+	pr_err("%s: clear %d len %d timed out, prefix table state unknown\n",
+	       __func__, base, len);
+	return -ETIMEDOUT;
+}
+
+/* Read and decode the prefix-route entry at table position pos. An
+ * invalid entry sets only attr.valid and leaves the rest of the route
+ * untouched: the shared code reuses the caller's dst_ip/prefix_len when
+ * reprogramming (same contract as rtl930x_route_read()).
+ */
+static void rtl931x_prefix_entry_read(int pos, struct rtl83xx_route *rt)
+{
+	struct table_reg *r = rtl_table_get(RTL9310_TBL_2, 4);
+	bool host_route, default_route;
+	u32 v, w;
+
+	rtl_table_read(r, rtl931x_l3_idx_to_addr(pos));
+
+	/* L3_PREFIX_ROUTE_IPUC entry, 192 bits (MANGO_L3_PREFIX_ROUTE_IPUCt,
+	 * rtk_mango_tableField_list.c):
+	 * word 0: VALID 31, FMT 30, ENTRY_TYPE 29:28, VRF_ID 27:20,
+	 *         IP[31:12] 19:0
+	 * word 1: IP[11:0] 31:20, BMSK_FMT 10, BMSK_ENTRY_TYPE 9:8,
+	 *         BMSK_VRF_ID 7:0
+	 * word 2: BMSK_IP 31:0
+	 * word 3: HOST_ROUTE 22, DFLT_ROUTE 21, DST_NULL_INTF 20,
+	 *         ACT 19:17, ECMP_EN 16, NH_ECMP_IDX 15:3, TTL_DEC 2,
+	 *         TTL_CHK 1, QOS_EN 0
+	 * word 4: QOS_PRI 31:29
+	 * word 5: HIT 27
+	 */
+	v = sw_r32(rtl_table_data(r, 0));
+	rt->attr.valid = !!(v & BIT(31));
+	if (!rt->attr.valid)
+		goto out;
+	rt->attr.type = (v >> 28) & 0x3;
+	if (rt->attr.type != 0) { /* Only IPv4 unicast routes */
+		pr_warn("%s: route type %d not supported\n", __func__, rt->attr.type);
+		goto out;
+	}
+	w = sw_r32(rtl_table_data(r, 1));
+	rt->dst_ip = ((v & 0xfffff) << 12) | (w >> 20);
+
+	v = sw_r32(rtl_table_data(r, 3));
+	host_route = !!(v & BIT(22));
+	default_route = !!(v & BIT(21));
+	rt->prefix_len = host_route ? 32 : -1;
+	if (rt->prefix_len < 0 && default_route)
+		rt->prefix_len = 0;
+	if (rt->prefix_len < 0)
+		rt->prefix_len = inet_mask_len(sw_r32(rtl_table_data(r, 2)));
+
+	rt->attr.dst_null = !!(v & BIT(20));
+	rt->attr.action = (v >> 17) & 0x7;
+	rt->nh.id = (v >> 3) & 0x1fff;
+	rt->attr.ttl_dec = !!(v & BIT(2));
+	rt->attr.ttl_check = !!(v & BIT(1));
+	rt->attr.qos_as = !!(v & BIT(0));
+	rt->attr.qos_prio = (sw_r32(rtl_table_data(r, 4)) >> 29) & 0x7;
+	rt->attr.hit = !!(sw_r32(rtl_table_data(r, 5)) & BIT(27));
+
+out:
+	rtl_table_release(r);
+}
+
+/* Encode and write a valid prefix-route entry at table position pos;
+ * see rtl931x_prefix_entry_read() for the layout. The key fields follow
+ * the SDK (l3_util_rtkRoute2routeEntry): FMT = 0 with BMSK_FMT = 1 (an
+ * OpenFlow entry never matches as a route), ENTRY_TYPE and VRF_ID fully
+ * cared, BMSK_IP the prefix mask.
+ */
+static void rtl931x_prefix_entry_write(int pos, struct rtl83xx_route *rt)
+{
+	struct table_reg *r = rtl_table_get(RTL9310_TBL_2, 4);
+	u32 v;
+
+	sw_w32(BIT(31) | ((rt->dst_ip >> 12) & 0xfffff), rtl_table_data(r, 0));
+	sw_w32(((rt->dst_ip & 0xfff) << 20) | BIT(10) | (0x3 << 8) | 0xff,
+	       rtl_table_data(r, 1));
+	sw_w32(inet_make_mask(rt->prefix_len), rtl_table_data(r, 2));
+
+	v = rt->prefix_len >= 32 ? BIT(22) : 0;		/* HOST_ROUTE */
+	v |= rt->prefix_len == 0 ? BIT(21) : 0;		/* DFLT_ROUTE */
+	v |= rt->attr.dst_null ? BIT(20) : 0;
+	v |= (rt->attr.action & 0x7) << 17;
+	v |= (rt->nh.id & 0x1fff) << 3;			/* ECMP_EN stays 0 */
+	v |= rt->attr.ttl_dec ? BIT(2) : 0;
+	v |= rt->attr.ttl_check ? BIT(1) : 0;
+	v |= rt->attr.qos_as ? BIT(0) : 0;
+	sw_w32(v, rtl_table_data(r, 3));
+
+	sw_w32((rt->attr.qos_prio & 0x7) << 29, rtl_table_data(r, 4));
+	sw_w32(rt->attr.hit ? BIT(27) : 0, rtl_table_data(r, 5));
+
+	rtl_table_write(r, rtl931x_l3_idx_to_addr(pos));
+	rtl_table_release(r);
+}
+
+/* Insert a route into the sorted v4 region
+ * (SDK __dal_mango_l3_routeEntry_alloc, IPv4 half): the entries shorter
+ * than the new prefix are shifted one position up, one boundary entry
+ * per move-engine command, opening a slot behind the last entry of
+ * equal-or-longer prefix. /0 appends at the bottom directly. On any
+ * failure the route is simply not programmed and keeps working in
+ * software via the catch-all trap.
+ */
+static void rtl931x_prefix_route_insert(int id, struct rtl83xx_route *rt)
+{
+	struct rtl931x_l3_prefix_tbl *t = &rtl931x_ptbl;
+	int dst, src, pos;
+
+	/* The top entry is the catch-all, the (future) v6 region grows
+	 * downward below it: v4 may use [0, size - 1 - 3 * ip6_cnt).
+	 */
+	if (t->ip_cnt + 1 > t->size - 1 - 3 * t->ip6_cnt) {
+		pr_err("%s: prefix table full, route to %pI4/%d stays in software\n",
+		       __func__, &rt->dst_ip, rt->prefix_len);
+		return;
+	}
+
+	dst = t->ip_cnt;
+	if (rt->prefix_len > 0) {
+		for (int pfl = 0; pfl < rt->prefix_len; pfl++) {
+			int mid;
+
+			src = t->ip_cnt - t->ip_pflen[pfl];
+			if (src == dst)
+				continue;
+			if (rtl931x_l3_route_move(dst, src, 1))
+				return;
+			mid = t->pos2id[src];
+			t->pos2id[dst] = mid;
+			if (mid >= 0)
+				t->id2pos[mid] = dst;
+			dst = src;
+		}
+	}
+	pos = dst;
+
+	rtl931x_prefix_entry_write(pos, rt);
+
+	for (int i = rt->prefix_len; i < 32; i++)
+		t->ip_pflen[i]++;
+	t->ip_cnt++;
+	t->pos2id[pos] = id;
+	t->id2pos[id] = pos;
+}
+
+/* Remove the route id from the sorted v4 region (SDK
+ * __dal_mango_l3_routeEntry_free, IPv4 half): the boundary entries are
+ * moved down one position each to close the gap, the vacated bottom
+ * entry is invalidated with the move engine in clear mode, and the
+ * bookkeeping is decremented afterwards (the moves above rely on the
+ * pre-delete histogram). The prefix length is read back from the
+ * hardware entry, as the SDK does, so a caller-side mistake cannot skew
+ * the histogram.
+ */
+static void rtl931x_prefix_route_remove(int id)
+{
+	struct rtl931x_l3_prefix_tbl *t = &rtl931x_ptbl;
+	struct rtl83xx_route cur;
+	int plen, bottom, dst, src;
+	int pos = t->id2pos[id];
+
+	if (pos < 0)
+		return;	/* never programmed (e.g. gateway never resolved) */
+
+	memset(&cur, 0, sizeof(cur));
+	rtl931x_prefix_entry_read(pos, &cur);
+	if (!cur.attr.valid) {
+		pr_warn("%s: id %d maps to invalid entry %d, bookkeeping lost\n",
+			__func__, id, pos);
+		t->pos2id[pos] = -1;
+		t->id2pos[id] = -1;
+		return;
+	}
+	plen = cur.prefix_len;
+	bottom = t->ip_cnt - 1;
+
+	if (pos < bottom) {
+		dst = pos;
+		for (int pfl = plen; pfl > 0; pfl--) {
+			int mid;
+
+			src = t->ip_cnt - t->ip_pflen[pfl - 1] - 1;
+			if (src == dst)
+				continue;
+			if (rtl931x_l3_route_move(dst, src, 1))
+				return;
+			mid = t->pos2id[src];
+			t->pos2id[dst] = mid;
+			if (mid >= 0)
+				t->id2pos[mid] = dst;
+			dst = src;
+		}
+		if (dst != bottom) {
+			int mid;
+
+			if (rtl931x_l3_route_move(dst, bottom, 1))
+				return;
+			mid = t->pos2id[bottom];
+			t->pos2id[dst] = mid;
+			if (mid >= 0)
+				t->id2pos[mid] = dst;
+		}
+	}
+
+	/* Invalidate the vacated bottom entry. If the clear fails the
+	 * entry survives as a stale duplicate of the moved-down one (the
+	 * lower copy wins every lookup), so the bookkeeping is completed
+	 * regardless: a live id must never keep pointing at another
+	 * route's entry.
+	 */
+	rtl931x_l3_route_clear(bottom, 1);
+
+	for (int i = plen; i < 32; i++)
+		t->ip_pflen[i]--;
+	t->ip_cnt--;
+	t->pos2id[bottom] = -1;
+	t->id2pos[id] = -1;
+}
+
+/* Read a prefix route by its software route id; see the region comment
+ * above for the id/position split.
+ */
+static void rtl931x_route_read(int id, struct rtl83xx_route *rt)
+{
+	int pos;
+
+	if (id < 0 || id >= MAX_ROUTES) {
+		pr_warn("%s: route id %d out of range\n", __func__, id);
+		rt->attr.valid = false;
+		return;
+	}
+
+	pos = rtl931x_ptbl.id2pos[id];
+	if (pos < 0) {
+		rt->attr.valid = false;
+		return;
+	}
+
+	rtl931x_prefix_entry_read(pos, rt);
+}
+
+/* Write a prefix route by its software route id. A valid route updates
+ * its entry in place when already programmed (the shared code rewrites
+ * the action/nexthop once the gateway neighbour resolves) and inserts
+ * into the sorted region otherwise; an invalid one is removed.
+ */
+static void rtl931x_route_write(int id, struct rtl83xx_route *rt)
+{
+	int pos;
+
+	if (rt->attr.type != 0) {
+		/* Only IPv4 unicast prefix routes are offloaded; anything
+		 * else keeps working in software via the catch-all trap.
+		 * Ratelimited: the shared code retries this on every v6
+		 * neighbour event.
+		 */
+		pr_warn_ratelimited("%s: route type %d not supported, stays in software\n",
+				    __func__, rt->attr.type);
+		return;
+	}
+
+	if (id < 0 || id >= MAX_ROUTES) {
+		pr_warn("%s: route id %d out of range\n", __func__, id);
+		return;
+	}
+
+	if (!rt->attr.valid) {
+		rtl931x_prefix_route_remove(id);
+		return;
+	}
+
+	if (rt->prefix_len < 0 || rt->prefix_len > 32) {
+		pr_warn("%s: prefix_len %d out of range\n", __func__, rt->prefix_len);
+		return;
+	}
+
+	pos = rtl931x_ptbl.id2pos[id];
+	if (pos >= 0) {
+		rtl931x_prefix_entry_write(pos, rt);
+		return;
+	}
+
+	rtl931x_prefix_route_insert(id, rt);
+}
+
+/* Hardware longest-prefix-match lookup of a prefix route (SDK
+ * __dal_mango_l3_routeEntry_hwLookup, MANGO_L3_ROUTE_HW_LU): the key is
+ * {VRF 0, ENTRY_TYPE IPUC, DIP = masked destination}, all other key
+ * fields 0. MANGO_L3_HW_LU_KEY_CTRLr @0xF29C, MANGO_L3_HW_LU_KEY_DIP_CTRLr
+ * @0xF2B0 (IPv4 in the low word), MANGO_L3_HW_LU_CTRLr @0xF2C0:
+ * EXEC_TCAM 15, RESULT_TCAM 14, ENTRY_IDX_TCAM 13:0 - the result is a
+ * packed TCAM address. Being an LPM, a route that was never programmed
+ * resolves to its covering entry (e.g. the catch-all); the catch-all is
+ * not driver-owned, so it maps to -1 and can never be invalidated
+ * through this path. Returns the software route id of the hit.
+ */
+static int rtl931x_route_lookup_hw(struct rtl83xx_route *rt)
+{
+	u32 v;
+	int i, pos;
+
+	if (rt->attr.type != 0)	/* Only IPv4 unicast routes */
+		return -1;
+
+	/* Key fields VID_INTF_ID 11:0, MC_KEY_SEL 12, VRF 20:13, IPMC_TYPE
+	 * 21, ENTRY_TYPE 23:22 and ROUND 24 all go to 0 (unicast, VRF 0);
+	 * TEST_MODE (25) and above keep their values.
+	 */
+	sw_w32_mask(0x1ffffff, 0, RTL931X_L3_HW_LU_KEY_CTRL);
+	sw_w32(rt->dst_ip & inet_make_mask(rt->prefix_len),
+	       RTL931X_L3_HW_LU_KEY_DIP_CTRL);
+
+	sw_w32_mask(BIT(15), BIT(15), RTL931X_L3_HW_LU_CTRL);
+	for (i = 0; i < 512; i++) {
+		udelay(1);
+		v = sw_r32(RTL931X_L3_HW_LU_CTRL);
+		if (!(v & BIT(15)))
+			break;
+	}
+	if (i == 512) {
+		pr_err("%s: lookup timed out\n", __func__);
+		return -1;
+	}
+	if (!(v & BIT(14)))
+		return -1;
+
+	pos = rtl931x_l3_addr_to_idx(v & 0x3fff);
+	if (pos >= rtl931x_ptbl.size)
+		return -1;
+
+	return rtl931x_ptbl.pos2id[pos];
+}
+
 /* Get the destination L2 index and the egress interface of a nexthop
  * entry from the L3_NEXTHOP table. The Mango nexthop couples L3 to the
  * L2 FDB: DMAC_IDX is the physical index of the L2 entry holding the
@@ -3003,6 +3482,22 @@ static void rtl931x_set_l3_nexthop(int idx, u16 dmac_id, u16 interface)
 static int rtl931x_l3_setup(struct rtl838x_switch_priv *priv)
 {
 	struct table_reg *r;
+
+	/* Prefix-route bookkeeping: empty sorted regions, no id mappings.
+	 * The RTL9311E clamps the table to 768 entries (dal_mango_l3_init,
+	 * DAL_MANGO_L3_ROUTE_TBL_SIZE_FOR_RTL9311E); the RTL_ID field of
+	 * MODEL_NAME_INFO (@0x4, bits 31:16) identifies the chip
+	 * (include/hal/chipdef/chip.h: 0x9311 = 9311E, 0x9313 = 9313).
+	 */
+	memset(&rtl931x_ptbl, 0, sizeof(rtl931x_ptbl));
+	memset(rtl931x_ptbl.id2pos, 0xff, sizeof(rtl931x_ptbl.id2pos));
+	memset(rtl931x_ptbl.pos2id, 0xff, sizeof(rtl931x_ptbl.pos2id));
+	rtl931x_ptbl.size = RTL931X_L3_ROUTE_TBL_SIZE;
+	if ((sw_r32(RTL93XX_MODEL_NAME_INFO) >> 16) == 0x9311) {
+		rtl931x_ptbl.size = RTL931X_L3_ROUTE_TBL_SIZE_9311E;
+		pr_info("RTL9311E: prefix route table clamped to %d entries\n",
+			rtl931x_ptbl.size);
+	}
 
 	for (int i = 0; i < MAX_INTF_MTUS; i++)
 		priv->intf_mtu_count[i] = priv->intf_mtus[i] = 0;
@@ -3172,6 +3667,9 @@ const struct rtl838x_reg rtl931x_reg = {
 	.set_l3_egress_mac = rtl931x_set_l3_egress_mac,
 	.host_route_write = rtl931x_host_route_write,
 	.find_l3_slot = rtl931x_find_l3_slot,
+	.route_read = rtl931x_route_read,
+	.route_write = rtl931x_route_write,
+	.route_lookup_hw = rtl931x_route_lookup_hw,
 	.set_l3_nexthop = rtl931x_set_l3_nexthop,
 	.get_l3_nexthop = rtl931x_get_l3_nexthop,
 #endif
