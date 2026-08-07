@@ -349,6 +349,30 @@
 #define RTL931X_MIR_DPM_CTRL			(0xAF30)
 #define RTL931X_MIR_SPM_CTRL			(0xAF10)
 
+/* Port-based packet sampling (sFlow) on RTL931x: identical field layout to
+ * RTL930x (one 32-bit register per port, ingress rate in the low half,
+ * egress rate in the high half; a rate of N samples one in N packets, 0
+ * disables, no separate enable bit), at different addresses, ports 0-55
+ * (SDK swcore_rtl9310.h RTL9310_SFLOW_CTRL_ADDR /
+ * RTL9310_SFLOW_PORT_RATE_CTRL_ADDR, fields SMPL_SEL/CPU_SEL/IGR_RATE/
+ * EGR_RATE at the same bit positions as RTL930X_SFLOW_*;
+ * dal_mango_mirror_sflowPort{Igr,Egr}SampleRate_set).
+ *
+ * Port-based sampling consumes NONE of the 4 mirror sessions on this
+ * family: the DAL setters touch only these two registers, sample copies
+ * reach the CPU marked with the dedicated SFLOW field of the CPU tag (not
+ * MIR_HIT, SDK nic_rtl9310.h), and their CPU queue comes from a flag-based
+ * mapping (QM_FLAG2CPUQID_CTRL_2.SFLOW). The TRAP_Q_SFLOW rejection in
+ * dal_mango_trap.c means only that sFlow is not a trap *reason* and
+ * therefore cannot be remapped to a CPU queue through the reason-based
+ * trap API - it is not a mirror session. What does consume a mirror
+ * session is the separate mirror-based sFlow feature
+ * (MIR_SAMPLE_RATE_CTRL, sampling of already-mirrored traffic), which this
+ * driver does not use.
+ */
+#define RTL931X_SFLOW_CTRL			(0x8400)
+#define RTL931X_SFLOW_PORT_RATE_CTRL(p)		(0x8404 + (((p) << 2)))
+
 /* Storm/rate control and scheduling */
 #define RTL838X_STORM_CTRL			(0x4700)
 #define RTL839X_STORM_CTRL			(0x1800)

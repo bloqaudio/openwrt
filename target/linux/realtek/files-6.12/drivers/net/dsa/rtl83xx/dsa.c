@@ -3339,8 +3339,10 @@ static int rtldsa_port_sample_add(struct dsa_switch *ds, int port,
 	struct psample_group *group = sample->psample_group;
 	struct rtldsa_sample *s;
 	u32 mask, val;
+	u32 sflow_ctrl, rate_ctrl;
 
-	if (priv->family_id != RTL9300_FAMILY_ID) {
+	if (priv->family_id != RTL9300_FAMILY_ID &&
+	    priv->family_id != RTL9310_FAMILY_ID) {
 		NL_SET_ERR_MSG_MOD(extack,
 				   "Sampling offload not supported on this chip");
 		return -EOPNOTSUPP;
@@ -3352,15 +3354,19 @@ static int rtldsa_port_sample_add(struct dsa_switch *ds, int port,
 		return -EINVAL;
 	}
 
-	/* Egress sampling is declined: the egress rate field programs
-	 * cleanly per the vendor reference but the silicon delivers no
-	 * egress sample copies to the CPU in any tested configuration
-	 * (switched and CPU-originated traffic, either SMPL_SEL value),
-	 * so accepting it would configure a sampler that never samples.
+	/* Egress sampling is declined on both supported families: on RTL930x
+	 * the egress rate field programs cleanly per the vendor reference but
+	 * the silicon delivers no egress sample copies to the CPU in any
+	 * tested configuration (switched and CPU-originated traffic, either
+	 * SMPL_SEL value), so accepting it would configure a sampler that
+	 * never samples. On RTL931x the field exists (SDK
+	 * swcore_rtl9310.h SFLOW_PORT_RATE_CTRL.EGR_RATE) but no hardware
+	 * test has proven that egress copies are delivered, so it stays
+	 * declined until proven otherwise.
 	 */
 	if (!sample->ingress) {
 		NL_SET_ERR_MSG_MOD(extack,
-				   "Only ingress sampling is functional on this switch");
+				   "Only ingress sampling is supported on this switch");
 		return -EOPNOTSUPP;
 	}
 
@@ -3368,14 +3374,23 @@ static int rtldsa_port_sample_add(struct dsa_switch *ds, int port,
 	mask = RTL930X_SFLOW_IGR_RATE_MASK;
 	val = sample->rate;
 
+	if (priv->family_id == RTL9310_FAMILY_ID) {
+		sflow_ctrl = RTL931X_SFLOW_CTRL;
+		rate_ctrl = RTL931X_SFLOW_PORT_RATE_CTRL(port);
+	} else {
+		sflow_ctrl = RTL930X_SFLOW_CTRL;
+		rate_ctrl = RTL930X_SFLOW_PORT_RATE_CTRL(port);
+	}
+
 	mutex_lock(&priv->reg_mutex);
 
 	/* Sample copies go to the local CPU; when a packet is both
 	 * ingress- and egress-sampled, keep the ingress copy.
+	 * SMPL_SEL/CPU_SEL sit at the same bit positions on both families.
 	 */
 	sw_w32_mask(RTL930X_SFLOW_CTRL_SMPL_SEL | RTL930X_SFLOW_CTRL_CPU_SEL,
-		    0, RTL930X_SFLOW_CTRL);
-	sw_w32_mask(mask, val, RTL930X_SFLOW_PORT_RATE_CTRL(port));
+		    0, sflow_ctrl);
+	sw_w32_mask(mask, val, rate_ctrl);
 
 	/* Ref the new group before dropping the old one: both pointers may
 	 * be identical on filter replace.
@@ -3398,14 +3413,19 @@ static void rtldsa_port_sample_del(struct dsa_switch *ds, int port,
 	struct rtl838x_switch_priv *priv = ds->priv;
 	struct rtldsa_sample *s = &priv->ports[port].sample[sample->ingress ? 0 : 1];
 	struct psample_group *group;
+	u32 rate_ctrl;
 
-	if (priv->family_id != RTL9300_FAMILY_ID)
+	if (priv->family_id != RTL9300_FAMILY_ID &&
+	    priv->family_id != RTL9310_FAMILY_ID)
 		return;
+
+	rate_ctrl = priv->family_id == RTL9310_FAMILY_ID ?
+		    RTL931X_SFLOW_PORT_RATE_CTRL(port) :
+		    RTL930X_SFLOW_PORT_RATE_CTRL(port);
 
 	mutex_lock(&priv->reg_mutex);
 	sw_w32_mask(sample->ingress ? RTL930X_SFLOW_IGR_RATE_MASK :
-		    RTL930X_SFLOW_EGR_RATE_MASK, 0,
-		    RTL930X_SFLOW_PORT_RATE_CTRL(port));
+		    RTL930X_SFLOW_EGR_RATE_MASK, 0, rate_ctrl);
 	group = s->group;
 	WRITE_ONCE(s->group, NULL);
 	s->rate = 0;

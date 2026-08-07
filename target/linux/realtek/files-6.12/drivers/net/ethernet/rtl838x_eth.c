@@ -335,13 +335,21 @@ static bool rtl930x_decode_tag(struct p_hdr *h, struct dsa_tag *t)
 static bool rtl931x_decode_tag(struct p_hdr *h, struct dsa_tag *t)
 {
 	t->reason = h->cpu_tag[7] & 0x3f;
-	t->sflow = 0;
+	/* sFlow field: 2 bits after the 4 mirror-hit bits of the tag's
+	 * B8-B9 word (MSB first), i.e. cpu_tag[4] bits 11:10; 0 = no
+	 * sample, 1 = ingress sample, 2 = egress sample (SDK
+	 * nic_rtl9310.h, struct nic_9310_cpuTag_s.rx: MIR_HIT:4 then
+	 * SFLOW:2, values NIC_9310_SFLOW_RX/TX). Same position and
+	 * encoding as on RTL930x.
+	 */
+	t->sflow = (h->cpu_tag[4] >> 10) & 0x3;
 	t->queue =  (h->cpu_tag[2] >> 11) & 0x1f;
 	t->port = (h->cpu_tag[0] >> 8) & 0x3f;
 	t->crc_error = h->cpu_tag[1] & BIT(6);
 
 	if (t->reason != 63)
-		pr_debug("%s: Reason %d, port %d, queue %d\n", __func__, t->reason, t->port, t->queue);
+		pr_debug("%s: Reason %d, port %d, queue %d, sflow %d\n",
+			 __func__, t->reason, t->port, t->queue, t->sflow);
 	if (t->reason >= 19 && t->reason <= 27)	/* NIC_RX_REASON_RMA */
 		t->l2_offloaded = 0;
 	else
