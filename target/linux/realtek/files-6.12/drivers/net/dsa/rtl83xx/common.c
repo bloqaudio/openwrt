@@ -473,8 +473,8 @@ int rtl83xx_lag_add(struct dsa_switch *ds, int group, int port, struct netdev_la
 	priv->lags_port_members[group] |= BIT_ULL(port);
 
 	/* SoCs with a separate source-port map and egress candidate list
-	 * (RTL930x) need those programmed as well - the member mask alone
-	 * only covers learning/filtering, not TX hashing.
+	 * (RTL930x, RTL931x) need those programmed as well - the member mask
+	 * alone only covers learning/filtering, not TX hashing.
 	 */
 	if (priv->r->trunk_srcmap_set)
 		priv->r->trunk_srcmap_set(port, true, group);

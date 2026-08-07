@@ -510,8 +510,16 @@ enum rtldsa_storm_class {
 #define RTL930X_TRK_LOCAL_TBL			(0x9F94)
 #define RTL930X_STK_GLB_CTRL			(0xA498)
 
-#define RTL931X_TRK_MBR_CTRL			(0xB8D0)
-#define RTL931X_TRK_HASH_CTRL			(0xBA70)
+/* RTL9310 trunk registers, per swcore_rtl9310.h */
+#define RTL931X_TRK_MBR_CTRL			(0xB8D0)	/* TRK_MBR_CTRL, indexed by local slot, 2 words each */
+#define RTL931X_TRK_HASH_CTRL			(0xBA70)	/* TRK_HASH_CTRL, 2 hash mask sets */
+#define RTL931X_TRK_CTRL			(0xBA78)	/* TRK_CTRL */
+#define RTL931X_TRK_SHFT_CTRL			(0xBA7C)	/* TRK_SHFT_CTRL */
+#define RTL931X_TRK_LOCAL_TBL_REFRESH		(0xBA80)	/* TRK_LOCAL_TBL_REFRESH */
+#define RTL931X_TRK_ID_CTRL			(0xB800)	/* TRK_ID_CTRL, indexed by local slot 0-51 */
+#define RTL931X_LOCAL_PORT_TRK_MAP		(0x4CAC)	/* LOCAL_PORT_TRK_MAP, per port */
+#define RTL931X_L2_LRN_TRK_CONSTRT_CTRL		(0xCB34)	/* L2_LRN_TRK_CONSTRT_CTRL, per trunk gid */
+#define RTL931X_STK_GBL_CTRL			(0x1448)	/* STK_GBL_CTRL, MY_DEV_ID at bits 4-7 */
 
 /* Attack prevention */
 #define RTL838X_ATK_PRVNT_PORT_EN		(0x5B00)
@@ -1511,8 +1519,8 @@ struct rtl838x_reg {
 	void (*write_cam)(int idx, struct rtl838x_l2_entry *e);
 	int (*trk_mbr_ctr)(int group);
 	/* Optional extra trunk programming beyond the member mask: the
-	 * RTL930x additionally needs the per-source-port trunk mapping and
-	 * the egress candidate list the TX hash indexes into.
+	 * RTL930x/RTL931x additionally need the per-source-port trunk mapping
+	 * and the egress candidate list the TX hash indexes into.
 	 */
 	void (*trunk_srcmap_set)(int port, bool valid, int group);
 	void (*trunk_egr_ports_set)(int group, u64 members);

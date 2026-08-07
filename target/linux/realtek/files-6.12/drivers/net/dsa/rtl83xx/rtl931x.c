@@ -2,6 +2,7 @@
 
 #include <asm/mach-rtl838x/mach-rtl83xx.h>
 #include <linux/etherdevice.h>
+#include <linux/iopoll.h>
 
 #include "rtl83xx.h"
 
@@ -176,7 +177,12 @@ static void rtl931x_stp_set(struct rtl838x_switch_priv *priv, u16 msti, u32 port
 
 static inline int rtldsa_931x_trk_mbr_ctr(int group)
 {
-	return RTL931X_TRK_MBR_CTRL + (group << 3);
+	/* DSA LAG ids are 1-based; hardware trunks start at 0. Map them so
+	 * the first bond uses hardware trunk 0, the path every vendor
+	 * implementation exercises. TRK_MBR_CTRL is indexed by the local
+	 * trunk slot; we use the identity mapping slot == trunk id.
+	 */
+	return RTL931X_TRK_MBR_CTRL + ((group - 1) << 3);
 }
 
 static void rtl931x_vlan_tables_read(u32 vlan, struct rtl838x_vlan_info *info)
@@ -1736,44 +1742,202 @@ static void rtl931x_set_egr_filter(int port,  enum egr_filter state)
 		    RTL931X_VLAN_PORT_EGR_FLTR + (((port >> 5) << 2)));
 }
 
+/* Which of the two TRK_HASH_CTRL mask sets each trunk is bound to, by
+ * hardware trunk id. Programmed by rtl931x_set_distribution_algorithm()
+ * and written into the LAG table entry (L2/IP4/IP6_HASH_MSK_IDX fields)
+ * by rtl931x_trunk_egr_ports_set(), mirroring the SDK's
+ * dal_mango_trunk_distributionAlgorithmTypeBind_set().
+ */
+static u8 rtl931x_trk_hash_idx[MAX_LAGS];
+
 static void rtl931x_set_distribution_algorithm(int group, int algoidx, u32 algomsk)
 {
-	u32 l3shift = 0;
-	u32 newmask = 0;
+	u32 l2msk = 0, l3msk = 0;
 
-	/* TODO: for now we set algoidx to 0 */
-	algoidx = 0;
+	/* The L2 mask (bits 3-0) hashes bridged/non-IP frames, the L3 mask
+	 * (bits 13-4) IP frames (RTL9310_TRK_HASH_CTRL L2_HASH_MSK/L3_HASH_MSK
+	 * in swcore_rtl9310.h). Both must be populated: an empty L2 mask
+	 * hashes every bridged frame identically and the trunk degenerates
+	 * to a single member.
+	 */
+	if (algomsk & TRUNK_DISTRIBUTION_ALGO_SMAC_BIT) {
+		l2msk |= TRUNK_DISTRIBUTION_ALGO_L2_SMAC_BIT;
+		l3msk |= TRUNK_DISTRIBUTION_ALGO_L3_SMAC_BIT;
+	}
+	if (algomsk & TRUNK_DISTRIBUTION_ALGO_DMAC_BIT) {
+		l2msk |= TRUNK_DISTRIBUTION_ALGO_L2_DMAC_BIT;
+		l3msk |= TRUNK_DISTRIBUTION_ALGO_L3_DMAC_BIT;
+	}
+	if (algomsk & TRUNK_DISTRIBUTION_ALGO_SIP_BIT)
+		l3msk |= TRUNK_DISTRIBUTION_ALGO_L3_SIP_BIT;
+	if (algomsk & TRUNK_DISTRIBUTION_ALGO_DIP_BIT)
+		l3msk |= TRUNK_DISTRIBUTION_ALGO_L3_DIP_BIT;
+	if (algomsk & TRUNK_DISTRIBUTION_ALGO_SRC_L4PORT_BIT)
+		l3msk |= TRUNK_DISTRIBUTION_ALGO_L3_SRC_L4PORT_BIT;
+	if (algomsk & TRUNK_DISTRIBUTION_ALGO_DST_L4PORT_BIT)
+		l3msk |= TRUNK_DISTRIBUTION_ALGO_L3_DST_L4PORT_BIT;
 
-	if (algomsk & TRUNK_DISTRIBUTION_ALGO_SIP_BIT) {
-		l3shift = 4;
-		newmask |= TRUNK_DISTRIBUTION_ALGO_L3_SIP_BIT;
-	}
-	if (algomsk & TRUNK_DISTRIBUTION_ALGO_DIP_BIT) {
-		l3shift = 4;
-		newmask |= TRUNK_DISTRIBUTION_ALGO_L3_DIP_BIT;
-	}
-	if (algomsk & TRUNK_DISTRIBUTION_ALGO_SRC_L4PORT_BIT) {
-		l3shift = 4;
-		newmask |= TRUNK_DISTRIBUTION_ALGO_L3_SRC_L4PORT_BIT;
-	}
-	if (algomsk & TRUNK_DISTRIBUTION_ALGO_SRC_L4PORT_BIT) {
-		l3shift = 4;
-		newmask |= TRUNK_DISTRIBUTION_ALGO_L3_SRC_L4PORT_BIT;
-	}
+	/* Mango has only two hash mask sets (RTL9310_TRK_HASH_CTRL index
+	 * 0-1), while the DSA layer asks for 0 (L2) / 1 (L23) / 2 (L34) -
+	 * fold L34 onto set 1, there is no third set to hold it.
+	 */
+	algoidx = min(algoidx, 1);
 
-	if (l3shift == 4) {
-		if (algomsk & TRUNK_DISTRIBUTION_ALGO_SMAC_BIT)
-			newmask |= TRUNK_DISTRIBUTION_ALGO_L3_SMAC_BIT;
-		if (algomsk & TRUNK_DISTRIBUTION_ALGO_DMAC_BIT)
-			newmask |= TRUNK_DISTRIBUTION_ALGO_L3_DMAC_BIT;
-	} else {
-		if (algomsk & TRUNK_DISTRIBUTION_ALGO_SMAC_BIT)
-			newmask |= TRUNK_DISTRIBUTION_ALGO_L2_SMAC_BIT;
-		if (algomsk & TRUNK_DISTRIBUTION_ALGO_DMAC_BIT)
-			newmask |= TRUNK_DISTRIBUTION_ALGO_L2_DMAC_BIT;
-	}
+	sw_w32(l2msk | (l3msk << 4), RTL931X_TRK_HASH_CTRL + (algoidx << 2));
 
-	sw_w32(newmask << l3shift, RTL931X_TRK_HASH_CTRL + (algoidx << 2));
+	/* Neutral per-field hash shifts (RTL9310_TRK_SHFT_CTRL @0xBA7C). */
+	sw_w32(0, RTL931X_TRK_SHFT_CTRL);
+
+	/* Stand-alone trunk mode, local-first member preference and the
+	 * non-terminate-mode tunnel hash source for plain bridged traffic
+	 * (RTL9310_TRK_CTRL @0xBA78 bits 2/4/0; dal_mango_trunk_mode_set()
+	 * forces LOCAL_FIRST on in stand-alone mode). Without bit 0 the TX
+	 * hash never varies and every flow exits the first member.
+	 */
+	sw_w32(BIT(0) | BIT(2) | BIT(4), RTL931X_TRK_CTRL);
+
+	/* The local trunk table generator matches LAG-table slots against
+	 * this box's stacking device ID; our slots carry devID 0, so the
+	 * box's own ID must be 0 as well or the generator finds no local
+	 * members at all (RTL9310_STK_GBL_CTRL MY_DEV_ID @0x1448 bits 4-7).
+	 */
+	sw_w32_mask(0xf << 4, 0, RTL931X_STK_GBL_CTRL);
+
+	if (group > 0 && group <= MAX_LAGS)
+		rtl931x_trk_hash_idx[group - 1] = algoidx;
+}
+
+/* Map a source port to a trunk group (SRC_TRK_MAP table, one entry per
+ * port): ingress traffic on the port is then attributed to the trunk for
+ * L2 learning, source-port filtering and non-unicast forwarding.
+ * SRC_TRK_MAP is table set 0 type 13 with TRK_ID_VALID @31 and a 7 bit
+ * TRK_ID @24 (RTL9310_SRC_TRK_MAP_FIELDS in rtk_mango_tableField_list.c;
+ * dal_mango_trunk_srcPortMap_set()).
+ */
+static void rtl931x_trunk_srcmap_set(int port, bool valid, int group)
+{
+	struct table_reg *r = rtl_table_get(RTL9310_TBL_0, 13);
+	u32 v = 0;
+
+	if (WARN_ON(!r))
+		return;
+
+	group -= 1;	/* 1-based DSA LAG id -> hardware trunk */
+
+	if (valid)
+		v = BIT(31) | (group & 0x7f) << 24;
+
+	sw_w32(v, rtl_table_data(r, 0));
+	rtl_table_write(r, port);
+	rtl_table_release(r);
+
+	/* The local (same-unit) forwarding logic keeps its own per-port
+	 * map with the same information: LOCAL_PORT_TRK_MAP @0x4CAC,
+	 * IS_TRK_MBR @7, 7 bit TRK_ID @0 (RTL9310_LOCAL_PORT_TRK_MAP in
+	 * swcore_rtl9310.h; _dal_mango_trunk_localPort_set()).
+	 */
+	sw_w32(valid ? BIT(7) | (group & 0x7f) : 0,
+	       RTL931X_LOCAL_PORT_TRK_MAP + (port << 2));
+}
+
+/* Helper for the 96 bit LAG table entry: bit 0 is the LSB of the last
+ * data word, bit 95 the MSB of the first (table word order per
+ * RTL9310_LAG_FIELDS / table access data registers).
+ */
+static void rtl931x_lag_entry_set(u32 w[3], int lsp, int len, u32 val)
+{
+	for (int i = 0; i < len; i++)
+		if (val & BIT(i))
+			w[2 - ((lsp + i) >> 5)] |= BIT((lsp + i) & 0x1f);
+}
+
+/* Bit offset of each 6 bit TRK_PORTn field in the 96 bit LAG entry
+ * (RTL9310_LAG_FIELDS in rtk_mango_tableField_list.c). The 10 bit
+ * {TRK_DEVn, TRK_PORTn} slots do not straddle the 32 bit word
+ * boundaries, so there are 2 bit reserved gaps at bits 30-31 and 62-63 -
+ * slots 0-2 sit at 10n, slots 3-5 at 10n+2, slots 6-7 at 10n+4.
+ */
+static const u8 rtl931x_lag_trk_port_lsp[8] = {
+	0, 10, 20, 32, 42, 52, 64, 74,
+};
+
+/* Program the egress candidate list of a trunk (LAG table, table set 2
+ * type 0): NUM_TX_CANDI members, each a {devID, port} pair the TX hash
+ * result indexes into. Without this the hash selects from an empty list
+ * and unicast towards the trunk is not forwarded. Unused slots carry the
+ * invalid port 0x3f (INVALID_TRUNK_MEMBER_PORT in the SDK), unused
+ * devIDs stay 0 (_dal_mango_trunk_egrPort_set()).
+ */
+static void rtl931x_trunk_egr_ports_set(int group, u64 members)
+{
+	struct table_reg *r = rtl_table_get(RTL9310_TBL_2, 0);
+	u32 w[3] = { 0 };
+	u32 idx;
+	int n = 0;
+
+	if (WARN_ON(!r))
+		return;
+
+	group -= 1;	/* 1-based DSA LAG id -> hardware trunk */
+
+	for (int p = 0; p < RTL931X_CPU_PORT && n < 8; p++) {
+		if (members & BIT_ULL(p)) {
+			/* TRK_PORTn at its slot offset, TRK_DEVn (0) above it */
+			rtl931x_lag_entry_set(w, rtl931x_lag_trk_port_lsp[n], 6, p);
+			n++;
+		}
+	}
+	for (int s = n; s < 8; s++)
+		rtl931x_lag_entry_set(w, rtl931x_lag_trk_port_lsp[s], 6, 0x3f);
+
+	rtl931x_lag_entry_set(w, 89, 4, n);	/* NUM_TX_CANDI */
+
+	/* Bind all traffic classes of this trunk to the hash mask set its
+	 * distribution algorithm was programmed into: L2/IP4/IP6_HASH_MSK_IDX
+	 * at bits 88/87/86 (RTL9310_LAG_FIELDS).
+	 */
+	idx = rtl931x_trk_hash_idx[group] & 1;
+	rtl931x_lag_entry_set(w, 88, 1, idx);
+	rtl931x_lag_entry_set(w, 87, 1, idx);
+	rtl931x_lag_entry_set(w, 86, 1, idx);
+
+	for (int i = 0; i < 3; i++)
+		sw_w32(w[i], rtl_table_data(r, i));
+
+	rtl_table_write(r, group);
+	rtl_table_release(r);
+
+	/* Allow SA learning for trunk-attributed traffic - the per-trunk
+	 * learning constraint powers up at zero, which suppresses all
+	 * learning on the trunk (same 0x7ffe limit the ports use).
+	 * L2_LRN_TRK_CONSTRT_CTRL @0xCB34 is indexed by trunk gid with
+	 * CONSTRT_NUM @3-18 and ACT @0-2 (0 = forward, per
+	 * dal_mango_l2_limitAction_set()).
+	 */
+	sw_w32(0x7ffe << 3, RTL931X_L2_LRN_TRK_CONSTRT_CTRL + (group << 2));
+
+	/* Bind the local trunk slot to the trunk ID: TRK_ID_CTRL @0xB800,
+	 * TRK_VALID @7, 7 bit TRK_ID @0 (RTL9310_TRK_ID_CTRL in
+	 * swcore_rtl9310.h). TRK_MBR_CTRL and the local table are indexed
+	 * by local slot, not by trunk ID; without a valid binding the
+	 * local-table refresh generates nothing and TX hashing degenerates
+	 * to the first LAG candidate. We use the identity mapping
+	 * slot == trunk id, so the SDK's 128-gid scan over its 52-entry
+	 * localTrunkID array has no counterpart (and no overflow) here.
+	 */
+	sw_w32(members ? BIT(7) | (group & 0x7f) : 0,
+	       RTL931X_TRK_ID_CTRL + (group << 2));
+
+	/* Regenerate the internal local trunk table (TRK_LOCAL_TBL @0xBA84)
+	 * - it is hardware-maintained: membership changes only take effect
+	 * after poking the self-clearing TRK_LOCAL_TBL_REFRESH @0xBA80 bit 0
+	 * (dal_mango_trunk_tbl_refresh()).
+	 */
+	sw_w32(BIT(0), RTL931X_TRK_LOCAL_TBL_REFRESH);
+	if (readx_poll_timeout(sw_r32, RTL931X_TRK_LOCAL_TBL_REFRESH, idx,
+			       !(idx & BIT(0)), 20, 10000))
+		pr_err("%s: trunk %d local table refresh timed out\n",
+		       __func__, group);
 }
 
 static void rtldsa_931x_led_get_forced(const struct device_node *node,
@@ -2336,6 +2500,8 @@ const struct rtl838x_reg rtl931x_reg = {
 	.vlan_port_pvid_set = rtl931x_vlan_port_pvid_set,
 	.vlan_port_fast_age = rtldsa_931x_vlan_port_fast_age,
 	.trk_mbr_ctr = rtldsa_931x_trk_mbr_ctr,
+	.trunk_srcmap_set = rtl931x_trunk_srcmap_set,
+	.trunk_egr_ports_set = rtl931x_trunk_egr_ports_set,
 	.rma_bpdu_fld_pmask = RTL931X_RMA_BPDU_FLD_PMSK,
 	.set_vlan_igr_filter = rtl931x_set_igr_filter,
 	.set_vlan_egr_filter = rtl931x_set_egr_filter,
