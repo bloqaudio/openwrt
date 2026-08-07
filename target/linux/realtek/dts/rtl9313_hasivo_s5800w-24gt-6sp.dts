@@ -36,9 +36,18 @@
  * loader never programs it. Each bus in use also needs its own MDC/MDIO
  * pin group muxed or its pins stay electrically dead.
  *
- * STILL UNVERIFIED: SFP+ cage i2c/LOS/mod-def0/tx-disable wiring, so no
- * sfp nodes are declared yet and the SFP+ ports are left as plain
- * in-band-status links (fine for DAC/fixed optics, no hotplug/DDM).
+ * SFP+ cage mod-def0 lines, measured one cage at a time by moving a module
+ * and diffing the GPIO data register (cage: line) --
+ *     25: 9   26: 11   27: 14   28: 22   29: 24   30: 26
+ * The spacing is irregular (+2, +3, +8, +2, +2), so it cannot be derived
+ * from a stride; every plausible guess was wrong before the cages were
+ * measured individually. Without these, a cage cannot be told apart from
+ * a module that is merely slow: the sfp layer assumes one is present and
+ * retries the EEPROM to -EIO, which costs ~6.5 s of SERIALISED bring-up
+ * per empty cage (the last cage linked ~27 s after the first) and leaves
+ * a removed module's port stuck reporting carrier forever.
+ * LOS and tx-disable remain unwired/unverified; there is no tx_disable
+ * pin, so modules always emit.
  */
 
 /* RTL8224 quads are C45 and need an explicit SMI bus/address pair */
@@ -361,17 +370,21 @@
 	sfp27: sfp-p27 {
 		compatible = "sff,sfp";
 		i2c-bus = <&i2c_sfp27>;
+		mod-def0-gpio = <&gpio0 14 GPIO_ACTIVE_LOW>;
 	};
 	sfp28: sfp-p28 {
 		compatible = "sff,sfp";
 		i2c-bus = <&i2c_sfp28>;
+		mod-def0-gpio = <&gpio0 22 GPIO_ACTIVE_LOW>;
 	};
 	sfp29: sfp-p29 {
 		compatible = "sff,sfp";
 		i2c-bus = <&i2c_sfp29>;
+		mod-def0-gpio = <&gpio0 24 GPIO_ACTIVE_LOW>;
 	};
 	sfp30: sfp-p30 {
 		compatible = "sff,sfp";
 		i2c-bus = <&i2c_sfp30>;
+		mod-def0-gpio = <&gpio0 26 GPIO_ACTIVE_LOW>;
 	};
 };
