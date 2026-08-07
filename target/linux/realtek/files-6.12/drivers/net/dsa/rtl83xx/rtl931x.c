@@ -234,7 +234,7 @@ static void rtl931x_vlan_set_tagged(u32 vlan, struct rtl838x_vlan_info *info)
 	w |= info->fid & 0x7f;
 	x = info->hash_uc_fid ? BIT(31) : 0;
 	x |= info->hash_mc_fid ? BIT(30) : 0;
-	x |= info->if_id & 0x3ff << 20;
+	x |= (info->if_id & 0x3ff) << 20;
 	x |= (info->profile_id & 0xf) << 16;
 	x |= info->multicast_grp_mask & 0xffff;
 	if (info->l2_tunnel_list_id >= 0) {
@@ -2604,6 +2604,205 @@ static void rtldsa_931x_qos_init(struct rtl838x_switch_priv *priv)
  */
 #define RTL931X_L3_ROUTE_IDX_CATCHALL_IP4	12287
 
+/* Reads a router-MAC entry (an L3 termination endpoint: packets whose
+ * DMAC matches are considered for routing) from the L3_ROUTER_MAC table.
+ */
+static void rtl931x_get_l3_router_mac(u32 idx, struct rtl93xx_rt_mac *m)
+{
+	struct table_reg *r = rtl_table_get(RTL9310_TBL_2, 2);
+	u32 v, w;
+
+	/* L3_ROUTER_MAC entry, 160 bits (MANGO_L3_ROUTER_MACt fields):
+	 * word 0: VALID 31, PORT_TYPE 30, PORT_ID 29:23, INTF_ID 22:13,
+	 *         MAC[47:35] 12:0
+	 * word 1: MAC[34:3] 31:0
+	 * word 2: MAC[2:0] 31:29, LU_PHASE 28, L3_INTF 27,
+	 *         BMSK_PORT_TYPE 22, BMSK_PORT_ID 21:15,
+	 *         BMSK_INTF_ID 14:5, BMSK_MAC[47:43] 4:0
+	 * word 3: BMSK_MAC[42:11] 31:0
+	 * word 4: BMSK_MAC[10:0] 31:21, BMSK_LU_PHASE 20, BMSK_L3_INTF 19,
+	 *         ACT 14:12
+	 */
+	rtl_table_read(r, idx);
+	v = sw_r32(rtl_table_data(r, 0));
+	w = sw_r32(rtl_table_data(r, 2));
+	m->valid = !!(v & BIT(31));
+	m->p_type = !!(v & BIT(30));
+	m->p_id = (v >> 23) & 0x7f;
+	/* The Mango entry has no VID field: it qualifies the matched MAC
+	 * by the ingress L3 interface ID, which takes the shared struct's
+	 * vid slot (BMSK_INTF_ID takes vid_mask).
+	 */
+	m->vid = (v >> 13) & 0x3ff;
+	m->vid_mask = (w >> 5) & 0x3ff;
+	m->p_id_mask = (w >> 15) & 0x7f;
+	m->mac = (((u64)v & 0x1fff) << 35) |
+		 (((u64)sw_r32(rtl_table_data(r, 1))) << 3) |
+		 ((w >> 29) & 0x7);
+	m->mac_mask = (((u64)w & 0x1f) << 43) |
+		      (((u64)sw_r32(rtl_table_data(r, 3))) << 11) |
+		      ((sw_r32(rtl_table_data(r, 4)) >> 21) & 0x7ff);
+	m->action = (sw_r32(rtl_table_data(r, 4)) >> 12) & 0x7;
+	rtl_table_release(r);
+}
+
+/* Writes a router-MAC entry into the L3_ROUTER_MAC table. The shared L3
+ * code programs an exact-MAC, any-VLAN, any-port entry with action
+ * FORWARD; on Mango "any VLAN" is expressed as BMSK_INTF_ID = 0 (the
+ * interface mask does not care), matching the RTL930x vid_mask = 0
+ * posture.
+ */
+static void rtl931x_set_l3_router_mac(u32 idx, struct rtl93xx_rt_mac *m)
+{
+	struct table_reg *r = rtl_table_get(RTL9310_TBL_2, 2);
+	u32 v;
+
+	v = m->valid ? BIT(31) : 0;
+	v |= m->p_type ? BIT(30) : 0;
+	v |= (m->p_id & 0x7f) << 23;
+	v |= (m->vid & 0x3ff) << 13;		/* INTF_ID, see get */
+	v |= (u32)(m->mac >> 35) & 0x1fff;
+	sw_w32(v, rtl_table_data(r, 0));
+
+	sw_w32((u32)(m->mac >> 3), rtl_table_data(r, 1));
+
+	v = ((u32)m->mac & 0x7) << 29;		/* LU_PHASE/L3_INTF stay 0 */
+	v |= (m->p_id_mask & 0x7f) << 15;	/* BMSK_PORT_TYPE stays 0 */
+	v |= (m->vid_mask & 0x3ff) << 5;	/* BMSK_INTF_ID */
+	v |= (u32)(m->mac_mask >> 43) & 0x1f;
+	sw_w32(v, rtl_table_data(r, 2));
+
+	sw_w32((u32)(m->mac_mask >> 11), rtl_table_data(r, 3));
+
+	v = ((u32)m->mac_mask & 0x7ff) << 21;
+	v |= (m->action & 0x7) << 12;
+	sw_w32(v, rtl_table_data(r, 4));
+
+	rtl_table_write(r, idx);
+	rtl_table_release(r);
+}
+
+/* Sets up an L3 interface. Mango splits the RTL930x single egress
+ * interface table into an ingress table (VRF, per-family route enables,
+ * uRPF) and an egress table (egress VID, inline 48-bit SMAC, MTU
+ * indices) sharing one interface index, and selects the ingress
+ * interface per packet from the VLAN entry's L3_INTF_ID field
+ * (SDK _dal_mango_l3_vlanIntf_insert). The source MAC is not part of
+ * struct rtl838x_l3_intf: the shared allocator patches it in afterwards
+ * through rtl931x_set_l3_egress_mac().
+ */
+static void rtl931x_set_l3_egress_intf(int idx, struct rtl838x_l3_intf *intf)
+{
+	struct rtl838x_vlan_info info;
+	struct table_reg *r;
+	u32 v;
+
+	/* L3_IGR_INTF entry, 64 bits (MANGO_L3_IGR_INTFt fields):
+	 * word 0: VRF_ID 31:24, IPUC_ROUTE_EN 23, IP6UC_ROUTE_EN 22,
+	 *         IPMC_ROUTE_EN 21, IP6MC_ROUTE_EN 20, MC lookup-miss and
+	 *         scope actions below
+	 * word 1: uRPF controls and MC key select
+	 * Only IPv4 unicast routing is enabled; IPv6, multicast and uRPF
+	 * stay off (IPv6 is additionally gated by the global
+	 * L3_IP6UC_ROUTE_CTRL enable, which is never written).
+	 */
+	r = rtl_table_get(RTL9310_TBL_2, 7);
+	sw_w32(BIT(23), rtl_table_data(r, 0));
+	sw_w32(0, rtl_table_data(r, 1));
+	rtl_table_write(r, idx);
+	rtl_table_release(r);
+
+	/* L3_EGR_INTF entry, 128 bits (MANGO_L3_EGR_INTFt fields):
+	 * word 0: DST_VID 31:20, SMAC_ADDR[47:28] 19:0
+	 * word 1: SMAC_ADDR[27:0] 31:4, IP_MTU_IDX 3:0
+	 * word 1 (high): IP6_MTU_IDX 31:28, IPMC_TTL_SCOPE 27:20,
+	 *         IP6MC_HL_SCOPE 19:12, IP_ICMP_REDIRECT_ACT 11:9,
+	 *         IP6_ICMP_REDIRECT_ACT 8:6, IP_PBR_ICMP_REDIRECT_ACT 5:3,
+	 *         IP6_PBR_ICMP_REDIRECT_ACT 2:0
+	 * words 2/3: tunnel interface fields, unused
+	 * The redirect actions take the shared struct's values verbatim:
+	 * 2 = FORWARD on both families (SDK _actEgrIntfIpIcmpRedirect),
+	 * so one-armed hairpin traffic (ingress == egress interface, the
+	 * ICMP-redirect case) is forwarded in hardware. The TTL/HL scope
+	 * fields are multicast scopes on Mango; the unicast TTL check is
+	 * driven by the route entry's TTL_DEC/TTL_CHK and the global
+	 * TTL_FAIL_ACT instead.
+	 */
+	v = (intf->ip6_mtu_id & 0xf) << 28;
+	v |= (intf->ttl_scope & 0xff) << 20;
+	v |= (intf->hl_scope & 0xff) << 12;
+	v |= (intf->ip4_icmp_redirect & 0x7) << 9;
+	v |= (intf->ip6_icmp_redirect & 0x7) << 6;
+	v |= (intf->ip4_pbr_icmp_redirect & 0x7) << 3;
+	v |= (intf->ip6_pbr_icmp_redirect & 0x7);
+	v |= (intf->ip4_mtu_id & 0xf);
+
+	r = rtl_table_get(RTL9310_TBL_2, 8);
+	sw_w32((intf->vid & 0xfff) << 20, rtl_table_data(r, 0));
+	sw_w32(v, rtl_table_data(r, 1));
+	sw_w32(0, rtl_table_data(r, 2));
+	sw_w32(0, rtl_table_data(r, 3));
+	rtl_table_write(r, idx);
+	rtl_table_release(r);
+
+	/* Bind the VLAN to this interface (SDK _dal_mango_vlan_l3IntfIdx_set):
+	 * the VLAN entry's L3_INTF_ID selects the ingress L3 interface for
+	 * packets in that VLAN. Read-modify-write keeps membership, FID,
+	 * profile and group mask intact.
+	 */
+	rtl931x_vlan_tables_read(intf->vid, &info);
+	info.if_id = idx;
+	rtl931x_vlan_set_tagged(intf->vid, &info);
+}
+
+/* Get the source MAC of an L3 egress interface. Mango has no SMAC-index
+ * table like the RTL930x L3_EGR_INTF_MAC: the SMAC is inline in the
+ * L3_EGR_INTF entry, so shared SMAC slot i maps to egress interface i.
+ * Indices below L3_EGRESS_DMACS name destination-MAC slots, which do not
+ * exist on Mango: a nexthop's DMAC is resolved through its L2 FDB entry
+ * (NEXTHOP.DMAC_IDX) instead.
+ */
+static u64 rtl931x_get_l3_egress_mac(u32 idx)
+{
+	struct table_reg *r;
+	u64 mac;
+
+	if (idx < L3_EGRESS_DMACS)
+		return 0;
+
+	r = rtl_table_get(RTL9310_TBL_2, 8);
+	rtl_table_read(r, idx - L3_EGRESS_DMACS);
+	mac = (((u64)sw_r32(rtl_table_data(r, 0)) & 0xfffff) << 28) |
+	      ((u64)sw_r32(rtl_table_data(r, 1)) >> 4);
+	rtl_table_release(r);
+
+	return mac;
+}
+
+/* Set the source MAC of an L3 egress interface; see
+ * rtl931x_get_l3_egress_mac() for the table model. Read-modify-write:
+ * the word-1 low nibble holds IP_MTU_IDX, word-0 the DST_VID.
+ */
+static void rtl931x_set_l3_egress_mac(u32 idx, u64 mac)
+{
+	struct table_reg *r;
+	u32 v;
+
+	if (idx < L3_EGRESS_DMACS)
+		return;
+
+	r = rtl_table_get(RTL9310_TBL_2, 8);
+	rtl_table_read(r, idx - L3_EGRESS_DMACS);
+	v = sw_r32(rtl_table_data(r, 0)) & 0xfff00000;
+	v |= (u32)(mac >> 28) & 0xfffff;
+	sw_w32(v, rtl_table_data(r, 0));
+	v = sw_r32(rtl_table_data(r, 1)) & 0xf;
+	v |= (u32)mac << 4;
+	sw_w32(v, rtl_table_data(r, 1));
+	rtl_table_write(r, idx - L3_EGRESS_DMACS);
+	rtl_table_release(r);
+}
+
 static int rtl931x_l3_setup(struct rtl838x_switch_priv *priv)
 {
 	struct table_reg *r;
@@ -2769,6 +2968,11 @@ const struct rtl838x_reg rtl931x_reg = {
 	.packet_cntr_clear = rtl931x_packet_cntr_clear,
 #ifdef CONFIG_NET_DSA_RTL83XX_RTL930X_L3_OFFLOAD
 	.l3_setup = rtl931x_l3_setup,
+	.get_l3_router_mac = rtl931x_get_l3_router_mac,
+	.set_l3_router_mac = rtl931x_set_l3_router_mac,
+	.set_l3_egress_intf = rtl931x_set_l3_egress_intf,
+	.get_l3_egress_mac = rtl931x_get_l3_egress_mac,
+	.set_l3_egress_mac = rtl931x_set_l3_egress_mac,
 #endif
 	.l2_learning_setup = rtl931x_l2_learning_setup,
 	.led_init = rtldsa_931x_led_init,
