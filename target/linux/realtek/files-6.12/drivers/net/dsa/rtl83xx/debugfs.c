@@ -1022,15 +1022,31 @@ void rtl838x_dbgfs_init(struct rtl838x_switch_priv *priv)
 	debugfs_create_regset32("port_ctrl", 0400, port_dir, port_ctrl_regset);
 	debugfs_create_u8("id", 0444, port_dir, &priv->cpu_port);
 
-	/* Create entries for LAGs */
+	/* Create entries for LAGs.
+	 *
+	 * trk_mbr_ctr() takes a DSA LAG id, which the kernel allocates
+	 * 1-based (dsa_lag_map() hands out id 1 first and reserves 0 as the
+	 * unmapped sentinel), and the 93xx accessors subtract one to reach
+	 * hardware trunk 0. Feeding them a raw 0-based array index therefore
+	 * lands one entry BELOW the member-control array: on RTL931x that is
+	 * TRK_ID_CTRL[50], a register the LAG code now programs, and these
+	 * files are writable. The older families index their register array
+	 * directly, so only the 93xx ids are shifted here.
+	 */
 	for (int i = 0; i < priv->ds->num_lag_ids; i++) {
+		int lag_id = i;
+
+		if (priv->family_id == RTL9300_FAMILY_ID ||
+		    priv->family_id == RTL9310_FAMILY_ID)
+			lag_id = i + 1;
+
 		snprintf(lag_name, sizeof(lag_name), "lag.%02d", i);
 		if (priv->family_id == RTL8380_FAMILY_ID)
 			debugfs_create_x32(lag_name, 0644, rtl838x_dir,
-					   (u32 *)(RTL838X_SW_BASE + priv->r->trk_mbr_ctr(i)));
+					   (u32 *)(RTL838X_SW_BASE + priv->r->trk_mbr_ctr(lag_id)));
 		else
 			debugfs_create_x64(lag_name, 0644, rtl838x_dir,
-					   (u64 *)(RTL838X_SW_BASE + priv->r->trk_mbr_ctr(i)));
+					   (u64 *)(RTL838X_SW_BASE + priv->r->trk_mbr_ctr(lag_id)));
 	}
 
 	/* Create directories for mirror groups */

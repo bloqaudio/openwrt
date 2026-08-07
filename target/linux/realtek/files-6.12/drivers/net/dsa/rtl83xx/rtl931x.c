@@ -1878,6 +1878,16 @@ static void rtl931x_trunk_egr_ports_set(int group, u64 members)
 	if (WARN_ON(!r))
 		return;
 
+	/* group is a 1-based DSA LAG id and indexes rtl931x_trk_hash_idx[]
+	 * once decremented. The silicon has 128 trunks, so raising
+	 * num_lag_ids past MAX_LAGS is a plausible future change - catch it
+	 * here rather than corrupting memory quietly.
+	 */
+	if (WARN_ON(group < 1 || group > MAX_LAGS)) {
+		rtl_table_release(r);
+		return;
+	}
+
 	group -= 1;	/* 1-based DSA LAG id -> hardware trunk */
 
 	for (int p = 0; p < RTL931X_CPU_PORT && n < 8; p++) {
