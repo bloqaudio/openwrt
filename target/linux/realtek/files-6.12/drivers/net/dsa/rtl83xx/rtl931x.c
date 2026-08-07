@@ -3,6 +3,7 @@
 #include <asm/mach-rtl838x/mach-rtl83xx.h>
 #include <linux/etherdevice.h>
 #include <linux/iopoll.h>
+#include <linux/sort.h>
 
 #include "rtl83xx.h"
 
@@ -1556,6 +1557,8 @@ static int rtl931x_pie_verify_template(struct rtl838x_switch_priv *priv,
 	return i + PIE_BLOCK_SIZE * block;
 }
 
+static void rtl931x_packet_cntr_clear(int counter);
+
 static int rtl931x_pie_rule_add(struct rtl838x_switch_priv *priv, struct pie_rule *pr)
 {
 	int idx, block, j;
@@ -1598,8 +1601,31 @@ static int rtl931x_pie_rule_add(struct rtl838x_switch_priv *priv, struct pie_rul
 	pr->tid_m = 0x1;
 	pr->id = idx;
 
+	/* Mango carries no counter-index field in the IACL action, only the
+	 * ACT_MSK_LOG enable: the FLOW_CNTR entry at the rule's own physical
+	 * PIE entry index does the counting (SDK dal_mango_acl_statCnt_get
+	 * reads FLOW_CNTRt at the physical entry index). Point the caller's
+	 * counter handle at it; the logically allocated packet counter index
+	 * cannot be programmed into hardware on this family and is unused.
+	 * The rewritten handle is a PIE entry index, not a counter-bitmap
+	 * allocation, and must never be released into packet_cntr_use_bm;
+	 * the only releasing caller (L3 route teardown) is RTL930x-only.
+	 */
+	pr->log_data = idx;
+	if (pr->log_sel)
+		pr->packet_cntr = idx;
+
 	rtl931x_pie_lookup_enable(priv, idx);
 	rtl931x_pie_rule_write(priv, idx, pr);
+
+	/* Start the rule's counter from a defined all-zero state; this also
+	 * programs CNTR_MODE 0 (packet+byte counting) in case the FLOW_CNTR
+	 * entry held garbage, and drops stale counts of a previous rule at
+	 * this index (SDK _dal_mango_acl_tblEntry_del clears FLOW_CNTRt
+	 * together with the PIE entry).
+	 */
+	if (pr->log_sel)
+		rtl931x_packet_cntr_clear(idx);
 
 	mutex_unlock(&priv->pie_mutex);
 
@@ -1632,6 +1658,92 @@ static void rtl931x_pie_rule_rm(struct rtl838x_switch_priv *priv, struct pie_rul
 
 	rtl931x_pie_rule_del(priv, idx, idx);
 	clear_bit(idx, priv->pie_use_bm);
+}
+
+/* Number of FLOW_CNTR samples taken for the median when a counter keeps
+ * changing between reads (SDK _dal_mango_acl_cntr_read,
+ * DAL_MANGO_ACL_CNTR_OPER_MAX).
+ */
+#define RTL931X_FLOW_CNTR_SAMPLES	20
+
+static int rtl931x_u64_cmp(const void *a, const void *b)
+{
+	const u64 l = *(const u64 *)a, r = *(const u64 *)b;
+
+	if (l < r)
+		return -1;
+	return l > r;
+}
+
+/* Read the packet counter of a FLOW_CNTR entry. FLOW_CNTRt is table
+ * access set 1, type 2, 4096 entries of 3 data words, one per physical
+ * PIE entry and indexed by it (SDK rtk_mango_table_list.c,
+ * dal_mango_acl_statCnt_get). Fields (SDK RTL9310_FLOW_CNTR_FIELDS):
+ * PKT_CNTR is a 36-bit field at entry bits 58-93, BYTE_CNTR 42 bits at
+ * 16-57, CNTR_MODE at 94-95. Table data word 0 carries the highest entry
+ * word, so PKT_CNTR bits 0-5 sit in data word 1 bits 31-26 and bits 6-35
+ * in data word 0 bits 29-0.
+ */
+static u64 rtl931x_flow_cntr_packets(struct table_reg *q, int entry)
+{
+	u32 hi, mid;
+
+	rtl_table_read(q, entry);
+	hi = sw_r32(rtl_table_data(q, 0));	/* entry bits 64-95 */
+	mid = sw_r32(rtl_table_data(q, 1));	/* entry bits 32-63 */
+
+	return ((u64)(hi & GENMASK(29, 0)) << 6) | (mid >> 26);
+}
+
+static u32 rtl931x_packet_cntr_read(int counter)
+{
+	/* Access FLOW_CNTR table (type 2) via register RTL9310_TBL_1 */
+	struct table_reg *q = rtl_table_get(RTL9310_TBL_1, 2);
+	u64 samples[RTL931X_FLOW_CNTR_SAMPLES];
+	u64 first, second;
+
+	first = rtl931x_flow_cntr_packets(q, counter);
+	second = rtl931x_flow_cntr_packets(q, counter);
+	if (first == second) {
+		rtl_table_release(q);
+		return (u32)first;
+	}
+
+	/* Mango counter-read erratum (SDK _dal_mango_acl_cntr_read): a read
+	 * can return a corrupted value while the entry is being updated, so
+	 * a single read is not reliable on this family under traffic. The
+	 * SDK takes 20 samples and returns the median; its fast path
+	 * additionally gates on the PIE entry hit status, which two
+	 * agreeing reads subsume - no hit between reads means a stable
+	 * counter.
+	 */
+	for (int i = 0; i < RTL931X_FLOW_CNTR_SAMPLES; i++)
+		samples[i] = rtl931x_flow_cntr_packets(q, counter);
+	rtl_table_release(q);
+
+	sort(samples, RTL931X_FLOW_CNTR_SAMPLES, sizeof(samples[0]),
+	     rtl931x_u64_cmp, NULL);
+
+	/* The hardware counter is 36 bits wide; like the 930x op only the
+	 * low 32 bits are returned, tc statistics cope with the wrap.
+	 */
+	return (u32)samples[RTL931X_FLOW_CNTR_SAMPLES / 2];
+}
+
+static void rtl931x_packet_cntr_clear(int counter)
+{
+	/* Access FLOW_CNTR table (type 2) via register RTL9310_TBL_1 */
+	struct table_reg *q = rtl_table_get(RTL9310_TBL_1, 2);
+
+	/* SDK dal_mango_acl_statCnt_clear zeroes the whole entry; CNTR_MODE
+	 * 0 is packet+byte counting, so the counter keeps counting after a
+	 * clear.
+	 */
+	for (int i = 0; i < 3; i++)
+		sw_w32(0, rtl_table_data(q, i));
+	rtl_table_write(q, counter);
+
+	rtl_table_release(q);
 }
 
 static void rtl931x_pie_init(struct rtl838x_switch_priv *priv)
@@ -2524,6 +2636,8 @@ const struct rtl838x_reg rtl931x_reg = {
 	.pie_rule_write = rtl931x_pie_rule_write,
 	.pie_rule_add = rtl931x_pie_rule_add,
 	.pie_rule_rm = rtl931x_pie_rule_rm,
+	.packet_cntr_read = rtl931x_packet_cntr_read,
+	.packet_cntr_clear = rtl931x_packet_cntr_clear,
 	.l2_learning_setup = rtl931x_l2_learning_setup,
 	.led_init = rtldsa_931x_led_init,
 	.enable_learning = rtldsa_931x_enable_learning,
