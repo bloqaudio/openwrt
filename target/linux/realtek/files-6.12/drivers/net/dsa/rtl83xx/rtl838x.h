@@ -117,10 +117,18 @@
 #define RTL930X_VLAN_PORT_EGR_TPID_OTPID_KEEP	BIT(3)
 
 #define RTL931X_VLAN_PROFILE_SET(idx)		(0x9800 + (((idx) * 28)))
+#define RTL931X_VLAN_TAG_TPID_CTRL(idx)		(0x13fc + ((idx) << 2))
+#define RTL931X_VLAN_PORT_OTAG_TPID_CMP_MSK(port) \
+	(0x600c + ((port) << 7))
+#define RTL931X_VLAN_PORT_ITAG_TPID_CMP_MSK(port) \
+	(0x6010 + ((port) << 7))
 #define RTL931X_VLAN_CTRL			(0x94E4)
 #define RTL931X_VLAN_PORT_IGR_CTRL		(0x94E8)
 #define RTL931X_VLAN_PORT_IGR_FLTR		(0x96B4)
 #define RTL931X_VLAN_PORT_EGR_FLTR		(0x96C4)
+#define RTL931X_PKT_ENCAP_MISC_CTRL		(0x4fcc)
+
+#define RTL931X_PKT_ENCAP_MISC_CTRL_EVC_TCAM_EN	BIT(0)
 
 /* Table access registers */
 #define RTL838X_TBL_ACCESS_CTRL_0		(0x6914)

@@ -29,6 +29,11 @@
 #define RTL931X_VLAN_PORT_TAG_ITPID_IDX_MASK			GENMASK(2, 1)
 #define RTL931X_VLAN_PORT_TAG_ITPID_KEEP_MASK			GENMASK(0, 0)
 
+#define RTL931X_VLAN_TPID_8021Q					0x8100
+#define RTL931X_VLAN_TPID_8021AD				0x88a8
+#define RTL931X_VLAN_TPID_PAIR(otpid, itpid) \
+	(((u32)(otpid) << 16) | (itpid))
+
 /* Definition of the RTL931X-specific template field IDs as used in the PIE */
 enum template_field_id {
 	TEMPLATE_FIELD_SPM0 = 1,
@@ -1808,6 +1813,88 @@ static void rtl931x_vlan_port_keep_tag_set(int port, bool keep_outer, bool keep_
 	       FIELD_PREP(RTL931X_VLAN_PORT_TAG_EGR_ITAG_STS_MASK,
 			  keep_inner ? RTL931X_VLAN_PORT_TAG_STS_TAGGED : RTL931X_VLAN_PORT_TAG_STS_UNTAG),
 	       RTL931X_VLAN_PORT_TAG_CTRL(port));
+}
+
+static void rtl931x_vlan_qinq_setup(struct rtl838x_switch_priv *priv)
+{
+	int port, tpid;
+
+	/* Mango provides four paired outer/inner TPID entries. Keep every
+	 * pair deterministic: standard S-TAG outside, standard C-TAG inside.
+	 */
+	for (tpid = 0; tpid < 4; tpid++)
+		sw_w32(RTL931X_VLAN_TPID_PAIR(RTL931X_VLAN_TPID_8021AD,
+					      RTL931X_VLAN_TPID_8021Q),
+		       RTL931X_VLAN_TAG_TPID_CTRL(tpid));
+
+	/* Egress VLAN conversion must be enabled for the outer-tag policy to
+	 * take effect.
+	 */
+	sw_w32_mask(0, RTL931X_PKT_ENCAP_MISC_CTRL_EVC_TCAM_EN,
+		    RTL931X_PKT_ENCAP_MISC_CTRL);
+
+	/* The normal port posture recognizes only C-TAGs. S-TAG recognition
+	 * is enabled when a user port joins an 802.1ad bridge. The CPU port
+	 * recognizes both so software-injected S-TAGs select the outer VID.
+	 */
+	for (port = 0; port <= priv->cpu_port; port++) {
+		sw_w32(BIT(0), RTL931X_VLAN_PORT_ITAG_TPID_CMP_MSK(port));
+		sw_w32(port == priv->cpu_port ? BIT(0) : 0,
+		       RTL931X_VLAN_PORT_OTAG_TPID_CMP_MSK(port));
+	}
+
+	/* CPU-injected untagged/C-TAG frames retain the existing inner-VID
+	 * forwarding behaviour; S-TAG and double-tagged frames use the SVID.
+	 */
+	sw_w32_mask(GENMASK(3, 0), BIT(3) | BIT(2),
+		    RTL931X_VLAN_PORT_FWD + (priv->cpu_port << 2));
+}
+
+static void rtl931x_vlan_port_qinq_set(int port, bool enable)
+{
+	u32 tag_sts;
+
+	/* All frame classes on a provider-bridge port forward on the outer
+	 * VID. A normal 802.1Q port forwards every class on the inner VID.
+	 */
+	rtl931x_vlan_fwd_on_inner(port, !enable);
+
+	/* Pair 0 is 0x88a8/0x8100. Normal ports deliberately do not parse an
+	 * S-TAG, preserving the pre-QinQ 802.1Q posture.
+	 */
+	sw_w32(BIT(0), RTL931X_VLAN_PORT_ITAG_TPID_CMP_MSK(port));
+	sw_w32(enable ? BIT(0) : 0,
+	       RTL931X_VLAN_PORT_OTAG_TPID_CMP_MSK(port));
+
+	/* Inserted outer tags take pair-0's 0x88a8 TPID rather than retaining
+	 * an ingress TPID. The same zero value is valid after leaving QinQ.
+	 */
+	sw_w32_mask(RTL931X_VLAN_PORT_TAG_OTPID_IDX_MASK |
+		    RTL931X_VLAN_PORT_TAG_OTPID_KEEP_MASK, 0,
+		    RTL931X_VLAN_PORT_TAG_CTRL(port));
+
+	if (!enable) {
+		/* Existing 802.1Q posture: outer untagged, inner table-tagged. */
+		rtl931x_vlan_port_keep_tag_set(port, false, true);
+		return;
+	}
+
+	/* Provider-bridge posture: the VLAN table controls the outer S-TAG;
+	 * preserve an ingress C-TAG transparently across the switch.
+	 */
+	tag_sts = FIELD_PREP(RTL931X_VLAN_PORT_TAG_EGR_OTAG_STS_MASK,
+			     RTL931X_VLAN_PORT_TAG_STS_TAGGED) |
+		  FIELD_PREP(RTL931X_VLAN_PORT_TAG_EGR_ITAG_STS_MASK,
+			     RTL931X_VLAN_PORT_TAG_STS_INTERNAL) |
+		  RTL931X_VLAN_PORT_TAG_EGR_ITAG_KEEP_MASK |
+		  RTL931X_VLAN_PORT_TAG_IGR_ITAG_KEEP_MASK;
+	sw_w32_mask(RTL931X_VLAN_PORT_TAG_EGR_OTAG_STS_MASK |
+		    RTL931X_VLAN_PORT_TAG_EGR_ITAG_STS_MASK |
+		    RTL931X_VLAN_PORT_TAG_EGR_OTAG_KEEP_MASK |
+		    RTL931X_VLAN_PORT_TAG_EGR_ITAG_KEEP_MASK |
+		    RTL931X_VLAN_PORT_TAG_IGR_OTAG_KEEP_MASK |
+		    RTL931X_VLAN_PORT_TAG_IGR_ITAG_KEEP_MASK,
+		    tag_sts, RTL931X_VLAN_PORT_TAG_CTRL(port));
 }
 
 static void rtl931x_vlan_port_pvidmode_set(int port, enum pbvlan_type type, enum pbvlan_mode mode)
@@ -3624,6 +3711,8 @@ const struct rtl838x_reg rtl931x_reg = {
 	.vlan_profile_dump = rtl931x_vlan_profile_dump,
 	.vlan_profile_setup = rtl931x_vlan_profile_setup,
 	.vlan_fwd_on_inner = rtl931x_vlan_fwd_on_inner,
+	.vlan_qinq_setup = rtl931x_vlan_qinq_setup,
+	.vlan_port_qinq_set = rtl931x_vlan_port_qinq_set,
 	.stp_get = rtl931x_stp_get,
 	.stp_set = rtl931x_stp_set,
 	.mac_force_mode_ctrl = rtl931x_mac_force_mode_ctrl,
