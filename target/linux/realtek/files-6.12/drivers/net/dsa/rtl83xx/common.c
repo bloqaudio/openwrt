@@ -738,6 +738,27 @@ static const struct rhashtable_params route_ht_params = {
 	.head_offset = offsetof(struct rtl83xx_route, linkage),
 };
 
+/* Does a prefix route need a PIE rule to actually forward?
+ *
+ * On the RTL838x/839x/930x families the route entry alone does not move the
+ * packet: a PIE rule carrying PIE_ACT_ROUTE_UC and the L2 nexthop is what
+ * forwards a matched prefix, so one is installed per offloaded route.
+ *
+ * RTL931x is different. Its route entry holds the nexthop index and the
+ * forward action itself and the ASIC forwards a match unaided -- the vendor
+ * route-add path (dal_mango_l3_routeEntry_add) touches no ACL entry at all.
+ * Installing the rule there is not merely redundant: PIE_ACT_ROUTE_UC is a
+ * Longan action encoding, and applied on Mango together with the
+ * overwrite-drop flag it captures the matched packet, which the silicon then
+ * drops. The symptom is a route the kernel reports as offloaded that
+ * blackholes every packet matching it, while host routes -- which never
+ * allocate a rule -- keep working.
+ */
+static bool rtl83xx_route_needs_pie(struct rtl838x_switch_priv *priv)
+{
+	return priv->family_id != RTL9310_FAMILY_ID;
+}
+
 /* Build the gateway hash key of an IPv4 route. Gateways are stored
  * v4-mapped so the connected-route keys 0.0.0.0 (IPv4) and :: (IPv6)
  * never collide in a bucket.
@@ -832,6 +853,9 @@ static int rtl83xx_l3_nexthop_update(struct rtl838x_switch_priv *priv,  __be32 i
 		 * and packet counter.
 		 */
 		if (r->is_host_route)
+			continue;
+
+		if (!rtl83xx_route_needs_pie(priv))
 			continue;
 
 		if (r->pr.id < 0) {
@@ -1590,16 +1614,18 @@ static int rtl83xx_l3_nexthop6_update(struct rtl838x_switch_priv *priv,
 			r->pr.fwd_data = r->nh.l2_id;
 			r->pr.fwd_act = PIE_ACT_ROUTE_UC;
 
-			if (r->pr.id < 0) {
-				r->pr.packet_cntr = rtl83xx_packet_cntr_alloc(priv);
-				if (r->pr.packet_cntr >= 0) {
-					pr_debug("Using packet counter %d\n", r->pr.packet_cntr);
-					r->pr.log_sel = true;
-					r->pr.log_data = r->pr.packet_cntr;
+			if (rtl83xx_route_needs_pie(priv)) {
+				if (r->pr.id < 0) {
+					r->pr.packet_cntr = rtl83xx_packet_cntr_alloc(priv);
+					if (r->pr.packet_cntr >= 0) {
+						pr_debug("Using packet counter %d\n", r->pr.packet_cntr);
+						r->pr.log_sel = true;
+						r->pr.log_data = r->pr.packet_cntr;
+					}
+					priv->r->pie_rule_add(priv, &r->pr);
+				} else {
+					priv->r->pie_rule_write(priv, r->pr.id, &r->pr);
 				}
-				priv->r->pie_rule_add(priv, &r->pr);
-			} else {
-				priv->r->pie_rule_write(priv, r->pr.id, &r->pr);
 			}
 
 			reprogram = true;
