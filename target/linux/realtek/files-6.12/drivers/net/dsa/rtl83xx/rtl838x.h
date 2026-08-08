@@ -49,6 +49,14 @@
 #define RTL930X_MAC_FORCE_MODE_CTRL		(0xCA1C)
 #define RTL931X_MAC_FORCE_MODE_CTRL		(0x0DCC)
 
+/*
+ * Selects where the switch obtains a port's link ability from: 0 polls an
+ * external PHY over MDIO, 2 takes it from the SerDes. Two bits per port.
+ */
+#define RTL931X_SMI_PHY_ABLTY_GET_SEL(port)	(0x0CAC + (((port) >> 4) << 2))
+#define RTL931X_SMI_PHY_ABLTY_GET_SEL_SHIFT(port) (((port) & 0xf) << 1)
+#define RTL931X_SMI_PHY_ABLTY_GET_SEL_SERDES	2
+
 #define RTL838X_PORT_ISO_CTRL(port)		(0x4100 + ((port) << 2))
 #define RTL839X_PORT_ISO_CTRL(port)		(0x1400 + ((port) << 3))
 

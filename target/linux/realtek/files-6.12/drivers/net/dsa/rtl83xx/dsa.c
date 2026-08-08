@@ -1167,6 +1167,19 @@ static void rtl83xx_phylink_mac_config(struct dsa_switch *ds, int port,
 	sw_w32(mcr, priv->r->mac_force_mode_ctrl(port));
 }
 
+/* True for interface modes driven directly by a SerDes, with no external PHY. */
+static bool rtl931x_serdes_link_ability(phy_interface_t interface)
+{
+	switch (interface) {
+	case PHY_INTERFACE_MODE_1000BASEX:
+	case PHY_INTERFACE_MODE_2500BASEX:
+	case PHY_INTERFACE_MODE_10GBASER:
+		return true;
+	default:
+		return false;
+	}
+}
+
 static void rtl931x_phylink_mac_config(struct dsa_switch *ds, int port,
 				       unsigned int mode,
 					const struct phylink_link_state *state)
@@ -1175,12 +1188,27 @@ static void rtl931x_phylink_mac_config(struct dsa_switch *ds, int port,
 	u32 reg;
 
 	reg = sw_r32(priv->r->mac_force_mode_ctrl(port));
-	pr_info("%s reading FORCE_MODE_CTRL: %08x\n", __func__, reg);
+	pr_debug("%s reading FORCE_MODE_CTRL: %08x\n", __func__, reg);
+
+	/*
+	 * Ports fed straight from a SerDes have no PHY to poll for their link
+	 * ability. Leaving the selector at its reset default makes the MAC wait
+	 * on MDIO for a PHY that is not there, so the SerDes can acquire symbol
+	 * lock while the MAC still reports a local fault and the port never
+	 * comes up. Boot loaders that run the vendor network init set this and
+	 * hide the problem; booting the kernel directly does not.
+	 */
+	if (rtl931x_serdes_link_ability(state->interface)) {
+		int shift = RTL931X_SMI_PHY_ABLTY_GET_SEL_SHIFT(port);
+
+		reg = sw_r32(RTL931X_SMI_PHY_ABLTY_GET_SEL(port));
+		reg &= ~(0x3 << shift);
+		reg |= RTL931X_SMI_PHY_ABLTY_GET_SEL_SERDES << shift;
+		sw_w32(reg, RTL931X_SMI_PHY_ABLTY_GET_SEL(port));
+	}
 
 	/* Disable MAC completely so PCS can setup the SerDes */
-	reg = 0;
-
-	sw_w32(reg, priv->r->mac_force_mode_ctrl(port));
+	sw_w32(0, priv->r->mac_force_mode_ctrl(port));
 }
 
 static void rtl93xx_phylink_mac_config(struct dsa_switch *ds, int port,
