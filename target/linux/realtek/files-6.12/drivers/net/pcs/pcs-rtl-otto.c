@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <dt-bindings/gpio/gpio.h>
+#include <linux/debugfs.h>
 #include <linux/gpio.h>
 #include <linux/gpio/consumer.h>
 #include <linux/mdio.h>
@@ -13,9 +14,12 @@
 #include <linux/platform_device.h>
 #include <linux/phylink.h>
 #include <linux/regmap.h>
+#include <linux/seq_file.h>
 #include <linux/workqueue.h>
 
 #define RTPCS_SDS_CNT				14
+#define RTPCS_SDS_PAGE_CNT			192
+#define RTPCS_SDS_REG_CNT			32
 #define RTPCS_PORT_CNT				57
 
 #define RTPCS_SPEED_10				0
@@ -159,6 +163,10 @@ struct rtpcs_ctrl {
 	struct rtpcs_serdes serdes[RTPCS_SDS_CNT];
 	struct rtpcs_link *link[RTPCS_PORT_CNT];
 	struct mutex lock;
+
+	/* debugfs SerDes accessor state: lane, and page << 8 | regnum */
+	u32 dbg_sds;
+	u32 dbg_addr;
 };
 
 struct rtpcs_link {
@@ -3814,6 +3822,80 @@ static struct mii_bus *rtpcs_probe_serdes_bus(struct rtpcs_ctrl *ctrl)
 	return bus;
 }
 
+#ifdef CONFIG_DEBUG_FS
+/*
+ * Raw SerDes register access for bring-up diagnosis. Lanes can come up with
+ * symbol lock but an untrained receiver depending on what the boot loader left
+ * behind, and that state lives in analog registers the driver never writes
+ * itself. Comparing a full dump between a working and a failing boot is the
+ * only way to see it.
+ */
+static int rtpcs_dbgfs_val_get(void *data, u64 *val)
+{
+	struct rtpcs_ctrl *ctrl = data;
+	int ret;
+
+	if (ctrl->dbg_sds >= RTPCS_SDS_CNT)
+		return -EINVAL;
+
+	ret = rtpcs_sds_read(&ctrl->serdes[ctrl->dbg_sds],
+			     ctrl->dbg_addr >> 8, ctrl->dbg_addr & 0xff);
+	if (ret < 0)
+		return ret;
+
+	*val = ret;
+
+	return 0;
+}
+
+static int rtpcs_dbgfs_val_set(void *data, u64 val)
+{
+	struct rtpcs_ctrl *ctrl = data;
+
+	if (ctrl->dbg_sds >= RTPCS_SDS_CNT)
+		return -EINVAL;
+
+	return rtpcs_sds_write(&ctrl->serdes[ctrl->dbg_sds],
+			       ctrl->dbg_addr >> 8, ctrl->dbg_addr & 0xff, val);
+}
+DEFINE_DEBUGFS_ATTRIBUTE(rtpcs_dbgfs_val_fops, rtpcs_dbgfs_val_get,
+			 rtpcs_dbgfs_val_set, "0x%04llx\n");
+
+static int rtpcs_dbgfs_dump_show(struct seq_file *s, void *v)
+{
+	struct rtpcs_ctrl *ctrl = s->private;
+	struct rtpcs_serdes *sds;
+
+	if (ctrl->dbg_sds >= RTPCS_SDS_CNT)
+		return -EINVAL;
+
+	sds = &ctrl->serdes[ctrl->dbg_sds];
+	for (int page = 0; page < RTPCS_SDS_PAGE_CNT; page++) {
+		for (int reg = 0; reg < RTPCS_SDS_REG_CNT; reg++) {
+			int val = rtpcs_sds_read(sds, page, reg);
+
+			seq_printf(s, "%02x %02x %04x\n", page, reg,
+				   val < 0 ? 0xffff : val);
+		}
+	}
+
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(rtpcs_dbgfs_dump);
+
+static void rtpcs_dbgfs_init(struct rtpcs_ctrl *ctrl)
+{
+	struct dentry *dir = debugfs_create_dir("rtl-otto-pcs", NULL);
+
+	debugfs_create_u32("sds", 0644, dir, &ctrl->dbg_sds);
+	debugfs_create_x32("addr", 0644, dir, &ctrl->dbg_addr);
+	debugfs_create_file("val", 0600, dir, ctrl, &rtpcs_dbgfs_val_fops);
+	debugfs_create_file("dump", 0400, dir, ctrl, &rtpcs_dbgfs_dump_fops);
+}
+#else
+static void rtpcs_dbgfs_init(struct rtpcs_ctrl *ctrl) { }
+#endif
+
 static int rtpcs_probe(struct platform_device *pdev)
 {
 	struct device_node *np = pdev->dev.of_node;
@@ -3871,6 +3953,8 @@ static int rtpcs_probe(struct platform_device *pdev)
 	 * determine if the driver is ready. Do this after everything is initialized properly.
 	 */
 	platform_set_drvdata(pdev, ctrl);
+
+	rtpcs_dbgfs_init(ctrl);
 
 	dev_info(dev, "Realtek PCS driver initialized\n");
 
