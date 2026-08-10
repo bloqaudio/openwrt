@@ -1,0 +1,132 @@
+From: OpenWrt
+Subject: [PATCH] net: sched: ets: let drivers reject unsupported configurations
+
+The ETS qdisc calls ndo_setup_tc() after committing state and drops its return
+value. That makes it impossible for a driver to refuse a configuration it
+cannot represent without leaving kernel qdisc and hardware scheduling semantics
+inconsistent.
+
+Add a pre-commit validation command. Drivers which do not implement it keep
+the existing software fallback. A driver that sets block_offload can return a
+terminal error and explain the restriction through the existing netlink extack.
+
+---
+ include/net/pkt_cls.h |  6 ++++++
+ net/sched/sch_ets.c   | 31 ++++++++++++++++++++++++++-----
+ 2 files changed, 32 insertions(+), 5 deletions(-)
+
+--- a/include/net/pkt_cls.h
++++ b/include/net/pkt_cls.h
+@@ -1005,6 +1005,7 @@
+ 	TC_ETS_DESTROY,
+ 	TC_ETS_STATS,
+ 	TC_ETS_GRAFT,
++	TC_ETS_VALIDATE,
+ };
+ 
+ struct tc_ets_qopt_offload_replace_params {
+@@ -1029,6 +1030,11 @@
+ 		struct tc_qopt_offload_stats stats;
+ 		struct tc_ets_qopt_offload_graft_params graft_params;
+ 	};
++	/* ETS replace has no standard mandatory-offload flag. Drivers set this
++	 * when an unsupported configuration must fail rather than fall back.
++	 */
++	struct netlink_ext_ack *extack;
++	bool block_offload;
+ };
+ 
+ enum tc_tbf_command {
+--- a/net/sched/sch_ets.c
++++ b/net/sched/sch_ets.c
+@@ -109,35 +109,40 @@
+ 	return TC_H_MAKE(sch->handle, band + 1);
+ }
+ 
+-static void ets_offload_change(struct Qdisc *sch)
++static int ets_offload(struct Qdisc *sch, unsigned int bands,
++		       const u8 *priomap, const unsigned int *quanta,
++		       enum tc_ets_command command,
++		       struct netlink_ext_ack *extack)
+ {
+ 	struct net_device *dev = qdisc_dev(sch);
+ 	struct ets_sched *q = qdisc_priv(sch);
+-	struct tc_ets_qopt_offload qopt;
++	struct tc_ets_qopt_offload qopt = {};
+ 	unsigned int w_psum_prev = 0;
+ 	unsigned int quantum;
+ 	unsigned int w_psum;
+ 	unsigned int weight;
+ 	unsigned int i;
++	int err;
+ 	u64 q_psum = 0;
+ 	u64 q_sum = 0;
+ 
+ 	if (!tc_can_offload(dev) || !dev->netdev_ops->ndo_setup_tc)
+-		return;
++		return 0;
+ 
+-	qopt.command = TC_ETS_REPLACE;
++	qopt.command = command;
+ 	qopt.handle = sch->handle;
+ 	qopt.parent = sch->parent;
+-	qopt.replace_params.bands = q->nbands;
++	qopt.extack = extack;
++	qopt.replace_params.bands = bands;
+ 	qopt.replace_params.qstats = &sch->qstats;
+ 	memcpy(&qopt.replace_params.priomap,
+-	       q->prio2band, sizeof(q->prio2band));
++	       priomap, sizeof(qopt.replace_params.priomap));
+ 
+-	for (i = 0; i < q->nbands; i++)
+-		q_sum += q->classes[i].quantum;
++	for (i = 0; i < bands; i++)
++		q_sum += quanta ? quanta[i] : q->classes[i].quantum;
+ 
+-	for (i = 0; i < q->nbands; i++) {
+-		quantum = q->classes[i].quantum;
++	for (i = 0; i < bands; i++) {
++		quantum = quanta ? quanta[i] : q->classes[i].quantum;
+ 		if (quantum) {
+ 			q_psum += quantum;
+ 			w_psum = div64_u64(q_psum * 100, q_sum);
+@@ -151,7 +156,27 @@
+ 		qopt.replace_params.weights[i] = weight;
+ 	}
+ 
+-	dev->netdev_ops->ndo_setup_tc(dev, TC_SETUP_QDISC_ETS, &qopt);
++	err = dev->netdev_ops->ndo_setup_tc(dev, TC_SETUP_QDISC_ETS, &qopt);
++	if (!qopt.block_offload)
++		return 0;
++
++	return err;
++}
++
++static void ets_offload_change(struct Qdisc *sch)
++{
++	struct ets_sched *q = qdisc_priv(sch);
++
++	ets_offload(sch, q->nbands, q->prio2band, NULL, TC_ETS_REPLACE, NULL);
++}
++
++static int ets_offload_validate(struct Qdisc *sch, unsigned int bands,
++				const u8 *priomap,
++				const unsigned int *quanta,
++				struct netlink_ext_ack *extack)
++{
++	return ets_offload(sch, bands, priomap, quanta, TC_ETS_VALIDATE,
++			   extack);
+ }
+ 
+ static void ets_offload_destroy(struct Qdisc *sch)
+@@ -641,6 +666,10 @@
+ 			quanta[i] = psched_mtu(qdisc_dev(sch));
+ 	}
+ 
++	err = ets_offload_validate(sch, nbands, priomap, quanta, extack);
++	if (err)
++		return err;
++
+ 	/* Before commit, make sure we can allocate all new qdiscs */
+ 	for (i = oldbands; i < nbands; i++) {
+ 		queues[i] = qdisc_create_dflt(sch->dev_queue, &pfifo_qdisc_ops,
