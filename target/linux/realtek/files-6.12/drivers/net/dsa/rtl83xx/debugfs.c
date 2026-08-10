@@ -5,6 +5,7 @@
 #include <linux/phy.h>
 #include <linux/uaccess.h>
 #include <linux/kernel.h>
+#include <linux/slab.h>
 #include <linux/string.h>
 #include <asm/mach-rtl838x/mach-rtl83xx.h>
 
@@ -783,6 +784,60 @@ static const struct file_operations sched_algo_fops = {
 	.write = sched_algo_write,
 };
 
+#define RTL838X_SWRED_DEBUGFS_BUFSIZE	1536
+
+/* Per-port SWRED state (read-only). The thresholds and probabilities are
+ * switch-global, but the port enable is not. Show every queue and drop
+ * precedence row as programmed, in the hardware's 256-byte page units.
+ */
+static ssize_t swred_read(struct file *filp, char __user *buffer, size_t count,
+			  loff_t *ppos)
+{
+	struct rtl838x_port *p = filp->private_data;
+	struct rtl838x_switch_priv *priv = p->dp->ds->priv;
+	struct rtl838x_qos_swred_state state;
+	char *buf;
+	int len = 0;
+	ssize_t ret;
+
+	if (*ppos != 0)
+		return 0;
+
+	buf = kmalloc(RTL838X_SWRED_DEBUGFS_BUFSIZE, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+
+	if (priv->family_id == RTL9310_FAMILY_ID)
+		rtl931x_qos_swred_get(priv, p->dp->index, &state);
+	else
+		rtl930x_qos_swred_get(priv, p->dp->index, &state);
+
+	len += scnprintf(buf + len, RTL838X_SWRED_DEBUGFS_BUFSIZE - len, "enabled %u\n",
+			 state.enabled);
+	len += scnprintf(buf + len, RTL838X_SWRED_DEBUGFS_BUFSIZE - len,
+			 "page_bytes 256\n");
+	for (int queue = 0; queue < MAX_PRIOS; queue++) {
+		for (int dp = 0; dp < RTL838X_SWRED_DROP_PRECEDENCES; dp++)
+			len += scnprintf(buf + len,
+					 RTL838X_SWRED_DEBUGFS_BUFSIZE - len,
+					 "queue %d dp %d min_pages %u max_pages %u probability %u\n",
+					 queue, dp, state.min_pages[queue][dp],
+					 state.max_pages[queue][dp],
+					 state.probability[queue][dp]);
+	}
+
+	ret = simple_read_from_buffer(buffer, count, ppos, buf, len);
+	kfree(buf);
+
+	return ret;
+}
+
+static const struct file_operations swred_fops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.read = swred_read,
+};
+
 /* Egress remarking state (read-only). There is no kernel API for egress
  * 1p/DSCP/DEI remarking on DSA ports (the DCBNL app table covers ingress
  * classification only), so the remark engine state is exposed here for
@@ -1371,6 +1426,8 @@ void rtl930x_dbgfs_init(struct rtl838x_switch_priv *priv)
 			debugfs_create_file("remark", 0400, port_dir,
 					    &priv->ports[i], &remark_fops);
 		}
+		debugfs_create_file("swred", 0400, port_dir,
+				    &priv->ports[i], &swred_fops);
 		debugfs_create_file("sched_algo", 0600, port_dir,
 				    &priv->ports[i], &sched_algo_fops);
 	}

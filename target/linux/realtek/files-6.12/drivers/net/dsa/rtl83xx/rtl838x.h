@@ -589,7 +589,7 @@ enum rtldsa_storm_class {
 #define RTL839X_SPCL_TRAP_SWITCH_IPV4_ADDR_CTRL	(0x106C)
 #define RTL839X_SPCL_TRAP_CRC_CTRL		(0x1070)
 
-#define RTL930X_BANDWIDTH_CTRL_EGRESS(port)	(0x7660 + (port * 16))
+/* The egress policer shares RTL930X_EGBW_PORT_CTRL() with the root TBF. */
 #define RTL930X_BANDWIDTH_CTRL_INGRESS(port)	(0x8068 + (port * 4))
 #define RTL930X_BANDWIDTH_CTRL_MAX_BURST	(64 * 1000)
 #define RTL930X_BANDWIDTH_CTRL_INGRESS_BURST_HIGH_ON(port) \
@@ -599,7 +599,7 @@ enum rtldsa_storm_class {
 #define RTL930X_BANDWIDTH_CTRL_INGRESS_BURST_MAX \
 						GENMASK(30, 0)
 
-#define RTL931X_BANDWIDTH_CTRL_EGRESS(port)	(0x2164 + (port * 8))
+/* The egress policer shares RTL931X_EGBW_PORT_CTRL() with the root TBF. */
 #define RTL931X_BANDWIDTH_CTRL_INGRESS(port)	(0xe008 + (port * 8))
 
 #define RTL93XX_BANDWIDTH_CTRL_RATE_MAX		GENMASK(19, 0)
@@ -750,12 +750,14 @@ typedef enum {
 /* port: 24-27, queue: 0-11 */
 #define RTL930X_EGBW_PORT_Q_MAX_LB_CTRL_SET1(port, q) \
 							(0xE300 + (((port) - 24) * 96) + ((q) * 8))
-/* port: 0-28 */
+/* port: 0-28. This one bucket is shared by root TBF and egress policer. */
 #define RTL930X_EGBW_PORT_CTRL(port)		(0x7660 + ((port) * 16))
-/* Reset value of the burst word; the burst cap gates egress even with
- * EN clear, so "disabled" must restore it rather than write zero.
+/* Cold-reset value of the burst word. The vendor SDK's
+ * RTK_DEFAULT_EGR_BANDWIDTH_PORT_BURST is 0x4000, but a cold Longan reset
+ * reads 0x8000 here. The burst cap gates egress even with EN clear, so the
+ * driver restores the silicon reset posture rather than the SDK policy.
  */
-#define RTL930X_EGBW_LB_RESET_BURST		(0x4000)
+#define RTL930X_EGBW_LB_RESET_BURST		(0x8000)
 #define RTL930X_EGBW_LB_CTRL			(0x78EC)
 #define RTL930X_EGBW_LB_TKN_M			GENMASK(31, 16)
 #define RTL930X_EGBW_Q_RATE_M			GENMASK(19, 0)
@@ -828,6 +830,7 @@ typedef enum {
  * dal_mango_rate_portEgrBwCtrl{Enable,Rate,BurstSize}_set). The word order
  * is the reverse of RTL930x, where EN|RATE is the low word.
  */
+/* This one bucket is shared by root TBF and egress policer. */
 #define RTL931X_EGBW_PORT_CTRL(port)		(0x2164 + ((port) << 3))
 #define RTL931X_EGBW_LB_CTRL			(0x2160)
 /* TKN is the low half of EGBW_LB_CTRL on this family (the high half on
@@ -1130,6 +1133,21 @@ struct rtldsa_sample {
 	u32 trunc_size;
 };
 
+#define RTL838X_SWRED_DROP_PRECEDENCES	3
+
+struct rtl838x_qos_swred_state {
+	bool enabled;
+	u16 min_pages[MAX_PRIOS][RTL838X_SWRED_DROP_PRECEDENCES];
+	u16 max_pages[MAX_PRIOS][RTL838X_SWRED_DROP_PRECEDENCES];
+	u8 probability[MAX_PRIOS][RTL838X_SWRED_DROP_PRECEDENCES];
+};
+
+enum rtl838x_port_shaper_owner {
+	RTL838X_PORT_SHAPER_NONE,
+	RTL838X_PORT_SHAPER_TBF,
+	RTL838X_PORT_SHAPER_POLICER,
+};
+
 struct rtl838x_port {
 	bool enable:1;
 	bool phy_is_integrated:1;
@@ -1137,8 +1155,11 @@ struct rtl838x_port {
 	bool is2G5:1;
 	bool isolated:1;
 	bool qinq:1;
-	bool rate_police_egress:1;
 	bool rate_police_ingress:1;
+	/* Root TBF and egress police share one hardware bucket. Protected by
+	 * reg_mutex with the register programming paths.
+	 */
+	enum rtl838x_port_shaper_owner egress_shaper_owner;
 	u64 pm;
 	u16 pvid;
 	bool eee_enabled;
@@ -1720,6 +1741,9 @@ int rtl930x_qos_sched_algo_get(int port);
 void rtl930x_qos_sched_algo_set(int port, bool wrr);
 void rtl930x_qos_port_sched_defaults(int port);
 void rtl930x_qos_sched_defaults(struct rtl838x_switch_priv *priv);
+int rtl83xx_qos_shaper_validate(struct rtl838x_switch_priv *priv, int port,
+				int queue, u64 rate_bytes_ps, u32 min_burst,
+				u32 max_burst, u32 *rate, u32 *burst);
 int rtl930x_qos_queue_shaper_set(struct rtl838x_switch_priv *priv, int port,
 				 int queue, u64 rate_bytes_ps, u32 burst);
 int rtl930x_qos_port_shaper_set(struct rtl838x_switch_priv *priv, int port,
@@ -1727,6 +1751,8 @@ int rtl930x_qos_port_shaper_set(struct rtl838x_switch_priv *priv, int port,
 int rtl930x_qos_swred_set(struct rtl838x_switch_priv *priv, int port, int queue,
 			  u32 min_pages, u32 max_pages, u8 probability);
 void rtl930x_qos_swred_disable(struct rtl838x_switch_priv *priv, int port);
+void rtl930x_qos_swred_get(struct rtl838x_switch_priv *priv, int port,
+			   struct rtl838x_qos_swred_state *state);
 void rtldsa_931x_qos_setup_default_dscp2queue_map(void);
 int rtl931x_qos_default_prio_get(int port);
 int rtl931x_qos_default_prio_set(struct rtl838x_switch_priv *priv, int port,
@@ -1746,6 +1772,8 @@ int rtl931x_qos_port_shaper_set(struct rtl838x_switch_priv *priv, int port,
 int rtl931x_qos_swred_set(struct rtl838x_switch_priv *priv, int port, int queue,
 			  u32 min_pages, u32 max_pages, u8 probability);
 void rtl931x_qos_swred_disable(struct rtl838x_switch_priv *priv, int port);
+void rtl931x_qos_swred_get(struct rtl838x_switch_priv *priv, int port,
+			   struct rtl838x_qos_swred_state *state);
 
 void rtldsa_counters_lock_register(struct rtl838x_switch_priv *priv, int port)
 	__acquires(&priv->ports[port].counters.lock);

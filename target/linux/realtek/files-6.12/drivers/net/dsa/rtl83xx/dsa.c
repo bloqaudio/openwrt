@@ -883,11 +883,23 @@ static int rtldsa_93xx_tc_setup_qdisc_ets(struct dsa_switch *ds, int port,
 	u32 weight_max = is_rtl931x ? RTL931X_SCHED_Q_WEIGHT_MAX :
 				      RTL930X_SCHED_Q_WEIGHT_MAX;
 	int band;
+	int prio;
 
 	if (qopt->parent != TC_H_ROOT)
 		return -EOPNOTSUPP;
 
 	switch (qopt->command) {
+	case TC_ETS_VALIDATE:
+		for (prio = 0; prio <= TC_PRIO_MAX; prio++) {
+			if (p->priomap[prio] == p->bands - 1)
+				continue;
+
+			qopt->block_offload = true;
+			NL_SET_ERR_MSG_MOD(qopt->extack,
+					   "ETS priomap cannot be offloaded: hardware classifies via dcb app / default-prio, not skb priority");
+			return -EOPNOTSUPP;
+		}
+		return 0;
 	case TC_ETS_REPLACE:
 		break;
 	case TC_ETS_DESTROY:
@@ -931,6 +943,85 @@ static int rtldsa_93xx_tc_setup_qdisc_ets(struct dsa_switch *ds, int port,
 	return 0;
 }
 
+static int rtldsa_93xx_port_shaper_set(struct rtl838x_switch_priv *priv,
+					       int port, u64 rate_bytes_ps,
+					       u32 burst)
+{
+	if (priv->family_id == RTL9310_FAMILY_ID)
+		return rtl931x_qos_port_shaper_set(priv, port, rate_bytes_ps, burst);
+
+	return rtl930x_qos_port_shaper_set(priv, port, rate_bytes_ps, burst);
+}
+
+static int rtldsa_93xx_port_tbf_replace(struct rtl838x_switch_priv *priv,
+					 int port, u64 rate_bytes_ps, u32 burst)
+{
+	struct rtl838x_port *p = &priv->ports[port];
+	bool claimed = false;
+	int ret;
+
+	mutex_lock(&priv->reg_mutex);
+	if (p->egress_shaper_owner == RTL838X_PORT_SHAPER_POLICER) {
+		mutex_unlock(&priv->reg_mutex);
+		dev_warn(priv->dev,
+			 "port %d root TBF rejected: egress port shaper is owned by an egress policer\n",
+			 port);
+		return -EBUSY;
+	}
+	if (p->egress_shaper_owner == RTL838X_PORT_SHAPER_NONE) {
+		p->egress_shaper_owner = RTL838X_PORT_SHAPER_TBF;
+		claimed = true;
+	}
+	mutex_unlock(&priv->reg_mutex);
+
+	/* sch_tbf drops this return code. The family setter validates before
+	 * every write, so a failed replacement deliberately leaves an existing
+	 * TBF programmed. A first-time failed claim is released below, leaving
+	 * the reset, unshaped posture and no owner.
+	 */
+	ret = rtldsa_93xx_port_shaper_set(priv, port, rate_bytes_ps, burst);
+	if (ret && claimed) {
+		mutex_lock(&priv->reg_mutex);
+		if (p->egress_shaper_owner == RTL838X_PORT_SHAPER_TBF)
+			p->egress_shaper_owner = RTL838X_PORT_SHAPER_NONE;
+		mutex_unlock(&priv->reg_mutex);
+	}
+
+	return ret;
+}
+
+static int rtldsa_93xx_port_tbf_destroy(struct rtl838x_switch_priv *priv,
+					 int port)
+{
+	struct rtl838x_port *p = &priv->ports[port];
+	int ret;
+
+	mutex_lock(&priv->reg_mutex);
+	if (p->egress_shaper_owner != RTL838X_PORT_SHAPER_TBF) {
+		if (p->egress_shaper_owner == RTL838X_PORT_SHAPER_POLICER)
+			dev_warn(priv->dev,
+				 "port %d root TBF teardown ignored: egress policer owns the port shaper\n",
+				 port);
+		mutex_unlock(&priv->reg_mutex);
+		return 0;
+	}
+	mutex_unlock(&priv->reg_mutex);
+
+	ret = rtldsa_93xx_port_shaper_set(priv, port, 0, 0);
+	if (ret) {
+		dev_warn(priv->dev,
+			 "port %d root TBF teardown rejected; egress port shaper left unchanged\n",
+			 port);
+		return ret;
+	}
+
+	mutex_lock(&priv->reg_mutex);
+	p->egress_shaper_owner = RTL838X_PORT_SHAPER_NONE;
+	mutex_unlock(&priv->reg_mutex);
+
+	return 0;
+}
+
 /* TBF attached to an ETS band shapes the egress leaky bucket of the
  * hardware queue the band maps to (band b = queue 7 - b, so parent
  * classid minor m shapes queue 8 - m); TBF at the root shapes the
@@ -954,15 +1045,9 @@ static int rtldsa_93xx_tc_setup_qdisc_tbf(struct dsa_switch *ds, int port,
 
 	switch (qopt->command) {
 	case TC_TBF_REPLACE:
-		if (queue < 0) {
-			if (is_rtl931x)
-				return rtl931x_qos_port_shaper_set(priv, port,
-							p->rate.rate_bytes_ps,
-							p->max_size);
-			return rtl930x_qos_port_shaper_set(priv, port,
-							p->rate.rate_bytes_ps,
-							p->max_size);
-		}
+		if (queue < 0)
+			return rtldsa_93xx_port_tbf_replace(priv, port,
+						     p->rate.rate_bytes_ps, p->max_size);
 		if (is_rtl931x)
 			return rtl931x_qos_queue_shaper_set(priv, port, queue,
 							    p->rate.rate_bytes_ps,
@@ -971,11 +1056,8 @@ static int rtldsa_93xx_tc_setup_qdisc_tbf(struct dsa_switch *ds, int port,
 						    p->rate.rate_bytes_ps,
 						    p->max_size);
 	case TC_TBF_DESTROY:
-		if (queue < 0) {
-			if (is_rtl931x)
-				return rtl931x_qos_port_shaper_set(priv, port, 0, 0);
-			return rtl930x_qos_port_shaper_set(priv, port, 0, 0);
-		}
+		if (queue < 0)
+			return rtldsa_93xx_port_tbf_destroy(priv, port);
 		if (is_rtl931x)
 			return rtl931x_qos_queue_shaper_set(priv, port, queue, 0, 0);
 		return rtl930x_qos_queue_shaper_set(priv, port, queue, 0, 0);
@@ -1002,13 +1084,18 @@ static int rtldsa_93xx_tc_setup_qdisc_red(struct dsa_switch *ds, int port,
 				   RTL930X_SWRED_THR_MAX_PAGES;
 	u32 min_pages, max_pages;
 	u8 probability;
+	int ret;
 	int queue = -1;
 
 	if (qopt->parent != TC_H_ROOT) {
 		unsigned int minor = TC_H_MIN(qopt->parent);
 
-		if (!minor || minor > MAX_PRIOS)
+		if (!minor || minor > MAX_PRIOS) {
+			dev_warn(priv->dev,
+				 "port %d RED offload rejected: parent %#x is not root or ETS band 1-%u\n",
+				 port, qopt->parent, MAX_PRIOS);
 			return -EOPNOTSUPP;
+		}
 		queue = MAX_PRIOS - minor;
 	}
 
@@ -1025,8 +1112,12 @@ static int rtldsa_93xx_tc_setup_qdisc_red(struct dsa_switch *ds, int port,
 		return -EOPNOTSUPP;
 	}
 
-	if (p->is_ecn)
+	if (p->is_ecn) {
+		dev_warn(priv->dev,
+			 "port %d RED offload rejected: ECN marking is unsupported; SWRED only drops\n",
+			 port);
 		return -EOPNOTSUPP;
+	}
 
 	if (p->is_nodrop) {
 		if (is_rtl931x)
@@ -1036,27 +1127,48 @@ static int rtldsa_93xx_tc_setup_qdisc_red(struct dsa_switch *ds, int port,
 		return 0;
 	}
 
-	if (!p->min || !p->max || p->min > p->max)
+	if (!p->min || !p->max || p->min > p->max) {
+		dev_warn(priv->dev,
+			 "port %d RED offload rejected: min %u and max %u bytes; require 1 <= min <= max\n",
+			 port, p->min, p->max);
 		return -EINVAL;
+	}
 
 	/* Thresholds are programmed in units of 256-byte pages, the
 	 * 2^32 fixed-point drop probability maps onto a rate of 0-255.
 	 */
 	min_pages = DIV_ROUND_UP(p->min, page_bytes);
 	max_pages = p->max / page_bytes;
-	if (!min_pages || !max_pages || max_pages > thr_max)
+	if (!min_pages || !max_pages || min_pages > max_pages ||
+	    max_pages > thr_max) {
+		dev_warn(priv->dev,
+			 "port %d RED offload rejected: min %u bytes -> %u pages, max %u bytes -> %u pages; require 1 <= min_pages <= max_pages <= %u (%u-byte pages)\n",
+			 port, p->min, min_pages, p->max, max_pages, thr_max,
+			 page_bytes);
 		return -EINVAL;
+	}
 
 	probability = ((u64)p->probability * 255 +
 		       BIT_ULL(32) - 1) >> 32;
-	if (!probability)
+	if (!probability) {
+		dev_warn(priv->dev,
+			 "port %d RED offload rejected: probability %#x -> %u; require 1..0xffffffff (2^32 fixed-point scaled to 1..255)\n",
+			 port, p->probability, probability);
 		return -EINVAL;
+	}
 
 	if (is_rtl931x)
-		return rtl931x_qos_swred_set(priv, port, queue, min_pages,
+		ret = rtl931x_qos_swred_set(priv, port, queue, min_pages,
 					     max_pages, probability);
-	return rtl930x_qos_swred_set(priv, port, queue, min_pages, max_pages,
-				     probability);
+	else
+		ret = rtl930x_qos_swred_set(priv, port, queue, min_pages, max_pages,
+					     probability);
+	if (ret)
+		dev_warn(priv->dev,
+			 "port %d RED offload rejected after conversion: min %u pages, max %u pages, probability %u/255\n",
+			 port, min_pages, max_pages, probability);
+
+	return ret;
 }
 
 static int rtldsa_93xx_port_setup_tc(struct dsa_switch *ds, int port,
@@ -3827,14 +3939,34 @@ static int rtldsa_cls_flower_add(struct dsa_switch *ds, int port,
 
 	mutex_lock(&priv->reg_mutex);
 
-	/* only allow one offloaded police for ingress/egress */
+	/* Only allow one offloaded ingress police. Root TBF and egress police
+	 * are mutually exclusive because both program the same port bucket.
+	 */
 	if (ingress && p->rate_police_ingress) {
-		ret = -EOPNOTSUPP;
+		NL_SET_ERR_MSG_MOD(cls->common.extack,
+				   "An ingress policer is already installed on this port");
+		dev_warn(priv->dev,
+			 "port %d ingress policer rejected: an ingress policer is already installed\n",
+			 port);
+		ret = -EBUSY;
 		goto unlock;
 	}
 
-	if (!ingress && p->rate_police_egress) {
-		ret = -EOPNOTSUPP;
+	if (!ingress && p->egress_shaper_owner != RTL838X_PORT_SHAPER_NONE) {
+		if (p->egress_shaper_owner == RTL838X_PORT_SHAPER_TBF) {
+			NL_SET_ERR_MSG_MOD(cls->common.extack,
+					   "Egress port shaper is already owned by root TBF");
+			dev_warn(priv->dev,
+				 "port %d egress policer rejected: root TBF owns the port shaper\n",
+				 port);
+		} else {
+			NL_SET_ERR_MSG_MOD(cls->common.extack,
+					   "An egress policer is already installed on this port");
+			dev_warn(priv->dev,
+				 "port %d egress policer rejected: an egress policer already owns the port shaper\n",
+				 port);
+		}
+		ret = -EBUSY;
 		goto unlock;
 	}
 
@@ -3845,7 +3977,7 @@ static int rtldsa_cls_flower_add(struct dsa_switch *ds, int port,
 	if (ingress)
 		p->rate_police_ingress = true;
 	else
-		p->rate_police_egress = true;
+		p->egress_shaper_owner = RTL838X_PORT_SHAPER_POLICER;
 
 unlock:
 	mutex_unlock(&priv->reg_mutex);
@@ -3872,6 +4004,18 @@ static int rtldsa_cls_flower_del(struct dsa_switch *ds, int port,
 		return -EOPNOTSUPP;
 
 	mutex_lock(&priv->reg_mutex);
+	if (ingress && !p->rate_police_ingress) {
+		mutex_unlock(&priv->reg_mutex);
+		return 0;
+	}
+	if (!ingress && p->egress_shaper_owner != RTL838X_PORT_SHAPER_POLICER) {
+		if (p->egress_shaper_owner == RTL838X_PORT_SHAPER_TBF)
+			dev_warn(priv->dev,
+				 "port %d egress policer teardown ignored: root TBF owns the port shaper\n",
+				 port);
+		mutex_unlock(&priv->reg_mutex);
+		return 0;
+	}
 
 	ret = priv->r->port_rate_police_del(ds, port, cls, ingress);
 	if (ret < 0)
@@ -3880,7 +4024,7 @@ static int rtldsa_cls_flower_del(struct dsa_switch *ds, int port,
 	if (ingress)
 		p->rate_police_ingress = false;
 	else
-		p->rate_police_egress = false;
+		p->egress_shaper_owner = RTL838X_PORT_SHAPER_NONE;
 
 unlock:
 	mutex_unlock(&priv->reg_mutex);

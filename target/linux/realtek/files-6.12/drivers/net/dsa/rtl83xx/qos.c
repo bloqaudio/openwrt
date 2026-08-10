@@ -15,6 +15,50 @@ int rtldsa_max_available_queue[] = {0, 1, 2, 3, 4, 5, 6, 7};
 int rtldsa_default_queue_weights[] = {1, 1, 1, 1, 1, 1, 1, 1};
 int dot1p_priority_remapping[] = {0, 1, 2, 3, 4, 5, 6, 7};
 
+/* Validate an egress TBF before its family-specific programming path takes
+ * reg_mutex or writes a register. sch_tbf drops the driver's error return,
+ * so every rejection and adjustment must be visible in the kernel log.
+ */
+int rtl83xx_qos_shaper_validate(struct rtl838x_switch_priv *priv, int port,
+				int queue, u64 rate_bytes_ps, u32 min_burst,
+				u32 max_burst, u32 *rate, u32 *burst)
+{
+	u64 hw_rate;
+	u32 requested_burst = *burst;
+	u32 applied_burst;
+
+	/* One hardware rate unit is 16 Kbps, or 2000 bytes/s. */
+	hw_rate = DIV_ROUND_UP_ULL(rate_bytes_ps, 2000U);
+	if (!hw_rate || hw_rate > RTL93XX_BANDWIDTH_CTRL_RATE_MAX) {
+		dev_warn(priv->dev,
+			 "port %d egress %s TBF (queue %d) rate %llu Bps rejected; hardware accepts 1..%llu Bps\n",
+			 port, queue < 0 ? "root" : "queue", queue,
+			 rate_bytes_ps,
+			 (u64)RTL93XX_BANDWIDTH_CTRL_RATE_MAX * 2000ULL);
+		return -EINVAL;
+	}
+
+	if (min_burst > max_burst) {
+		dev_warn(priv->dev,
+			 "port %d egress %s TBF (queue %d) burst %u bytes rejected; token floor %u exceeds field maximum %u bytes\n",
+			 port, queue < 0 ? "root" : "queue", queue,
+			 requested_burst, min_burst, max_burst);
+		return -EINVAL;
+	}
+
+	applied_burst = clamp_t(u32, requested_burst, min_burst, max_burst);
+	if (applied_burst != requested_burst)
+		dev_warn(priv->dev,
+			 "port %d egress %s TBF (queue %d) burst %u bytes clamped to %u bytes (hardware accepts %u..%u bytes)\n",
+			 port, queue < 0 ? "root" : "queue", queue,
+			 requested_burst, applied_burst, min_burst, max_burst);
+
+	*rate = hw_rate;
+	*burst = applied_burst;
+
+	return 0;
+}
+
 static void rtl839x_read_scheduling_table(int port)
 {
 	u32 cmd = 1 << 9 | /* Execute cmd */

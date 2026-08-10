@@ -318,21 +318,33 @@ static int rtldsa_931x_port_rate_police_add(struct dsa_switch *ds, int port,
 					    const struct flow_action_entry *act,
 					    bool ingress)
 {
+	struct rtl838x_switch_priv *priv = ds->priv;
 	u32 burst;
 	u64 rate;
 	u32 addr;
 
 	/* rate has unit 16000 bit */
 	rate = div_u64(act->police.rate_bytes_ps, 2000);
+	if (rate > RTL93XX_BANDWIDTH_CTRL_RATE_MAX)
+		dev_warn(priv->dev,
+			 "port %d %s policer rate %llu Bps clamped to %u Bps\n",
+			 port, ingress ? "ingress" : "egress",
+			 act->police.rate_bytes_ps,
+			 (u32)(RTL93XX_BANDWIDTH_CTRL_RATE_MAX * 2000U));
 	rate = min_t(u64, rate, RTL93XX_BANDWIDTH_CTRL_RATE_MAX);
 	rate |= RTL93XX_BANDWIDTH_CTRL_ENABLE;
 
+	if (act->police.burst > RTL931X_BANDWIDTH_CTRL_MAX_BURST)
+		dev_warn(priv->dev,
+			 "port %d %s policer burst %u bytes clamped to %u bytes\n",
+			 port, ingress ? "ingress" : "egress", act->police.burst,
+			 (u32)RTL931X_BANDWIDTH_CTRL_MAX_BURST);
 	burst = min_t(u32, act->police.burst, RTL931X_BANDWIDTH_CTRL_MAX_BURST);
 
 	if (ingress)
 		addr = RTL931X_BANDWIDTH_CTRL_INGRESS(port);
 	else
-		addr = RTL931X_BANDWIDTH_CTRL_EGRESS(port);
+		addr = RTL931X_EGBW_PORT_CTRL(port);
 
 	sw_w32(burst, addr + 4);
 	sw_w32(rate, addr);
@@ -349,9 +361,17 @@ static int rtldsa_931x_port_rate_police_del(struct dsa_switch *ds, int port,
 	if (ingress)
 		addr = RTL931X_BANDWIDTH_CTRL_INGRESS(port);
 	else
-		addr = RTL931X_BANDWIDTH_CTRL_EGRESS(port);
+		addr = RTL931X_EGBW_PORT_CTRL(port);
 
-	sw_w32_mask(RTL93XX_BANDWIDTH_CTRL_ENABLE, 0, addr);
+	if (ingress) {
+		sw_w32_mask(RTL93XX_BANDWIDTH_CTRL_ENABLE, 0, addr);
+	} else {
+		/* Match root-TBF teardown: a stale burst cap still gates egress
+		 * with EN clear, so restore rate-wide-open and the reset burst.
+		 */
+		sw_w32(RTL931X_EGBW_Q_RATE_M, addr);
+		sw_w32(RTL931X_EGBW_LB_RESET_BURST, addr + 4);
+	}
 
 	return 0;
 }
@@ -2471,16 +2491,18 @@ int rtl931x_qos_queue_shaper_set(struct rtl838x_switch_priv *priv, int port,
 {
 	u32 entry[RTL931X_EGR_Q_BW_WORDS];
 	struct table_reg *r;
-	u32 rate = 0, tkn;
+	u32 rate = 0, tkn, min_burst;
+	int ret;
 
 	if (rate_bytes_ps) {
-		rate = DIV_ROUND_UP_ULL(rate_bytes_ps * 8, 16000);
-		if (!rate || rate > RTL931X_EGBW_Q_RATE_M)
-			return -EINVAL;
-
 		tkn = sw_r32(RTL931X_EGBW_LB_CTRL) & RTL931X_EGBW_LB_TKN_M;
-		if (burst < 8 * tkn || burst > RTL931X_EGBW_Q_BURST_M)
-			return -EINVAL;
+		min_burst = 8 * tkn;
+		ret = rtl83xx_qos_shaper_validate(priv, port, queue,
+						 rate_bytes_ps, min_burst,
+						 RTL931X_EGBW_Q_BURST_M, &rate,
+						 &burst);
+		if (ret)
+			return ret;
 	}
 
 	r = rtl_table_get(RTL9310_TBL_4, 0);
@@ -2533,16 +2555,18 @@ int rtl931x_qos_port_shaper_set(struct rtl838x_switch_priv *priv, int port,
 				u64 rate_bytes_ps, u32 burst)
 {
 	u32 addr = RTL931X_EGBW_PORT_CTRL(port);
-	u32 rate = 0, tkn;
+	u32 rate = 0, tkn, min_burst;
+	int ret;
 
 	if (rate_bytes_ps) {
-		rate = DIV_ROUND_UP_ULL(rate_bytes_ps * 8, 16000);
-		if (!rate || rate > RTL931X_EGBW_Q_RATE_M)
-			return -EINVAL;
-
 		tkn = sw_r32(RTL931X_EGBW_LB_CTRL) & RTL931X_EGBW_LB_TKN_M;
-		if (burst < 8 * tkn || burst > RTL931X_EGBW_Q_BURST_M)
-			return -EINVAL;
+		min_burst = 8 * tkn;
+		ret = rtl83xx_qos_shaper_validate(priv, port, -1,
+						 rate_bytes_ps, min_burst,
+						 RTL931X_EGBW_Q_BURST_M, &rate,
+						 &burst);
+		if (ret)
+			return ret;
 	}
 
 	/* 64-bit entry, high word first: the low address carries RATE
@@ -2609,6 +2633,26 @@ void rtl931x_qos_swred_disable(struct rtl838x_switch_priv *priv, int port)
 	mutex_lock(&priv->reg_mutex);
 	sw_w32_mask(RTL931X_FC_EGR_DROP_ALGO_SWRED, 0,
 		    RTL931X_FC_PORT_EGR_DROP_CTRL(port));
+	mutex_unlock(&priv->reg_mutex);
+}
+
+void rtl931x_qos_swred_get(struct rtl838x_switch_priv *priv, int port,
+			   struct rtl838x_qos_swred_state *state)
+{
+	mutex_lock(&priv->reg_mutex);
+	state->enabled = !!(sw_r32(RTL931X_FC_PORT_EGR_DROP_CTRL(port)) &
+				   RTL931X_FC_EGR_DROP_ALGO_SWRED);
+	for (int queue = 0; queue < MAX_PRIOS; queue++) {
+		u32 rate = sw_r32(RTL931X_SWRED_Q_DROP_RATE(queue));
+
+		for (int dp = 0; dp < RTL838X_SWRED_DROP_PRECEDENCES; dp++) {
+			u32 v = sw_r32(RTL931X_SWRED_Q_THR(queue, dp));
+
+			state->min_pages[queue][dp] = FIELD_GET(RTL931X_SWRED_THR_MIN_M, v);
+			state->max_pages[queue][dp] = FIELD_GET(RTL931X_SWRED_THR_MAX_M, v);
+			state->probability[queue][dp] = (rate >> (dp * 8)) & 0xff;
+		}
+	}
 	mutex_unlock(&priv->reg_mutex);
 }
 
