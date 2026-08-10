@@ -344,8 +344,10 @@ static int rtl83xx_mdio_probe(struct rtl838x_switch_priv *priv)
 				continue;
 			}
 
-			if (sfp_node)
+			if (sfp_node) {
+				priv->ports[pn].sfp = true;
 				rtpcs_pcs_set_sfp_node(priv->pcs[pn], sfp_node);
+			}
 		}
 
 		if (of_get_phy_mode(dn, &interface))
@@ -410,6 +412,39 @@ static int rtl83xx_mdio_probe(struct rtl838x_switch_priv *priv)
 	}
 
 	return 0;
+}
+
+/* Return the maximum speed of a DSA user port from its actual attachment,
+ * rather than the initial phy-mode. SFP+ ports commonly start in 1000base-x
+ * mode even though the cage and PCS support 10G, while an external PHY's
+ * supported bitmap is authoritative for copper GE/2.5GE/10GE ports.
+ */
+int rtl83xx_port_max_speed(struct rtl838x_switch_priv *priv, int port)
+{
+	const struct phy_setting *setting;
+	const struct dsa_port *dp = priv->ports[port].dp;
+	struct phy_device *phydev;
+
+	if (priv->ports[port].sfp)
+		return SPEED_10000;
+
+	phydev = dp && dp->user ? dp->user->phydev : NULL;
+	if (phydev) {
+		setting = phy_lookup_setting(SPEED_10000, DUPLEX_FULL,
+					     phydev->supported, false);
+		if (setting)
+			return setting->speed;
+	}
+
+	/* Fallback for fixed/PCS-only descriptions without a PHY or SFP node. */
+	if (priv->ports[port].is10G)
+		return SPEED_10000;
+	if (priv->ports[port].is2G5)
+		return SPEED_2500;
+	if (priv->ports[port].phy || priv->pcs[port])
+		return SPEED_1000;
+
+	return SPEED_UNKNOWN;
 }
 
 static int rtl83xx_get_l2aging(struct rtl838x_switch_priv *priv)
@@ -2861,6 +2896,9 @@ static int rtl83xx_sw_probe(struct platform_device *pdev)
 		sw_w32(0x1, priv->r->imr_glb);
 
 	rtl83xx_get_l2aging(priv);
+
+	if (priv->r->flow_control_init)
+		priv->r->flow_control_init(priv);
 
 	if (priv->r->qos_init)
 		priv->r->qos_init(priv);

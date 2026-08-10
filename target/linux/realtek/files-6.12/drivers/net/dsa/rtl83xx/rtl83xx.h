@@ -135,6 +135,7 @@ void rtldsa_838x_qos_init(struct rtl838x_switch_priv *priv);
 void rtldsa_839x_qos_init(struct rtl838x_switch_priv *priv);
 
 void rtl83xx_fast_age(struct dsa_switch *ds, int port);
+int rtl83xx_port_max_speed(struct rtl838x_switch_priv *priv, int port);
 void rtl83xx_l3_flush_neigh_routes(struct rtl838x_switch_priv *priv, int port);
 int rtl83xx_packet_cntr_alloc(struct rtl838x_switch_priv *priv);
 int rtl83xx_port_get_stp_state(struct rtl838x_switch_priv *priv, int port);

@@ -5,6 +5,7 @@
 #include <linux/etherdevice.h>
 #include <linux/inetdevice.h>
 #include <linux/iopoll.h>
+#include <linux/seq_file.h>
 #include <linux/sort.h>
 
 #include "rtl83xx.h"
@@ -2321,6 +2322,273 @@ static u64 rtldsa_931x_stat_port_table_read(int port, unsigned int mib_size,
 	return ret;
 }
 
+/* Flow-control construction from _dal_mango_flowctrl_init_config(). Mango has
+ * no model table: these are the named constants in dal_mango_construct.h.
+ * Addresses and fields come from rtk_mango_{reg,regField}_list.c, whose
+ * FC_PORT_EGR_DROP_CTRL/SWRED entries at 0xa800/0x27c4/0x27f4 already match
+ * this driver's hardware-verified QoS register map.
+ */
+#define RTL931X_IGBW_Q_DROP_THR(q)		(0xe1e8 + ((q) << 2))
+#define RTL931X_FC_PORT_ACT_CTRL(p)		(0x504c + ((p) << 2))
+#define RTL931X_FC_GLB_SYS_UTIL_THR		0x5130
+#define RTL931X_FC_GLB_DROP_THR			0x5134
+#define RTL931X_FC_GLB_HI_THR			0x5138
+#define RTL931X_FC_GLB_LO_THR			0x513c
+#define RTL931X_FC_GLB_FCOFF_HI_THR		0x5140
+#define RTL931X_FC_GLB_FCOFF_LO_THR		0x5144
+#define RTL931X_FC_JUMBO_HI_THR			0x5148
+#define RTL931X_FC_JUMBO_LO_THR			0x514c
+#define RTL931X_FC_JUMBO_FCOFF_HI_THR		0x5150
+#define RTL931X_FC_JUMBO_FCOFF_LO_THR		0x5154
+#define RTL931X_FC_PORT_HI_THR			0x515c
+#define RTL931X_FC_PORT_LO_THR			0x516c
+#define RTL931X_FC_PORT_FCOFF_HI_THR		0x517c
+#define RTL931X_FC_PORT_FCOFF_LO_THR		0x518c
+#define RTL931X_FC_PORT_GUAR_THR			0x519c
+#define RTL931X_FC_PORT_THR_SET_SEL		0x51ac
+#define RTL931X_FC_Q_EGR_DROP_THR		0x2618
+#define RTL931X_FC_PORT_EGR_DROP_THR_SET_SEL	0x2728
+#define RTL931X_FC_REPCT_FCOFF_THR		0x8180
+#define RTL931X_FC_HOL_PRVNT_CTRL		0xa8e4
+
+#define RTL931X_FC_THR_ON_M			GENMASK(28, 16)
+#define RTL931X_FC_THR_OFF_M			GENMASK(12, 0)
+#define RTL931X_FC_THR_M			GENMASK(12, 0)
+#define RTL931X_FC_ALLOW_PAGE_CNT_M		GENMASK(12, 0)
+
+#define RTL931X_IGBW_QUEUE_COUNT		3
+#define RTL931X_FC_QUEUE_COUNT			8
+#define RTL931X_FC_EGR_DROP_THR_SET_COUNT	3
+#define RTL931X_FC_JUMBO_PORT_THR_SET		3
+#define RTL931X_FC_JUMBO_EGR_DROP_THR_SET	2
+
+/* dal_mango_construct.h constants used by
+ * _dal_mango_flowctrl_init_config().
+ */
+#define RTL931X_IGBW_Q_DROP_THR_HIGH		220
+#define RTL931X_IGBW_Q_DROP_THR_LOW		210
+#define RTL931X_FC_JUMBO_Q_DROP_THR_ON		300
+#define RTL931X_FC_JUMBO_Q_DROP_THR_OFF		220
+#define RTL931X_FC_JUMBO_SYS_HI_ON		3572
+#define RTL931X_FC_JUMBO_SYS_HI_OFF		3397
+#define RTL931X_FC_JUMBO_SYS_LO_ON		2510
+#define RTL931X_FC_JUMBO_SYS_LO_OFF		2335
+#define RTL931X_FC_JUMBO_FCOFF_SYS_HI_ON	2000
+#define RTL931X_FC_JUMBO_FCOFF_SYS_HI_OFF	1825
+#define RTL931X_FC_JUMBO_FCOFF_SYS_LO_ON	1000
+#define RTL931X_FC_JUMBO_FCOFF_SYS_LO_OFF	825
+#define RTL931X_FC_JUMBO_PORT_HI_ON		200
+#define RTL931X_FC_JUMBO_PORT_HI_OFF		130
+#define RTL931X_FC_JUMBO_PORT_LO_ON		110
+#define RTL931X_FC_JUMBO_PORT_LO_OFF		35
+#define RTL931X_FC_JUMBO_FCOFF_PORT_HI_ON	200
+#define RTL931X_FC_JUMBO_FCOFF_PORT_HI_OFF	130
+#define RTL931X_FC_JUMBO_FCOFF_PORT_LO_ON	105
+#define RTL931X_FC_JUMBO_FCOFF_PORT_LO_OFF	35
+#define RTL931X_FC_JUMBO_PORT_GUAR		0
+#define RTL931X_FC_PORT_LO_ON			25
+#define RTL931X_FC_REPCT_DROP_ON		78
+#define RTL931X_FC_REPCT_DROP_OFF		68
+#define RTL931X_FC_ALLOW_PAGE_CNT		40
+
+static void rtl931x_fc_field_write(u32 reg, u32 mask, u32 value)
+{
+	sw_w32_mask(mask, (value << __ffs(mask)) & mask, reg);
+}
+
+static u32 rtl931x_fc_field_read(u32 reg, u32 mask)
+{
+	return (sw_r32(reg) & mask) >> __ffs(mask);
+}
+
+static u32 rtl931x_fc_queue_drop_thr(int queue, int set)
+{
+	return RTL931X_FC_Q_EGR_DROP_THR +
+	       ((queue * RTL931X_FC_EGR_DROP_THR_SET_COUNT + set) << 2);
+}
+
+static u32 rtl931x_fc_get_selector(u32 base, int port)
+{
+	u32 shift = (port & 0xf) << 1;
+	u32 reg = base + ((port >> 4) << 2);
+
+	return (sw_r32(reg) >> shift) & 0x3;
+}
+
+static void rtl931x_flow_control_init(struct rtl838x_switch_priv *priv)
+{
+	struct dsa_port *dp;
+	u32 reg;
+
+	mutex_lock(&priv->reg_mutex);
+
+	/* Set ingress queue drop thresholds. */
+	for (int queue = 0; queue < RTL931X_IGBW_QUEUE_COUNT; queue++) {
+		reg = RTL931X_IGBW_Q_DROP_THR(queue);
+		rtl931x_fc_field_write(reg, RTL931X_FC_THR_ON_M,
+				       RTL931X_IGBW_Q_DROP_THR_HIGH);
+		rtl931x_fc_field_write(reg, RTL931X_FC_THR_OFF_M,
+				       RTL931X_IGBW_Q_DROP_THR_LOW);
+	}
+
+	/* The vendor has the ordinary FC_GLB_HI_THR.OFF write under #if 0.
+	 * Deliberately preserve that omission rather than inventing a value.
+	 */
+
+	/* Set jumbo-mode egress queue drop thresholds, table index 2. */
+	for (int queue = 0; queue < RTL931X_FC_QUEUE_COUNT; queue++) {
+		reg = rtl931x_fc_queue_drop_thr(queue,
+						RTL931X_FC_JUMBO_EGR_DROP_THR_SET);
+		rtl931x_fc_field_write(reg, RTL931X_FC_THR_ON_M,
+				       RTL931X_FC_JUMBO_Q_DROP_THR_ON);
+		rtl931x_fc_field_write(reg, RTL931X_FC_THR_OFF_M,
+				       RTL931X_FC_JUMBO_Q_DROP_THR_OFF);
+	}
+
+	/* Set jumbo-mode system thresholds. */
+	rtl931x_fc_field_write(RTL931X_FC_JUMBO_HI_THR, RTL931X_FC_THR_ON_M,
+			       RTL931X_FC_JUMBO_SYS_HI_ON);
+	rtl931x_fc_field_write(RTL931X_FC_JUMBO_HI_THR, RTL931X_FC_THR_OFF_M,
+			       RTL931X_FC_JUMBO_SYS_HI_OFF);
+	rtl931x_fc_field_write(RTL931X_FC_JUMBO_LO_THR, RTL931X_FC_THR_ON_M,
+			       RTL931X_FC_JUMBO_SYS_LO_ON);
+	rtl931x_fc_field_write(RTL931X_FC_JUMBO_LO_THR, RTL931X_FC_THR_OFF_M,
+			       RTL931X_FC_JUMBO_SYS_LO_OFF);
+	rtl931x_fc_field_write(RTL931X_FC_JUMBO_FCOFF_HI_THR,
+			       RTL931X_FC_THR_ON_M,
+			       RTL931X_FC_JUMBO_FCOFF_SYS_HI_ON);
+	rtl931x_fc_field_write(RTL931X_FC_JUMBO_FCOFF_HI_THR,
+			       RTL931X_FC_THR_OFF_M,
+			       RTL931X_FC_JUMBO_FCOFF_SYS_HI_OFF);
+	rtl931x_fc_field_write(RTL931X_FC_JUMBO_FCOFF_LO_THR,
+			       RTL931X_FC_THR_ON_M,
+			       RTL931X_FC_JUMBO_FCOFF_SYS_LO_ON);
+	rtl931x_fc_field_write(RTL931X_FC_JUMBO_FCOFF_LO_THR,
+			       RTL931X_FC_THR_OFF_M,
+			       RTL931X_FC_JUMBO_FCOFF_SYS_LO_OFF);
+
+	/* Set jumbo-mode port thresholds, table index 3. */
+	reg = RTL931X_FC_PORT_HI_THR + (RTL931X_FC_JUMBO_PORT_THR_SET << 2);
+	rtl931x_fc_field_write(reg, RTL931X_FC_THR_ON_M,
+			       RTL931X_FC_JUMBO_PORT_HI_ON);
+	rtl931x_fc_field_write(reg, RTL931X_FC_THR_OFF_M,
+			       RTL931X_FC_JUMBO_PORT_HI_OFF);
+	reg = RTL931X_FC_PORT_LO_THR + (RTL931X_FC_JUMBO_PORT_THR_SET << 2);
+	rtl931x_fc_field_write(reg, RTL931X_FC_THR_ON_M,
+			       RTL931X_FC_JUMBO_PORT_LO_ON);
+	rtl931x_fc_field_write(reg, RTL931X_FC_THR_OFF_M,
+			       RTL931X_FC_JUMBO_PORT_LO_OFF);
+	reg = RTL931X_FC_PORT_GUAR_THR + (RTL931X_FC_JUMBO_PORT_THR_SET << 2);
+	rtl931x_fc_field_write(reg, RTL931X_FC_THR_M,
+			       RTL931X_FC_JUMBO_PORT_GUAR);
+	reg = RTL931X_FC_PORT_FCOFF_HI_THR +
+	      (RTL931X_FC_JUMBO_PORT_THR_SET << 2);
+	rtl931x_fc_field_write(reg, RTL931X_FC_THR_ON_M,
+			       RTL931X_FC_JUMBO_FCOFF_PORT_HI_ON);
+	rtl931x_fc_field_write(reg, RTL931X_FC_THR_OFF_M,
+			       RTL931X_FC_JUMBO_FCOFF_PORT_HI_OFF);
+	reg = RTL931X_FC_PORT_FCOFF_LO_THR +
+	      (RTL931X_FC_JUMBO_PORT_THR_SET << 2);
+	rtl931x_fc_field_write(reg, RTL931X_FC_THR_ON_M,
+			       RTL931X_FC_JUMBO_FCOFF_PORT_LO_ON);
+	rtl931x_fc_field_write(reg, RTL931X_FC_THR_OFF_M,
+			       RTL931X_FC_JUMBO_FCOFF_PORT_LO_OFF);
+
+	/* Adjust the low-on threshold in ordinary port sets 0 through 2. */
+	for (int set = 0; set < RTL931X_FC_JUMBO_PORT_THR_SET; set++) {
+		rtl931x_fc_field_write(RTL931X_FC_PORT_LO_THR + (set << 2),
+				       RTL931X_FC_THR_ON_M,
+				       RTL931X_FC_PORT_LO_ON);
+		rtl931x_fc_field_write(RTL931X_FC_PORT_FCOFF_LO_THR + (set << 2),
+				       RTL931X_FC_THR_ON_M,
+				       RTL931X_FC_PORT_LO_ON);
+	}
+
+	/* Set replication queue drop thresholds. */
+	rtl931x_fc_field_write(RTL931X_FC_REPCT_FCOFF_THR,
+			       RTL931X_FC_THR_ON_M, RTL931X_FC_REPCT_DROP_ON);
+	rtl931x_fc_field_write(RTL931X_FC_REPCT_FCOFF_THR,
+			       RTL931X_FC_THR_OFF_M, RTL931X_FC_REPCT_DROP_OFF);
+
+	/* HWP_PORT_TRAVS_EXCEPT_CPU skips FE ports in the SDK. RTL931x ports
+	 * represented by this DSA driver are GE or faster, so every DSA user
+	 * port receives the vendor's allowance while absent ports stay untouched.
+	 */
+	dsa_switch_for_each_user_port(dp, priv->ds) {
+		if (rtl83xx_port_max_speed(priv, dp->index) <= SPEED_100)
+			continue;
+
+		rtl931x_fc_field_write(RTL931X_FC_PORT_ACT_CTRL(dp->index),
+				       RTL931X_FC_ALLOW_PAGE_CNT_M,
+				       RTL931X_FC_ALLOW_PAGE_CNT);
+	}
+
+	/* RTK_DEFAULT_FC_HOL_PKT_{BC,L2_MC,IP_MC,UNKN_UC}_STATUS are all
+	 * DISABLED. Preserve unrelated upper bits in FC_HOL_PRVNT_CTRL.
+	 */
+	sw_w32_mask(GENMASK(3, 0), 0, RTL931X_FC_HOL_PRVNT_CTRL);
+
+	/* Mango's SWRED construction is a separate vendor function and is not
+	 * ported: W8.7 proved those controls inert on both families.
+	 */
+	mutex_unlock(&priv->reg_mutex);
+}
+
+static void rtl931x_fc_dump_pair(struct seq_file *m, const char *name, u32 reg)
+{
+	seq_printf(m, "%s on %u off %u raw %08x\n", name,
+		   rtl931x_fc_field_read(reg, RTL931X_FC_THR_ON_M),
+		   rtl931x_fc_field_read(reg, RTL931X_FC_THR_OFF_M), sw_r32(reg));
+}
+
+static void rtl931x_flow_control_dump(struct rtl838x_switch_priv *priv,
+				      int port, struct seq_file *m)
+{
+	u32 reg;
+
+	mutex_lock(&priv->reg_mutex);
+	seq_puts(m, "family mango\n");
+	seq_printf(m, "glb_sys_util %u raw %08x source reset\n",
+		   rtl931x_fc_field_read(RTL931X_FC_GLB_SYS_UTIL_THR,
+					 RTL931X_FC_THR_M),
+		   sw_r32(RTL931X_FC_GLB_SYS_UTIL_THR));
+	seq_printf(m, "glb_drop %u raw %08x source reset\n",
+		   rtl931x_fc_field_read(RTL931X_FC_GLB_DROP_THR,
+					 RTL931X_FC_THR_M),
+		   sw_r32(RTL931X_FC_GLB_DROP_THR));
+	rtl931x_fc_dump_pair(m, "glb_hi_vendor_write_disabled",
+			     RTL931X_FC_GLB_HI_THR);
+	rtl931x_fc_dump_pair(m, "glb_lo_source_reset", RTL931X_FC_GLB_LO_THR);
+	rtl931x_fc_dump_pair(m, "glb_fcoff_hi_source_reset",
+			     RTL931X_FC_GLB_FCOFF_HI_THR);
+	rtl931x_fc_dump_pair(m, "glb_fcoff_lo_source_reset",
+			     RTL931X_FC_GLB_FCOFF_LO_THR);
+	rtl931x_fc_dump_pair(m, "jumbo_hi", RTL931X_FC_JUMBO_HI_THR);
+	rtl931x_fc_dump_pair(m, "jumbo_lo", RTL931X_FC_JUMBO_LO_THR);
+	rtl931x_fc_dump_pair(m, "jumbo_fcoff_hi", RTL931X_FC_JUMBO_FCOFF_HI_THR);
+	rtl931x_fc_dump_pair(m, "jumbo_fcoff_lo", RTL931X_FC_JUMBO_FCOFF_LO_THR);
+	reg = RTL931X_FC_PORT_HI_THR + (RTL931X_FC_JUMBO_PORT_THR_SET << 2);
+	rtl931x_fc_dump_pair(m, "jumbo_port_hi", reg);
+	reg = RTL931X_FC_PORT_LO_THR + (RTL931X_FC_JUMBO_PORT_THR_SET << 2);
+	rtl931x_fc_dump_pair(m, "jumbo_port_lo", reg);
+	reg = RTL931X_FC_PORT_FCOFF_HI_THR +
+	      (RTL931X_FC_JUMBO_PORT_THR_SET << 2);
+	rtl931x_fc_dump_pair(m, "jumbo_port_fcoff_hi", reg);
+	reg = RTL931X_FC_PORT_FCOFF_LO_THR +
+	      (RTL931X_FC_JUMBO_PORT_THR_SET << 2);
+	rtl931x_fc_dump_pair(m, "jumbo_port_fcoff_lo", reg);
+	rtl931x_fc_dump_pair(m, "replication_drop", RTL931X_FC_REPCT_FCOFF_THR);
+	seq_printf(m, "hol_prevent %x\n",
+		   (u32)(sw_r32(RTL931X_FC_HOL_PRVNT_CTRL) & GENMASK(3, 0)));
+	seq_printf(m, "port %d thr_set %u egr_drop_thr_set %u allow_page_count %u\n",
+		   port, rtl931x_fc_get_selector(RTL931X_FC_PORT_THR_SET_SEL, port),
+		   rtl931x_fc_get_selector(RTL931X_FC_PORT_EGR_DROP_THR_SET_SEL,
+					   port),
+		   rtl931x_fc_field_read(RTL931X_FC_PORT_ACT_CTRL(port),
+					 RTL931X_FC_ALLOW_PAGE_CNT_M));
+	mutex_unlock(&priv->reg_mutex);
+}
+
 static void rtldsa_931x_qos_set_group_selector(int port, int group)
 {
 	sw_w32_mask(RTL93XX_PORT_TBL_IDX_CTRL_IDX_MASK(port),
@@ -3813,5 +4081,7 @@ const struct rtl838x_reg rtl931x_reg = {
 	.enable_flood = rtldsa_931x_enable_flood,
 	.enable_bcast_flood = rtldsa_931x_enable_bcast_flood,
 	.set_receive_management_action = rtldsa_931x_set_receive_management_action,
+	.flow_control_init = rtl931x_flow_control_init,
+	.flow_control_dump = rtl931x_flow_control_dump,
 	.qos_init = rtldsa_931x_qos_init,
 };

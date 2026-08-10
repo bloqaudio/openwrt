@@ -3,6 +3,7 @@
 #include <asm/mach-rtl838x/mach-rtl83xx.h>
 #include <linux/etherdevice.h>
 #include <linux/inetdevice.h>
+#include <linux/seq_file.h>
 
 #include "rtl83xx.h"
 
@@ -2936,6 +2937,396 @@ static void rtl930x_led_init(struct rtl838x_switch_priv *priv)
 		dev_dbg(dev, "%08x: %08x\n", 0xbb00cc00 + i * 4, sw_r32(0xcc00 + i * 4));
 }
 
+/* Flow-control construction from _dal_longan_flowctrl_init_config(). The
+ * addresses and fields are from rtk_longan_{reg,regField}_list.c; notably,
+ * FC_Q_EGR_DROP_THR at 0x791c is in the same SDK register map as the
+ * hardware-verified SWRED block at 0x7a04.
+ */
+#define RTL930X_FC_MODEL_COUNT			4
+#define RTL930X_FC_PORT_THR_SET_COUNT		4
+#define RTL930X_FC_STACK_QUEUE_COUNT		12
+#define RTL930X_FC_CPU_QUEUE_COUNT		32
+
+#define RTL930X_FC_PORT_ACT_CTRL(p)		(0xd804 + ((p) << 2))
+#define RTL930X_FC_GLB_SYS_UTIL_THR		0xd878
+#define RTL930X_FC_GLB_DROP_THR			0xd87c
+#define RTL930X_FC_GLB_HI_THR			0xd880
+#define RTL930X_FC_GLB_LO_THR			0xd884
+#define RTL930X_FC_GLB_FCOFF_HI_THR		0xd888
+#define RTL930X_FC_GLB_FCOFF_LO_THR		0xd88c
+#define RTL930X_FC_JUMBO_HI_THR			0xd890
+#define RTL930X_FC_JUMBO_LO_THR			0xd894
+#define RTL930X_FC_JUMBO_FCOFF_HI_THR		0xd898
+#define RTL930X_FC_JUMBO_FCOFF_LO_THR		0xd89c
+#define RTL930X_FC_JUMBO_THR_ADJUST		0xd8a0
+#define RTL930X_FC_PORT_HI_THR			0xd8a4
+#define RTL930X_FC_PORT_LO_THR			0xd8b4
+#define RTL930X_FC_PORT_FCOFF_HI_THR		0xd8c4
+#define RTL930X_FC_PORT_FCOFF_LO_THR		0xd8d4
+#define RTL930X_FC_PORT_GUAR_THR			0xd8e4
+#define RTL930X_FC_PORT_THR_SET_SEL		0xd8f4
+#define RTL930X_FC_PORT_EGR_DROP_CTRL(p)	(0xc380 + ((p) << 2))
+#define RTL930X_FC_CPU_Q_EGR_FORCE_DROP_CTRL	0xc4dc
+#define RTL930X_FC_Q_EGR_DROP_THR		0x791c
+#define RTL930X_FC_CPU_Q_EGR_DROP_THR(q)	(0x7dc0 + ((q) << 2))
+#define RTL930X_FC_PORT_EGR_DROP_THR_SET_SEL	0x79dc
+#define RTL930X_FC_LB_PORT_Q_EGR_DROP_THR	0x79e4
+#define RTL930X_SC_P_CTRL			0x7a98
+
+#define RTL930X_FC_THR_M			GENMASK(11, 0)
+#define RTL930X_FC_ON_M				GENMASK(27, 16)
+#define RTL930X_FC_OFF_M			GENMASK(11, 0)
+#define RTL930X_FC_ALLOW_PAGE_CNT_M		GENMASK(11, 0)
+#define RTL930X_FC_REF_RXCNGST			BIT(1)
+
+enum rtl930x_fc_model {
+	RTL930X_FC_MODEL_24G_4XG,
+	RTL930X_FC_MODEL_8XG,
+	RTL930X_FC_MODEL_48G_CASCADE,
+	RTL930X_FC_MODEL_24X2_5G_2XG,
+};
+
+struct rtl930x_fc_entry {
+	u32 reg;
+	u32 mask;
+	u16 value[RTL930X_FC_MODEL_COUNT];
+};
+
+struct rtl930x_fc_indexed_entry {
+	u8 index;
+	struct rtl930x_fc_entry entry;
+};
+
+#define RTL930X_FC_ENTRY(_reg, _mask, _m0, _m1, _m2, _m3) \
+	{ .reg = (_reg), .mask = (_mask), .value = { (_m0), (_m1), (_m2), (_m3) } }
+#define RTL930X_FC_IDX(_idx, _reg, _mask, _m0, _m1, _m2, _m3) \
+	{ .index = (_idx), .entry = RTL930X_FC_ENTRY(_reg, _mask, _m0, _m1, _m2, _m3) }
+
+/* Vendor table flowctrlGlobCfg, excluding ETE_FC_CASCADE_PORT_DROP_THR:
+ * those rows are explicitly stacking-only defaults. Our driver does not
+ * enable stacking/cascade mode.
+ */
+static const struct rtl930x_fc_entry rtl930x_flowctrl_glob_cfg[] = {
+	RTL930X_FC_ENTRY(RTL930X_FC_GLB_DROP_THR, RTL930X_FC_THR_M,
+			 0xfe4, 0xff8, 0xfc8, 0xfe4),
+	RTL930X_FC_ENTRY(RTL930X_FC_GLB_SYS_UTIL_THR, RTL930X_FC_THR_M,
+			 0x5d4, 0x958, 0x4a6, 0x5d4),
+	RTL930X_FC_ENTRY(RTL930X_FC_GLB_HI_THR, RTL930X_FC_ON_M,
+			 0x890, 0xa20, 0x542, 0x890),
+	RTL930X_FC_ENTRY(RTL930X_FC_GLB_HI_THR, RTL930X_FC_OFF_M,
+			 0x778, 0x9d0, 0x50e, 0x778),
+	RTL930X_FC_ENTRY(RTL930X_FC_GLB_LO_THR, RTL930X_FC_ON_M,
+			 0x5d4, 0x958, 0x4a6, 0x5d4),
+	RTL930X_FC_ENTRY(RTL930X_FC_GLB_LO_THR, RTL930X_FC_OFF_M,
+			 0x4bc, 0x908, 0x472, 0x4bc),
+	RTL930X_FC_ENTRY(RTL930X_FC_GLB_FCOFF_HI_THR, RTL930X_FC_ON_M,
+			 0x890, 0xa20, 0x542, 0x890),
+	RTL930X_FC_ENTRY(RTL930X_FC_GLB_FCOFF_HI_THR, RTL930X_FC_OFF_M,
+			 0x778, 0x9d0, 0x50e, 0x778),
+	RTL930X_FC_ENTRY(RTL930X_FC_GLB_FCOFF_LO_THR, RTL930X_FC_ON_M,
+			 0x5d4, 0x958, 0x4a6, 0x5d4),
+	RTL930X_FC_ENTRY(RTL930X_FC_GLB_FCOFF_LO_THR, RTL930X_FC_OFF_M,
+			 0x4bc, 0x908, 0x472, 0x4bc),
+	RTL930X_FC_ENTRY(RTL930X_FC_JUMBO_HI_THR, RTL930X_FC_ON_M,
+			 0x628, 0xd30, 0x542, 0x628),
+	RTL930X_FC_ENTRY(RTL930X_FC_JUMBO_HI_THR, RTL930X_FC_OFF_M,
+			 0x510, 0xce0, 0x50e, 0x510),
+	RTL930X_FC_ENTRY(RTL930X_FC_JUMBO_LO_THR, RTL930X_FC_ON_M,
+			 0x36c, 0xc68, 0x4a6, 0x36c),
+	RTL930X_FC_ENTRY(RTL930X_FC_JUMBO_LO_THR, RTL930X_FC_OFF_M,
+			 0x254, 0xc18, 0x472, 0x254),
+	RTL930X_FC_ENTRY(RTL930X_FC_JUMBO_FCOFF_HI_THR, RTL930X_FC_ON_M,
+			 0x628, 0xd30, 0x542, 0x628),
+	RTL930X_FC_ENTRY(RTL930X_FC_JUMBO_FCOFF_HI_THR, RTL930X_FC_OFF_M,
+			 0x510, 0xce0, 0x50e, 0x510),
+	RTL930X_FC_ENTRY(RTL930X_FC_JUMBO_FCOFF_LO_THR, RTL930X_FC_ON_M,
+			 0x36c, 0xc68, 0x4a6, 0x36c),
+	RTL930X_FC_ENTRY(RTL930X_FC_JUMBO_FCOFF_LO_THR, RTL930X_FC_OFF_M,
+			 0x254, 0xc18, 0x472, 0x254),
+	RTL930X_FC_ENTRY(RTL930X_FC_JUMBO_THR_ADJUST, RTL930X_FC_THR_M,
+			 0x540, 0xdc8, 0xa80, 0x540),
+	RTL930X_FC_ENTRY(RTL930X_FC_LB_PORT_Q_EGR_DROP_THR, RTL930X_FC_ON_M,
+			 0x4e, 0x4e, 0x4e, 0x4e),
+	RTL930X_FC_ENTRY(RTL930X_FC_LB_PORT_Q_EGR_DROP_THR, RTL930X_FC_OFF_M,
+			 0x44, 0x44, 0x44, 0x44),
+	RTL930X_FC_ENTRY(RTL930X_SC_P_CTRL, RTL930X_FC_ON_M,
+			 0xc8, 0x140, 0x32, 0xc8),
+	RTL930X_FC_ENTRY(RTL930X_SC_P_CTRL, RTL930X_FC_OFF_M,
+			 0xc8, 0x140, 0x32, 0xc8),
+};
+
+/* Vendor table fcPerPortCfg. */
+static const struct rtl930x_fc_entry rtl930x_fc_per_port_cfg[] = {
+	RTL930X_FC_ENTRY(0, RTL930X_FC_ALLOW_PAGE_CNT_M,
+			 0x32, 0x32, 0x32, 0x34),
+};
+
+/* Vendor table regPortInfo. The ETE_FC_{ON,OFF}_REMOTE_PORT_THR and
+ * ETE_FC_REMOTE_PORT_GUAR_THR rows are omitted: the SDK marks them as
+ * non-stacking defaults, so touching them would only configure ETE state.
+ */
+static const struct rtl930x_fc_indexed_entry rtl930x_reg_port_info[] = {
+	RTL930X_FC_IDX(0, RTL930X_FC_PORT_HI_THR, RTL930X_FC_ON_M, 0xab, 0x11b, 0x64, 0xab),
+	RTL930X_FC_IDX(0, RTL930X_FC_PORT_HI_THR, RTL930X_FC_OFF_M, 0xa1, 0x111, 0x5a, 0xa1),
+	RTL930X_FC_IDX(0, RTL930X_FC_PORT_LO_THR, RTL930X_FC_ON_M, 0x28, 0xa0, 0x19, 0x28),
+	RTL930X_FC_IDX(0, RTL930X_FC_PORT_LO_THR, RTL930X_FC_OFF_M, 0x1e, 0x78, 0x0f, 0x1e),
+	RTL930X_FC_IDX(0, RTL930X_FC_PORT_FCOFF_HI_THR, RTL930X_FC_ON_M, 0xab, 0x11b, 0x64, 0xab),
+	RTL930X_FC_IDX(0, RTL930X_FC_PORT_FCOFF_HI_THR, RTL930X_FC_OFF_M, 0xa1, 0x111, 0x5a, 0xa1),
+	RTL930X_FC_IDX(0, RTL930X_FC_PORT_FCOFF_LO_THR, RTL930X_FC_ON_M, 0x28, 0xa0, 0x19, 0x28),
+	RTL930X_FC_IDX(0, RTL930X_FC_PORT_FCOFF_LO_THR, RTL930X_FC_OFF_M, 0x1e, 0x78, 0x0f, 0x1e),
+	RTL930X_FC_IDX(0, RTL930X_FC_PORT_GUAR_THR, RTL930X_FC_THR_M, 0x10, 0x10, 0x0c, 0x10),
+	RTL930X_FC_IDX(1, RTL930X_FC_PORT_HI_THR, RTL930X_FC_ON_M, 0xab, 0x11b, 0x3ad, 0xab),
+	RTL930X_FC_IDX(1, RTL930X_FC_PORT_HI_THR, RTL930X_FC_OFF_M, 0xa1, 0x111, 0x35f, 0xa1),
+	RTL930X_FC_IDX(1, RTL930X_FC_PORT_LO_THR, RTL930X_FC_ON_M, 0x28, 0xa0, 0x32b, 0x28),
+	RTL930X_FC_IDX(1, RTL930X_FC_PORT_LO_THR, RTL930X_FC_OFF_M, 0x1e, 0x78, 0x2dd, 0x1e),
+	RTL930X_FC_IDX(1, RTL930X_FC_PORT_FCOFF_HI_THR, RTL930X_FC_ON_M, 0xab, 0x11b, 0x3ad, 0xab),
+	RTL930X_FC_IDX(1, RTL930X_FC_PORT_FCOFF_HI_THR, RTL930X_FC_OFF_M, 0xa1, 0x111, 0x35f, 0xa1),
+	RTL930X_FC_IDX(1, RTL930X_FC_PORT_FCOFF_LO_THR, RTL930X_FC_ON_M, 0x28, 0xa0, 0x32b, 0x28),
+	RTL930X_FC_IDX(1, RTL930X_FC_PORT_FCOFF_LO_THR, RTL930X_FC_OFF_M, 0x1e, 0x78, 0x2dd, 0x1e),
+	RTL930X_FC_IDX(1, RTL930X_FC_PORT_GUAR_THR, RTL930X_FC_THR_M, 0x10, 0x10, 0x0c, 0x10),
+	RTL930X_FC_IDX(2, RTL930X_FC_PORT_HI_THR, RTL930X_FC_ON_M, 0x2ac, 0x11b, 0x64, 0x2ac),
+	RTL930X_FC_IDX(2, RTL930X_FC_PORT_HI_THR, RTL930X_FC_OFF_M, 0x284, 0x111, 0x5a, 0x284),
+	RTL930X_FC_IDX(2, RTL930X_FC_PORT_LO_THR, RTL930X_FC_ON_M, 0xa0, 0xa0, 0x19, 0xa0),
+	RTL930X_FC_IDX(2, RTL930X_FC_PORT_LO_THR, RTL930X_FC_OFF_M, 0x78, 0x78, 0x0f, 0x78),
+	RTL930X_FC_IDX(2, RTL930X_FC_PORT_FCOFF_HI_THR, RTL930X_FC_ON_M, 0x2ac, 0x11b, 0x64, 0x2ac),
+	RTL930X_FC_IDX(2, RTL930X_FC_PORT_FCOFF_HI_THR, RTL930X_FC_OFF_M,
+		       0x284, 0x111, 0x5a, 0x284),
+	RTL930X_FC_IDX(2, RTL930X_FC_PORT_FCOFF_LO_THR, RTL930X_FC_ON_M, 0xa0, 0xa0, 0x19, 0xa0),
+	RTL930X_FC_IDX(2, RTL930X_FC_PORT_FCOFF_LO_THR, RTL930X_FC_OFF_M, 0x78, 0x78, 0x0f, 0x78),
+	RTL930X_FC_IDX(2, RTL930X_FC_PORT_GUAR_THR, RTL930X_FC_THR_M, 0x10, 0x10, 0x0c, 0x10),
+	RTL930X_FC_IDX(3, RTL930X_FC_PORT_HI_THR, RTL930X_FC_ON_M, 0x5e, 0x17d, 0x64, 0x5e),
+	RTL930X_FC_IDX(3, RTL930X_FC_PORT_HI_THR, RTL930X_FC_OFF_M, 0x54, 0x173, 0x5a, 0x54),
+	RTL930X_FC_IDX(3, RTL930X_FC_PORT_LO_THR, RTL930X_FC_ON_M, 0x23, 0x23, 0x19, 0x23),
+	RTL930X_FC_IDX(3, RTL930X_FC_PORT_LO_THR, RTL930X_FC_OFF_M, 0x19, 0x19, 0x0f, 0x19),
+	RTL930X_FC_IDX(3, RTL930X_FC_PORT_FCOFF_HI_THR, RTL930X_FC_ON_M, 0x5e, 0x17d, 0x64, 0x5e),
+	RTL930X_FC_IDX(3, RTL930X_FC_PORT_FCOFF_HI_THR, RTL930X_FC_OFF_M, 0x54, 0x173, 0x5a, 0x54),
+	RTL930X_FC_IDX(3, RTL930X_FC_PORT_FCOFF_LO_THR, RTL930X_FC_ON_M, 0x23, 0x23, 0x19, 0x23),
+	RTL930X_FC_IDX(3, RTL930X_FC_PORT_FCOFF_LO_THR, RTL930X_FC_OFF_M, 0x19, 0x19, 0x0f, 0x19),
+	RTL930X_FC_IDX(3, RTL930X_FC_PORT_GUAR_THR, RTL930X_FC_THR_M, 0x10, 0x10, 0x0c, 0x10),
+};
+
+/* Vendor table regQueueInfo. Only FC_Q_EGR_DROP_THR is constructed here.
+ * Its SWRED_QUEUE_DROP_CTRL rows are deliberately omitted: W8.7 proved RED
+ * inert on both families, so programming non-functional non-zero RED state
+ * would mislead later diagnosis.
+ */
+static const struct rtl930x_fc_indexed_entry rtl930x_reg_queue_info[] = {
+	RTL930X_FC_IDX(0, RTL930X_FC_Q_EGR_DROP_THR, RTL930X_FC_ON_M, 0x4e, 0x4e, 0x4e, 0x4e),
+	RTL930X_FC_IDX(0, RTL930X_FC_Q_EGR_DROP_THR, RTL930X_FC_OFF_M, 0x44, 0x44, 0x44, 0x44),
+	RTL930X_FC_IDX(1, RTL930X_FC_Q_EGR_DROP_THR, RTL930X_FC_ON_M, 0x4e, 0x118, 0x30c, 0x4e),
+	RTL930X_FC_IDX(1, RTL930X_FC_Q_EGR_DROP_THR, RTL930X_FC_OFF_M, 0x44, 0x0f0, 0x2a8, 0x44),
+	RTL930X_FC_IDX(2, RTL930X_FC_Q_EGR_DROP_THR, RTL930X_FC_ON_M, 0x118, 0x4e, 0x4e, 0x118),
+	RTL930X_FC_IDX(2, RTL930X_FC_Q_EGR_DROP_THR, RTL930X_FC_OFF_M, 0x0f0, 0x44, 0x44, 0x0f0),
+	RTL930X_FC_IDX(3, RTL930X_FC_Q_EGR_DROP_THR, RTL930X_FC_ON_M, 0x64, 0x64, 0x4e, 0x64),
+	RTL930X_FC_IDX(3, RTL930X_FC_Q_EGR_DROP_THR, RTL930X_FC_OFF_M, 0x44, 0x44, 0x44, 0x44),
+};
+
+/* Vendor table regCpuQInfo. */
+static const struct rtl930x_fc_entry rtl930x_reg_cpu_q_info[] = {
+	RTL930X_FC_ENTRY(0, RTL930X_FC_ON_M, 0x4e, 0x4e, 0x4e, 0x4e),
+	RTL930X_FC_ENTRY(0, RTL930X_FC_OFF_M, 0x44, 0x44, 0x44, 0x44),
+};
+
+static void rtl930x_fc_field_write(u32 reg, u32 mask, u32 value)
+{
+	sw_w32_mask(mask, (value << __ffs(mask)) & mask, reg);
+}
+
+static u32 rtl930x_fc_field_read(u32 reg, u32 mask)
+{
+	return (sw_r32(reg) & mask) >> __ffs(mask);
+}
+
+static enum rtl930x_fc_model
+rtl930x_flow_control_model(const struct rtl838x_switch_priv *priv, u8 *idx_10g)
+{
+	*idx_10g = 2;
+
+	switch (priv->id) {
+	case 0x9301:
+		/* The vendor selects model 2 only when RTL9301 cascade mode is
+		 * active. This driver never enables stacking, so model 2 is
+		 * intentionally unreachable.
+		 */
+		return RTL930X_FC_MODEL_24G_4XG;
+	case 0x9303:
+		*idx_10g = 1;
+		return RTL930X_FC_MODEL_8XG;
+	case 0x9302:
+		/* The SDK names this chip variant RTL9302D. */
+		return RTL930X_FC_MODEL_24X2_5G_2XG;
+	default:
+		/* Match the vendor's fallback. */
+		return RTL930X_FC_MODEL_24X2_5G_2XG;
+	}
+}
+
+static void rtl930x_fc_set_selector(u32 base, int port, u8 index)
+{
+	u32 shift = (port & 0xf) << 1;
+	u32 reg = base + ((port >> 4) << 2);
+
+	sw_w32_mask(0x3 << shift, index << shift, reg);
+}
+
+static u32 rtl930x_fc_get_selector(u32 base, int port)
+{
+	u32 shift = (port & 0xf) << 1;
+	u32 reg = base + ((port >> 4) << 2);
+
+	return (sw_r32(reg) >> shift) & 0x3;
+}
+
+static void rtl930x_flow_control_init(struct rtl838x_switch_priv *priv)
+{
+	enum rtl930x_fc_model model;
+	struct dsa_port *dp;
+	u8 idx_10g;
+
+	model = rtl930x_flow_control_model(priv, &idx_10g);
+
+	/* The effective packet-buffer ceiling is the minimum of this group.
+	 * Keep the entire construction under one lock while DSA ports are still
+	 * disabled, so no observer can interleave a partial global setup.
+	 */
+	mutex_lock(&priv->reg_mutex);
+
+	/* Port threshold-set selection is based on the DSA port's maximum PHY or
+	 * SFP+/PCS speed, independently of the chip model. 2.5G-only ports are
+	 * neither vendor GE nor 10GE ports and are therefore skipped.
+	 */
+	dsa_switch_for_each_user_port(dp, priv->ds) {
+		int max_speed = rtl83xx_port_max_speed(priv, dp->index);
+		u8 index;
+
+		if (max_speed == SPEED_10000)
+			index = idx_10g;
+		else if (max_speed == SPEED_1000)
+			index = 0;
+		else
+			continue;
+
+		rtl930x_fc_set_selector(RTL930X_FC_PORT_THR_SET_SEL,
+					dp->index, index);
+		rtl930x_fc_set_selector(RTL930X_FC_PORT_EGR_DROP_THR_SET_SEL,
+					dp->index, index);
+	}
+
+	/* CPU port: use the 1G pause set and do not reference RX congestion for
+	 * egress dropping, exactly as the vendor construction does.
+	 */
+	sw_w32_mask(RTL930X_FC_REF_RXCNGST, 0,
+		    RTL930X_FC_PORT_EGR_DROP_CTRL(priv->cpu_port));
+	rtl930x_fc_set_selector(RTL930X_FC_PORT_THR_SET_SEL,
+				priv->cpu_port, 0);
+
+	for (int i = 0; i < ARRAY_SIZE(rtl930x_flowctrl_glob_cfg); i++) {
+		const struct rtl930x_fc_entry *entry = &rtl930x_flowctrl_glob_cfg[i];
+
+		rtl930x_fc_field_write(entry->reg, entry->mask,
+				       entry->value[model]);
+	}
+
+	/* flowctrlGlobCfg programs SYS_UTIL_THR from the model table. The SDK
+	 * function later overwrites it with 1 in an oddly indented trailing
+	 * write; measurements found 1 and the table value behaviorally neutral,
+	 * so retain the semantically meaningful, table-exact value here.
+	 */
+
+	dsa_switch_for_each_user_port(dp, priv->ds) {
+		const struct rtl930x_fc_entry *entry = &rtl930x_fc_per_port_cfg[0];
+
+		rtl930x_fc_field_write(RTL930X_FC_PORT_ACT_CTRL(dp->index),
+				       entry->mask, entry->value[model]);
+	}
+
+	for (int i = 0; i < ARRAY_SIZE(rtl930x_reg_port_info); i++) {
+		const struct rtl930x_fc_indexed_entry *indexed = &rtl930x_reg_port_info[i];
+		const struct rtl930x_fc_entry *entry = &indexed->entry;
+
+		rtl930x_fc_field_write(entry->reg + (indexed->index << 2),
+				       entry->mask, entry->value[model]);
+	}
+
+	for (int queue = 0; queue < RTL930X_FC_STACK_QUEUE_COUNT; queue++) {
+		for (int i = 0; i < ARRAY_SIZE(rtl930x_reg_queue_info); i++) {
+			const struct rtl930x_fc_indexed_entry *indexed =
+				&rtl930x_reg_queue_info[i];
+			const struct rtl930x_fc_entry *entry = &indexed->entry;
+			u32 reg = entry->reg +
+				  ((queue * RTL930X_FC_PORT_THR_SET_COUNT +
+				    indexed->index) << 2);
+
+			rtl930x_fc_field_write(reg, entry->mask,
+					       entry->value[model]);
+		}
+	}
+
+	for (int queue = 0; queue < RTL930X_FC_CPU_QUEUE_COUNT; queue++) {
+		u32 reg = RTL930X_FC_CPU_Q_EGR_DROP_THR(queue);
+
+		for (int i = 0; i < ARRAY_SIZE(rtl930x_reg_cpu_q_info); i++) {
+			const struct rtl930x_fc_entry *entry =
+				&rtl930x_reg_cpu_q_info[i];
+
+			rtl930x_fc_field_write(reg, entry->mask,
+					       entry->value[model]);
+		}
+		sw_w32_mask(BIT(queue), BIT(queue),
+			    RTL930X_FC_CPU_Q_EGR_FORCE_DROP_CTRL);
+	}
+
+	mutex_unlock(&priv->reg_mutex);
+}
+
+static void rtl930x_fc_dump_pair(struct seq_file *m, const char *name, u32 reg)
+{
+	seq_printf(m, "%s on %u off %u raw %08x\n", name,
+		   rtl930x_fc_field_read(reg, RTL930X_FC_ON_M),
+		   rtl930x_fc_field_read(reg, RTL930X_FC_OFF_M), sw_r32(reg));
+}
+
+static void rtl930x_flow_control_dump(struct rtl838x_switch_priv *priv,
+				      int port, struct seq_file *m)
+{
+	u8 idx_10g;
+
+	mutex_lock(&priv->reg_mutex);
+	seq_puts(m, "family longan\n");
+	seq_printf(m, "model_index %u\n",
+		   rtl930x_flow_control_model(priv, &idx_10g));
+	seq_printf(m, "glb_drop %u raw %08x\n",
+		   rtl930x_fc_field_read(RTL930X_FC_GLB_DROP_THR,
+					 RTL930X_FC_THR_M),
+		   sw_r32(RTL930X_FC_GLB_DROP_THR));
+	seq_printf(m, "glb_sys_util %u raw %08x\n",
+		   rtl930x_fc_field_read(RTL930X_FC_GLB_SYS_UTIL_THR,
+					 RTL930X_FC_THR_M),
+		   sw_r32(RTL930X_FC_GLB_SYS_UTIL_THR));
+	rtl930x_fc_dump_pair(m, "glb_hi", RTL930X_FC_GLB_HI_THR);
+	rtl930x_fc_dump_pair(m, "glb_lo", RTL930X_FC_GLB_LO_THR);
+	rtl930x_fc_dump_pair(m, "glb_fcoff_hi", RTL930X_FC_GLB_FCOFF_HI_THR);
+	rtl930x_fc_dump_pair(m, "glb_fcoff_lo", RTL930X_FC_GLB_FCOFF_LO_THR);
+	rtl930x_fc_dump_pair(m, "jumbo_hi", RTL930X_FC_JUMBO_HI_THR);
+	rtl930x_fc_dump_pair(m, "jumbo_lo", RTL930X_FC_JUMBO_LO_THR);
+	rtl930x_fc_dump_pair(m, "jumbo_fcoff_hi", RTL930X_FC_JUMBO_FCOFF_HI_THR);
+	rtl930x_fc_dump_pair(m, "jumbo_fcoff_lo", RTL930X_FC_JUMBO_FCOFF_LO_THR);
+	seq_printf(m, "jumbo_sys_used %u raw %08x\n",
+		   rtl930x_fc_field_read(RTL930X_FC_JUMBO_THR_ADJUST,
+					 RTL930X_FC_THR_M),
+		   sw_r32(RTL930X_FC_JUMBO_THR_ADJUST));
+	rtl930x_fc_dump_pair(m, "lb_port_queue_drop",
+			     RTL930X_FC_LB_PORT_Q_EGR_DROP_THR);
+	rtl930x_fc_dump_pair(m, "sc_drain_out", RTL930X_SC_P_CTRL);
+	seq_printf(m, "port %d thr_set %u egr_drop_thr_set %u allow_page_count %u\n",
+		   port, rtl930x_fc_get_selector(RTL930X_FC_PORT_THR_SET_SEL, port),
+		   rtl930x_fc_get_selector(RTL930X_FC_PORT_EGR_DROP_THR_SET_SEL,
+					   port),
+		   rtl930x_fc_field_read(RTL930X_FC_PORT_ACT_CTRL(port),
+					 RTL930X_FC_ALLOW_PAGE_CNT_M));
+	mutex_unlock(&priv->reg_mutex);
+}
+
 static void rtldsa_930x_qos_set_group_selector(int port, int group)
 {
 	sw_w32_mask(RTL93XX_PORT_TBL_IDX_CTRL_IDX_MASK(port),
@@ -3370,5 +3761,7 @@ const struct rtl838x_reg rtl930x_reg = {
 	.enable_mcast_flood = rtldsa_930x_enable_mcast_flood,
 	.enable_bcast_flood = rtldsa_930x_enable_bcast_flood,
 	.set_receive_management_action = rtldsa_930x_set_receive_management_action,
+	.flow_control_init = rtl930x_flow_control_init,
+	.flow_control_dump = rtl930x_flow_control_dump,
 	.qos_init = rtldsa_930x_qos_init,
 };

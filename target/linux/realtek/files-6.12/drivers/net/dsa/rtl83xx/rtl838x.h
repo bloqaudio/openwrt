@@ -1121,6 +1121,7 @@ struct rtldsa_counter_state {
 };
 
 struct psample_group;
+struct seq_file;
 
 /* Per-port hardware packet sampling state, indexed by direction
  * (0 = ingress, 1 = egress). Written under reg_mutex from the tc
@@ -1151,6 +1152,7 @@ enum rtl838x_port_shaper_owner {
 struct rtl838x_port {
 	bool enable:1;
 	bool phy_is_integrated:1;
+	bool sfp:1;
 	bool is10G:1;
 	bool is2G5:1;
 	bool isolated:1;
@@ -1634,6 +1636,9 @@ struct rtl838x_reg {
 	void (*set_distribution_algorithm)(int group, int algoidx, u32 algomask);
 	void (*set_receive_management_action)(int port, rma_ctrl_t type, action_type_t action);
 	void (*led_init)(struct rtl838x_switch_priv *priv);
+	void (*flow_control_init)(struct rtl838x_switch_priv *priv);
+	void (*flow_control_dump)(struct rtl838x_switch_priv *priv, int port,
+				  struct seq_file *m);
 	void (*qos_init)(struct rtl838x_switch_priv *priv);
 };
 

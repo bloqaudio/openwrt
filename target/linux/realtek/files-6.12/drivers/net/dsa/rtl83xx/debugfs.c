@@ -784,6 +784,32 @@ static const struct file_operations sched_algo_fops = {
 	.write = sched_algo_write,
 };
 
+static int flow_control_show(struct seq_file *m, void *v)
+{
+	struct rtl838x_port *p = m->private;
+	struct rtl838x_switch_priv *priv = p->dp->ds->priv;
+
+	if (!priv->r->flow_control_dump)
+		return -EOPNOTSUPP;
+
+	priv->r->flow_control_dump(priv, p->dp->index, m);
+
+	return 0;
+}
+
+static int flow_control_open(struct inode *inode, struct file *filp)
+{
+	return single_open(filp, flow_control_show, inode->i_private);
+}
+
+static const struct file_operations flow_control_fops = {
+	.owner = THIS_MODULE,
+	.open = flow_control_open,
+	.read = seq_read,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
+
 #define RTL838X_SWRED_DEBUGFS_BUFSIZE	1536
 
 /* Per-port SWRED state (read-only). The thresholds and probabilities are
@@ -1428,6 +1454,8 @@ void rtl930x_dbgfs_init(struct rtl838x_switch_priv *priv)
 		}
 		debugfs_create_file("swred", 0400, port_dir,
 				    &priv->ports[i], &swred_fops);
+		debugfs_create_file("flow_control", 0400, port_dir,
+				    &priv->ports[i], &flow_control_fops);
 		debugfs_create_file("sched_algo", 0600, port_dir,
 				    &priv->ports[i], &sched_algo_fops);
 	}
