@@ -35,6 +35,13 @@
  */
 #define RTPCS_SDS_SETUP_RETRY_DELAY		msecs_to_jiffies(30000)
 
+/* Retry each recovery level twice before escalating to the next one. */
+#define RTPCS_SDS_RECOVERY_TRIES		2
+
+/* A live lane needs two bad symbol-error windows before it may be disturbed. */
+#define RTPCS_SDS_RX_BAD_SAMPLES		2
+#define RTPCS_SDS_RX_SAMPLE_DELAY		msecs_to_jiffies(100)
+
 #define RTPCS_838X_CPU_PORT			28
 #define RTPCS_838X_SERDES_CNT			6
 #define RTPCS_838X_MAC_LINK_DUP_STS		0xa19c
@@ -142,6 +149,13 @@ enum rtpcs_sds_mode {
 	RTPCS_SDS_MODE_USXGMII_2_5GSXGMII,
 };
 
+enum rtpcs_sds_recovery_tier {
+	RTPCS_SDS_RECOVERY_CALIBRATE,
+	RTPCS_SDS_RECOVERY_RX_RESET,
+	RTPCS_SDS_RECOVERY_REINIT,
+	RTPCS_SDS_RECOVERY_TIERS,
+};
+
 struct rtpcs_ctrl;
 
 struct rtpcs_serdes {
@@ -162,11 +176,16 @@ struct rtpcs_ctrl {
 	const struct rtpcs_config *cfg;
 	struct rtpcs_serdes serdes[RTPCS_SDS_CNT];
 	struct rtpcs_link *link[RTPCS_PORT_CNT];
+	/* Serializes logical SerDes operations; see the accessor rule below. */
 	struct mutex lock;
 
 	/* debugfs SerDes accessor state: lane, and page << 8 | regnum */
 	u32 dbg_sds;
 	u32 dbg_addr;
+#ifdef CONFIG_DEBUG_FS
+	/* One-shot debug-only fault injection, consumed by RX verification. */
+	u32 dbg_fail_sds;
+#endif
 };
 
 struct rtpcs_link {
@@ -184,6 +203,16 @@ struct rtpcs_link {
 	struct delayed_work retry_work;
 	phy_interface_t retry_mode;
 	unsigned int retry_neg_mode;
+	unsigned int retry_attempt;
+	unsigned int retry_bad_samples;
+	bool retry_verify;
+	bool retry_escalating;
+	bool retry_ladder_exhausted;
+	bool retry_recovery_active;
+	bool retry_clean_linkless_reported;
+	bool retry_force;
+	bool retry_bad_link_up;
+	bool retry_injected;
 };
 
 struct rtpcs_config {
@@ -200,6 +229,10 @@ struct rtpcs_config {
 	int (*init_serdes_common)(struct rtpcs_ctrl *ctrl);
 	int (*set_autoneg)(struct rtpcs_serdes *sds, unsigned int neg_mode);
 	int (*setup_serdes)(struct rtpcs_serdes *sds, phy_interface_t mode);
+	int (*verify_rx)(struct rtpcs_link *link);
+	int (*recover_serdes)(struct rtpcs_serdes *sds,
+			      phy_interface_t mode,
+			      enum rtpcs_sds_recovery_tier tier);
 };
 
 typedef struct {
@@ -208,6 +241,17 @@ typedef struct {
 	u16 data;
 } sds_config;
 
+/*
+ * ctrl->lock serializes logical SerDes operations, not individual MDIO
+ * transfers.  mdiobus_c45_* holds the bus lock for one transfer only, while
+ * an indirect-register RMW or a calibration sequence spans many transfers
+ * (and can touch the paired lane's shared CMU).  Callers take ctrl->lock
+ * around the complete setup, reset, RMW, or debugfs dump; these leaf helpers
+ * deliberately do not take it, both to avoid recursive locking and to avoid
+ * locking thousands of times during calibration.  ctrl->lock is always taken
+ * before the MDIO bus lock, which the mdiobus helpers acquire and release
+ * within a transfer; no path takes them in the opposite order.
+ */
 static int rtpcs_sds_to_mmd(int sds_page, int sds_regnum)
 {
 	return (sds_page << 8) + sds_regnum;
@@ -249,6 +293,8 @@ static int rtpcs_sds_write_bits(struct rtpcs_serdes *sds, int page,
 {
 	int mask, reg;
 
+	lockdep_assert_held(&sds->ctrl->lock);
+
 	WARN_ON(bithigh < bitlow);
 
 	mask = GENMASK(bithigh, bitlow);
@@ -266,6 +312,8 @@ static int rtpcs_sds_modify(struct rtpcs_serdes *sds, int page, int regnum,
 			    u16 mask, u16 set)
 {
 	int mmd_regnum = rtpcs_sds_to_mmd(page, regnum);
+
+	lockdep_assert_held(&sds->ctrl->lock);
 
 	return mdiobus_c45_modify(sds->ctrl->bus, sds->id, MDIO_MMD_VEND1,
 				  mmd_regnum, mask, set);
@@ -1999,9 +2047,7 @@ static int rtpcs_930x_sds_10g_idle(struct rtpcs_serdes *sds)
 	if (i < 100)
 		return 0;
 
-	pr_warn("%s WARNING: Waiting for RX idle timed out, SDS %d\n",
-		__func__, sds->id);
-	return -EIO;
+	return -ETIMEDOUT;
 }
 
 static int rtpcs_930x_sds_set_polarity(struct rtpcs_serdes *sds,
@@ -2302,7 +2348,9 @@ static int rtpcs_930x_setup_serdes(struct rtpcs_serdes *sds,
 	/* Enable Fiber RX */
 	rtpcs_sds_write_bits(sds, 0x20, 2, 12, 12, 0);
 
-	/* Calibrate SerDes receiver in loopback mode */
+	/* RX-idle is a pre-calibration quiesce operation from the Longan SDK.
+	 * Do not use it after the lane has been returned to its live peer.
+	 */
 	rtpcs_930x_sds_10g_idle(sds);
 	do {
 		rtpcs_930x_sds_do_rx_calibration(sds, phy_mode);
@@ -2311,7 +2359,7 @@ static int rtpcs_930x_setup_serdes(struct rtpcs_serdes *sds,
 		calib_ok = !rtpcs_930x_sds_check_calibration(sds, phy_mode);
 	} while (!calib_ok && calib_tries < 3);
 	if (!calib_ok) {
-		pr_warn("%s: SerDes RX calibration failed\n", __func__);
+		pr_debug("%s: SerDes RX calibration failed\n", __func__);
 		ret = -EIO;
 	}
 
@@ -2319,6 +2367,92 @@ static int rtpcs_930x_setup_serdes(struct rtpcs_serdes *sds,
 	rtpcs_930x_sds_tx_config(sds, phy_mode);
 
 	return ret;
+}
+
+/*
+ * Longan's dal_longan_sds_symErr_clear() and dal_longan_sds_symErr_get()
+ * define the 10G-R counter as page 5, register 1: bits [7:0] are blk_err;
+ * the complete register is read to clear it.  The SDK's
+ * _dal_longan_sds_rxReCali_check() clears it twice, reads a baseline, waits
+ * one millisecond, then rejects a non-zero second blk_err sample.
+ *
+ * This deliberately supports only 10G-R.  The vendor has no comparable
+ * post-calibration error verdict for the other RTL930x modes used here, so
+ * an unsupported mode or an indirect-read error is inconclusive, not bad.
+ */
+static int rtpcs_930x_sds_live_symerr_clear(struct rtpcs_serdes *sds,
+					     phy_interface_t mode)
+{
+	int ret;
+
+	if (mode != PHY_INTERFACE_MODE_10GBASER)
+		return -EOPNOTSUPP;
+
+	ret = rtpcs_sds_read(sds, 0x5, 0x1);
+	return ret < 0 ? ret : 0;
+}
+
+static int rtpcs_930x_sds_live_symerr_get(struct rtpcs_serdes *sds,
+					   phy_interface_t mode, u32 *errors)
+{
+	int ret;
+
+	if (mode != PHY_INTERFACE_MODE_10GBASER)
+		return -EOPNOTSUPP;
+
+	ret = rtpcs_sds_read(sds, 0x5, 0x1);
+	if (ret < 0)
+		return ret;
+
+	*errors = ret & 0xff;
+	return 0;
+}
+
+static int rtpcs_930x_verify_rx(struct rtpcs_link *link)
+{
+	struct rtpcs_serdes *sds = link->sds;
+	u32 ignored, errors;
+	int ret;
+
+	ret = rtpcs_930x_sds_live_symerr_clear(sds, link->retry_mode);
+	if (ret)
+		return 0;
+	ret = rtpcs_930x_sds_live_symerr_clear(sds, link->retry_mode);
+	if (ret)
+		return 0;
+
+	ret = rtpcs_930x_sds_live_symerr_get(sds, link->retry_mode, &ignored);
+	if (ret)
+		return 0;
+	mdelay(1);
+	ret = rtpcs_930x_sds_live_symerr_get(sds, link->retry_mode, &errors);
+	if (ret)
+		return 0;
+
+	return errors ? -EIO : 0;
+}
+
+/*
+ * The recovery levels mirror the Longan SDK: dal_longan_sds_rx_rst() pulses
+ * the receiver reset while preserving the patch, and
+ * _dal_longan_sds_10gSdsMode_force(..., RTK_MII_DISABLE) powers the lane
+ * down and forces it OFF before the following full setup reapplies the mode.
+ */
+static int rtpcs_930x_recover_serdes(struct rtpcs_serdes *sds,
+				     phy_interface_t mode,
+				     enum rtpcs_sds_recovery_tier tier)
+{
+	switch (tier) {
+	case RTPCS_SDS_RECOVERY_CALIBRATE:
+		return 0;
+	case RTPCS_SDS_RECOVERY_RX_RESET:
+		rtpcs_930x_sds_rx_reset(sds, mode);
+		return 0;
+	case RTPCS_SDS_RECOVERY_REINIT:
+		return rtpcs_930x_sds_force_mode(sds, PHY_INTERFACE_MODE_NA);
+	default:
+		return -EINVAL;
+	}
 }
 
 /* RTL931X */
@@ -2330,7 +2464,8 @@ static void rtpcs_931x_sds_reset(struct rtpcs_serdes *sds)
 	u32 o, v, o_mode;
 	int shift = ((sds_id & 0x3) << 3);
 
-	/* TODO: We need to lock this! */
+	/* This saves and restores two shared control registers as one reset. */
+	lockdep_assert_held(&ctrl->lock);
 
 	regmap_read(ctrl->map, RTL931X_PS_SERDES_OFF_MODE_CTRL_ADDR, &o);
 	v = o | BIT(sds_id);
@@ -2351,32 +2486,118 @@ static void rtpcs_931x_sds_disable(struct rtpcs_serdes *sds)
 		     RTL931X_SERDES_MODE_CTRL + (sds->id >> 2) * 4, 0x9f);
 }
 
-static void rtpcs_931x_sds_symerr_clear(struct rtpcs_serdes *sds,
-					phy_interface_t mode)
+/* phy_rtl9310_symErr_clear() clears digital XSGMII counters by writing
+ * logical pages 0x41/0x81, and clears the analog 10G-R blk_err counter by
+ * reading page 5 register 1.  _phy_rtl9310_{xsgmii,10gr}_symErr_get()
+ * subsequently read those same counters.
+ */
+static int rtpcs_931x_sds_symerr_clear(struct rtpcs_serdes *sds,
+				       phy_interface_t mode)
 {
+	int ret;
+
 	switch (mode) {
 	case PHY_INTERFACE_MODE_NA:
-		break;
+		return -EOPNOTSUPP;
 	case PHY_INTERFACE_MODE_XGMII:
 		for (int i = 0; i < 4; ++i) {
-			rtpcs_sds_write_bits(sds, 0x41, 24,  2, 0, i);
-			rtpcs_sds_write_bits(sds, 0x41,  3, 15, 8, 0x0);
-			rtpcs_sds_write_bits(sds, 0x41,  2, 15, 0, 0x0);
+			ret = rtpcs_sds_write_bits(sds, 0x41, 24,  2, 0, i);
+			if (ret)
+				return ret;
+			ret = rtpcs_sds_write_bits(sds, 0x41,  3, 15, 8, 0x0);
+			if (ret)
+				return ret;
+			ret = rtpcs_sds_write_bits(sds, 0x41,  2, 15, 0, 0x0);
+			if (ret)
+				return ret;
 		}
 
 		for (int i = 0; i < 4; ++i) {
-			rtpcs_sds_write_bits(sds, 0x81, 24,  2, 0, i);
-			rtpcs_sds_write_bits(sds, 0x81,  3, 15, 8, 0x0);
-			rtpcs_sds_write_bits(sds, 0x81,  2, 15, 0, 0x0);
+			ret = rtpcs_sds_write_bits(sds, 0x81, 24,  2, 0, i);
+			if (ret)
+				return ret;
+			ret = rtpcs_sds_write_bits(sds, 0x81,  3, 15, 8, 0x0);
+			if (ret)
+				return ret;
+			ret = rtpcs_sds_write_bits(sds, 0x81,  2, 15, 0, 0x0);
+			if (ret)
+				return ret;
 		}
 
-		rtpcs_sds_write_bits(sds, 0x41, 0, 15, 0, 0x0);
-		rtpcs_sds_write_bits(sds, 0x41, 1, 15, 8, 0x0);
-		rtpcs_sds_write_bits(sds, 0x81, 0, 15, 0, 0x0);
-		rtpcs_sds_write_bits(sds, 0x81, 1, 15, 8, 0x0);
-		break;
+		ret = rtpcs_sds_write_bits(sds, 0x41, 0, 15, 0, 0x0);
+		if (ret)
+			return ret;
+		ret = rtpcs_sds_write_bits(sds, 0x41, 1, 15, 8, 0x0);
+		if (ret)
+			return ret;
+		ret = rtpcs_sds_write_bits(sds, 0x81, 0, 15, 0, 0x0);
+		if (ret)
+			return ret;
+		return rtpcs_sds_write_bits(sds, 0x81, 1, 15, 8, 0x0);
+	case PHY_INTERFACE_MODE_10GBASER:
+	case PHY_INTERFACE_MODE_10GKR:
+	case PHY_INTERFACE_MODE_10G_QXGMII:
+	case PHY_INTERFACE_MODE_USXGMII:
+		/* Read-clear, as phy_rtl9310_symErr_clear() does for 10G-R. */
+		ret = rtpcs_sds_read(sds, 0x5, 0x1);
+		return ret < 0 ? ret : 0;
 	default:
-		break;
+		return -EOPNOTSUPP;
+	}
+}
+
+/* _phy_rtl9310_xsgmii_symErr_get() selects and reads all eight XSGMII
+ * counters; _phy_rtl9310_10gr_symErr_get() reads page 5 register 1 [7:0].
+ */
+static int rtpcs_931x_sds_symerr_get(struct rtpcs_serdes *sds,
+				     phy_interface_t mode,
+				     u32 *errors)
+{
+	int ret, i;
+	u32 high, low;
+
+	switch (mode) {
+	case PHY_INTERFACE_MODE_XGMII:
+		*errors = 0;
+		for (i = 0; i < 4; i++) {
+			ret = rtpcs_sds_write_bits(sds, 0x41, 24, 2, 0, i);
+			if (ret)
+				return ret;
+			ret = rtpcs_sds_read(sds, 0x41, 3);
+			if (ret < 0)
+				return ret;
+			high = ret & 0xff00;
+			ret = rtpcs_sds_read(sds, 0x41, 2);
+			if (ret < 0)
+				return ret;
+			low = ret & 0xffff;
+			*errors |= high << 8 | low;
+
+			ret = rtpcs_sds_write_bits(sds, 0x81, 24, 2, 0, i);
+			if (ret)
+				return ret;
+			ret = rtpcs_sds_read(sds, 0x81, 3);
+			if (ret < 0)
+				return ret;
+			high = ret & 0xff00;
+			ret = rtpcs_sds_read(sds, 0x81, 2);
+			if (ret < 0)
+				return ret;
+			low = ret & 0xffff;
+			*errors |= high << 8 | low;
+		}
+		return 0;
+	case PHY_INTERFACE_MODE_10GBASER:
+	case PHY_INTERFACE_MODE_10GKR:
+	case PHY_INTERFACE_MODE_10G_QXGMII:
+	case PHY_INTERFACE_MODE_USXGMII:
+		ret = rtpcs_sds_read(sds, 0x5, 0x1);
+		if (ret < 0)
+			return ret;
+		*errors = ret & 0xff;
+		return 0;
+	default:
+		return -EOPNOTSUPP;
 	}
 }
 
@@ -3455,6 +3676,66 @@ static int rtpcs_931x_setup_serdes(struct rtpcs_serdes *sds,
 	return 0;
 }
 
+/*
+ * phy_rtl9310_pcb_adapt() and phy_rtl9310_fiber_adapt() finish Mango
+ * calibration with clear/sample/read symbol-error checks. The latter uses
+ * three 150 ms samples; phy_rtl9310_10gr_symErr_get() defines the 10G-R
+ * counter as page 5 register 1 bits [7:0]. Neither helper reads RX-idle:
+ * an idle, error-free lane and a busy, error-free lane both validate clean.
+ * An unavailable counter is inconclusive and therefore succeeds; a false
+ * positive would disrupt a working lane.
+ */
+static int rtpcs_931x_verify_rx(struct rtpcs_link *link)
+{
+	u32 errors;
+	int i, ret;
+
+	for (i = 0; i < 3; i++) {
+		ret = rtpcs_931x_sds_symerr_clear(link->sds, link->retry_mode);
+		if (ret)
+			return 0;
+		msleep(150);
+
+		ret = rtpcs_931x_sds_symerr_get(link->sds, link->retry_mode,
+						&errors);
+		if (ret == -EOPNOTSUPP)
+			return 0;
+		if (ret)
+			return 0;
+		if (!errors)
+			return 0;
+	}
+
+	return -EIO;
+}
+
+/*
+ * phy_rtl9310_rx_rst() is the lightweight receiver reset used between Mango
+ * adaptation passes.  phy_rtl9310_sds_rst() is the deeper OFF -> mode -> OFF
+ * sequence; rtpcs_931x_sds_reset() is its register-exact local equivalent.
+ * The next setup reapplies the mode and analog baseline in both cases.
+ */
+static int rtpcs_931x_recover_serdes(struct rtpcs_serdes *sds,
+				     phy_interface_t mode,
+				     enum rtpcs_sds_recovery_tier tier)
+{
+	if (mode == PHY_INTERFACE_MODE_NA)
+		return -EINVAL;
+
+	switch (tier) {
+	case RTPCS_SDS_RECOVERY_CALIBRATE:
+		return 0;
+	case RTPCS_SDS_RECOVERY_RX_RESET:
+		rtpcs_931x_sds_rx_reset(sds);
+		return 0;
+	case RTPCS_SDS_RECOVERY_REINIT:
+		rtpcs_931x_sds_reset(sds);
+		return 0;
+	default:
+		return -EINVAL;
+	}
+}
+
 /* Common functions */
 
 static void rtpcs_pcs_get_state(struct phylink_pcs *pcs, struct phylink_link_state *state)
@@ -3546,7 +3827,16 @@ static bool rtpcs_mac_link_up(struct rtpcs_link *link)
 	struct rtpcs_ctrl *ctrl = link->ctrl;
 
 	return rtpcs_regmap_read_bits(ctrl, ctrl->cfg->mac_link_sts,
-				      link->port, link->port);
+				      link->port, link->port) > 0;
+}
+
+/* This reads the ordinary MAC link bitmap already used by pcs_get_state().
+ * Sampling it twice makes it a guard against a transient link indication,
+ * not an additional RX-health signal.
+ */
+static bool rtpcs_mac_link_stable(struct rtpcs_link *link)
+{
+	return rtpcs_mac_link_up(link) && rtpcs_mac_link_up(link);
 }
 
 /* MOD-DEF0 is the only SFP presence signal that is valid at any time: it
@@ -3617,33 +3907,306 @@ static bool rtpcs_sfp_skip_setup(struct rtpcs_link *link)
 	return rtpcs_sfp_module_absent(link);
 }
 
+/* setup_serdes() owns the family-specific register sequence. Its potentially
+ * long health sample runs in retry_work rather than phylink's pcs_config()
+ * context; the shared wrappers keep all family register layouts private.
+ */
+static int rtpcs_sds_verify_rx(struct rtpcs_link *link)
+{
+	struct rtpcs_ctrl *ctrl = link->ctrl;
+	int ret;
+
+	lockdep_assert_held(&ctrl->lock);
+
+	if (!ctrl->cfg->verify_rx)
+		return 0;
+
+	ret = ctrl->cfg->verify_rx(link);
+	if (ret) {
+		link->retry_bad_samples++;
+		link->retry_bad_link_up = rtpcs_mac_link_stable(link);
+		if (link->retry_bad_samples < RTPCS_SDS_RX_BAD_SAMPLES)
+			return -EAGAIN;
+		return ret;
+	}
+
+	link->retry_bad_samples = 0;
+	link->retry_bad_link_up = false;
+	link->retry_injected = false;
+
+#ifdef CONFIG_DEBUG_FS
+	if (ctrl->dbg_fail_sds == link->sds->id) {
+		ctrl->dbg_fail_sds = RTPCS_SDS_CNT;
+		link->retry_injected = true;
+		dev_warn(ctrl->dev,
+			 "port %d, sds %d: debug: forcing RX verification failure\n",
+			 link->port, link->sds->id);
+		return -EIO;
+	}
+#endif
+
+	return 0;
+}
+
+static int rtpcs_sds_setup(struct rtpcs_link *link)
+{
+	struct rtpcs_ctrl *ctrl = link->ctrl;
+	int ret;
+
+	lockdep_assert_held(&ctrl->lock);
+
+	ret = ctrl->cfg->setup_serdes(link->sds, link->retry_mode);
+	if (ret)
+		return ret;
+
+	return 0;
+}
+
+static enum rtpcs_sds_recovery_tier
+rtpcs_sds_retry_tier(const struct rtpcs_link *link)
+{
+	return link->retry_attempt / RTPCS_SDS_RECOVERY_TRIES;
+}
+
+static const char *rtpcs_sds_recovery_tier_name(enum rtpcs_sds_recovery_tier tier)
+{
+	switch (tier) {
+	case RTPCS_SDS_RECOVERY_CALIBRATE:
+		return "calibration";
+	case RTPCS_SDS_RECOVERY_RX_RESET:
+		return "RX reset";
+	case RTPCS_SDS_RECOVERY_REINIT:
+		return "SerDes re-init";
+	default:
+		return "invalid";
+	}
+}
+
+static void rtpcs_sds_retry_reset(struct rtpcs_link *link)
+{
+	lockdep_assert_held(&link->ctrl->lock);
+
+	link->retry_attempt = 0;
+	link->retry_bad_samples = 0;
+	link->retry_verify = false;
+	link->retry_escalating = false;
+	link->retry_ladder_exhausted = false;
+	link->retry_recovery_active = false;
+	link->retry_clean_linkless_reported = false;
+	link->retry_force = false;
+	link->retry_bad_link_up = false;
+	link->retry_injected = false;
+}
+
+static void rtpcs_sds_retry_completed(struct rtpcs_link *link)
+{
+	struct rtpcs_ctrl *ctrl = link->ctrl;
+
+	lockdep_assert_held(&ctrl->lock);
+	rtpcs_sds_retry_reset(link);
+	if (ctrl->cfg->set_autoneg)
+		ctrl->cfg->set_autoneg(link->sds, link->retry_neg_mode);
+
+	dev_info(ctrl->dev, "port %d, sds %d: RX recovery completed\n",
+		 link->port, link->sds->id);
+}
+
+static void rtpcs_sds_retry_linkless(struct rtpcs_link *link, bool clean)
+{
+	struct rtpcs_ctrl *ctrl = link->ctrl;
+
+	lockdep_assert_held(&ctrl->lock);
+
+	if (clean && !link->retry_clean_linkless_reported) {
+		dev_info(ctrl->dev,
+			 "port %d, sds %d: RX verification clean but link is down; retaining setup retry\n",
+			 link->port, link->sds->id);
+		link->retry_clean_linkless_reported = true;
+	}
+
+	mod_delayed_work(system_power_efficient_wq, &link->retry_work,
+			 RTPCS_SDS_SETUP_RETRY_DELAY);
+}
+
 static void rtpcs_sds_setup_retry(struct work_struct *work)
 {
 	struct rtpcs_link *link = container_of(to_delayed_work(work),
 					       struct rtpcs_link, retry_work);
 	struct rtpcs_ctrl *ctrl = link->ctrl;
+	enum rtpcs_sds_recovery_tier tier;
 	int ret;
 
 	mutex_lock(&ctrl->lock);
 
-	/* Done once the link is up or the module is (now known to be) gone */
-	if (rtpcs_mac_link_up(link) || rtpcs_sfp_module_absent(link))
+	/* Done once the module is (now known to be) gone. */
+	if (rtpcs_sfp_module_absent(link)) {
+		rtpcs_sds_retry_reset(link);
 		goto out;
-
-	dev_info(ctrl->dev, "port %d, sds %d: no link, retry SerDes setup\n",
-		 link->port, link->sds->id);
-
-	ret = ctrl->cfg->setup_serdes(link->sds, link->retry_mode);
-	if (!ret) {
-		link->sds->first_start = false;
-		link->sds->configured_mode = link->retry_mode;
-
-		if (ctrl->cfg->set_autoneg)
-			ctrl->cfg->set_autoneg(link->sds, link->retry_neg_mode);
 	}
 
-	mod_delayed_work(system_power_efficient_wq, &link->retry_work,
-			 RTPCS_SDS_SETUP_RETRY_DELAY);
+	/* A link is the only success condition.  The forced debug check must run
+	 * even on a live lane so that the stable-link veto can prove it harmless.
+	 */
+	if (rtpcs_mac_link_up(link) && !link->retry_force) {
+		if (link->retry_recovery_active)
+			rtpcs_sds_retry_completed(link);
+		else
+			rtpcs_sds_retry_reset(link);
+		goto out;
+	}
+
+	/* Variants without a health check retain the old linkless retry. */
+	if (!ctrl->cfg->verify_rx) {
+		dev_info(ctrl->dev, "port %d, sds %d: no link, retry SerDes setup\n",
+			 link->port, link->sds->id);
+
+		ret = rtpcs_sds_setup(link);
+		if (!ret) {
+			link->sds->first_start = false;
+			link->sds->configured_mode = link->retry_mode;
+
+			if (ctrl->cfg->set_autoneg)
+				ctrl->cfg->set_autoneg(link->sds, link->retry_neg_mode);
+		}
+
+		mod_delayed_work(system_power_efficient_wq, &link->retry_work,
+				 RTPCS_SDS_SETUP_RETRY_DELAY);
+		goto out;
+	}
+
+	/* A successful pcs_config() is verified here, not under phylink's
+	 * configuration lock. A failed check is made non-latched before it enters
+	 * the same bounded recovery ladder as an outright setup error.
+	 */
+	if (link->retry_verify) {
+		link->retry_verify = false;
+		ret = rtpcs_sds_verify_rx(link);
+		if (ret == -EAGAIN) {
+			link->retry_verify = true;
+			mod_delayed_work(system_power_efficient_wq, &link->retry_work,
+					 RTPCS_SDS_RX_SAMPLE_DELAY);
+			goto out;
+		}
+
+		if (rtpcs_mac_link_up(link)) {
+			if (link->retry_recovery_active)
+				rtpcs_sds_retry_completed(link);
+			else
+				rtpcs_sds_retry_reset(link);
+			goto out;
+		}
+
+		link->retry_force = false;
+		if (!ret) {
+			rtpcs_sds_retry_linkless(link, true);
+			goto out;
+		}
+
+		if (!link->retry_escalating)
+			dev_warn(ctrl->dev,
+				 "port %d, sds %d: RX health check failed (%d), scheduling recovery\n",
+				 link->port, link->sds->id, ret);
+		link->retry_escalating = true;
+		if (rtpcs_sfp_module_absent(link))
+			goto out;
+	}
+
+	/* A clean error counter is not evidence of a working receiver when no
+	 * partner is present.  It stops a *new* escalation, but never stops the
+	 * populated-cage retry.  Once a health failure has entered the bounded
+	 * ladder, retain its state across clean linkless samples so that it gets
+	 * all recovery tiers.  After that, only ordinary setup retries remain:
+	 * a module with an unplugged DAC peer cannot repeatedly pulse reset or
+	 * re-initialize the SerDes forever.
+	 */
+	if (!link->retry_escalating || link->retry_ladder_exhausted) {
+		ret = rtpcs_sds_setup(link);
+		if (!ret) {
+			link->sds->first_start = false;
+			link->sds->configured_mode = link->retry_mode;
+			if (ctrl->cfg->set_autoneg)
+				ctrl->cfg->set_autoneg(link->sds, link->retry_neg_mode);
+		}
+		rtpcs_sds_retry_linkless(link, false);
+		goto out;
+	}
+
+	tier = rtpcs_sds_retry_tier(link);
+	if (tier >= RTPCS_SDS_RECOVERY_TIERS) {
+		link->retry_ladder_exhausted = true;
+		rtpcs_sds_retry_linkless(link, false);
+		goto out;
+	}
+
+	/* A link that came back by itself must not be bounced. A current live
+	 * link is actionable only after the same real health signal was bad in
+	 * two consecutive samples while the link was up. The debug injector is
+	 * deliberately not a real health signal, so it always takes this veto.
+	 */
+	if (rtpcs_mac_link_stable(link) &&
+	    (link->retry_injected || !link->retry_bad_link_up ||
+	     link->retry_bad_samples < RTPCS_SDS_RX_BAD_SAMPLES)) {
+		dev_info(ctrl->dev,
+			 "port %d, sds %d: RX recovery skipped; link is up and stable\n",
+			 link->port, link->sds->id);
+		link->retry_bad_samples = 0;
+		link->retry_bad_link_up = false;
+		link->retry_injected = false;
+		rtpcs_sds_retry_reset(link);
+		goto out;
+	}
+
+	link->sds->configured_mode = PHY_INTERFACE_MODE_NA;
+	link->retry_recovery_active = true;
+	link->retry_attempt++;
+	if (link->retry_attempt >=
+	    RTPCS_SDS_RECOVERY_TRIES * RTPCS_SDS_RECOVERY_TIERS)
+		link->retry_ladder_exhausted = true;
+
+	if (!((link->retry_attempt - 1) % RTPCS_SDS_RECOVERY_TRIES))
+		dev_warn(ctrl->dev,
+			 "port %d, sds %d: RX recovery tier %s (%u/%u)\n",
+			 link->port, link->sds->id,
+			 rtpcs_sds_recovery_tier_name(tier),
+			 link->retry_attempt,
+			 RTPCS_SDS_RECOVERY_TRIES * RTPCS_SDS_RECOVERY_TIERS);
+
+	if (ctrl->cfg->recover_serdes)
+		ret = ctrl->cfg->recover_serdes(link->sds, link->retry_mode, tier);
+	else
+		ret = 0;
+	if (!ret)
+		ret = rtpcs_sds_setup(link);
+	if (!ret)
+		ret = rtpcs_sds_verify_rx(link);
+	if (rtpcs_mac_link_up(link)) {
+		rtpcs_sds_retry_completed(link);
+		goto out;
+	}
+	if (ret == -EAGAIN) {
+		/* setup succeeded; retain that state if the lane comes up while
+		 * the second confirmation sample is pending.
+		 */
+		link->sds->first_start = false;
+		link->sds->configured_mode = link->retry_mode;
+		link->retry_verify = true;
+		mod_delayed_work(system_power_efficient_wq, &link->retry_work,
+				 RTPCS_SDS_RX_SAMPLE_DELAY);
+		goto out;
+	}
+	if (ret) {
+		if (rtpcs_sfp_module_absent(link))
+			goto out;
+		rtpcs_sds_retry_linkless(link, false);
+		goto out;
+	}
+
+	link->sds->first_start = false;
+	link->sds->configured_mode = link->retry_mode;
+	if (ctrl->cfg->set_autoneg)
+		ctrl->cfg->set_autoneg(link->sds, link->retry_neg_mode);
+	link->retry_force = false;
+	rtpcs_sds_retry_linkless(link, true);
 
 out:
 	mutex_unlock(&ctrl->lock);
@@ -3674,6 +4237,8 @@ static int rtpcs_pcs_config(struct phylink_pcs *pcs, unsigned int neg_mode,
 		 phy_modes(interface), link->port, link->sds->id);
 
 	mutex_lock(&ctrl->lock);
+	link->retry_mode = interface;
+	link->retry_neg_mode = neg_mode;
 
 	if (ctrl->cfg->setup_serdes) {
 		if (interface == link->sds->configured_mode) {
@@ -3683,24 +4248,42 @@ static int rtpcs_pcs_config(struct phylink_pcs *pcs, unsigned int neg_mode,
 			dev_dbg(ctrl->dev, "sds %d: no module, skip setup for mode %s\n",
 				link->sds->id, phy_modes(interface));
 		} else {
-			ret = ctrl->cfg->setup_serdes(link->sds, interface);
+			link->retry_verify = false;
+			ret = rtpcs_sds_setup(link);
 			link->sds_setup_done = true;
 			if (!ret) {
 				link->sds->first_start = false;
 				link->sds->configured_mode = interface;
+				rtpcs_sds_retry_reset(link);
+				cancel_delayed_work(&link->retry_work);
 			}
 
-			/* SerDes RX calibration is not fully deterministic
-			 * and a failed setup is not latched, so a setup on
-			 * an SFP port that did not (yet) produce a link is
-			 * retried until the link comes up, the module is
-			 * removed or the port is administratively disabled.
+			/* A checked family verifies a successful setup in the worker, but
+			 * any populated cage that is still linkless retains patch 130's
+			 * retry.  A clean error count can block a new escalation only; it
+			 * cannot abandon a lane with no signal to measure.
 			 */
-			if (link->sfp_node && !rtpcs_mac_link_up(link)) {
-				link->retry_mode = interface;
-				link->retry_neg_mode = neg_mode;
+			if (link->sfp_node && !rtpcs_mac_link_up(link) &&
+			    !rtpcs_sfp_module_absent(link)) {
+				if (ctrl->cfg->verify_rx) {
+					link->retry_attempt = 0;
+					link->retry_bad_samples = 0;
+					link->retry_escalating = ret < 0;
+					link->retry_ladder_exhausted = false;
+					link->retry_recovery_active = false;
+					link->retry_clean_linkless_reported = false;
+					link->retry_bad_link_up = false;
+					link->retry_injected = false;
+					if (!ret)
+						link->retry_verify = true;
+					else
+						dev_warn(ctrl->dev,
+							 "port %d, sds %d: RX setup failed (%d), scheduling recovery\n",
+							 link->port, link->sds->id, ret);
+				}
 				mod_delayed_work(system_power_efficient_wq,
 						 &link->retry_work,
+						 ctrl->cfg->verify_rx ? 0 :
 						 RTPCS_SDS_SETUP_RETRY_DELAY);
 			}
 
@@ -3830,56 +4413,184 @@ static struct mii_bus *rtpcs_probe_serdes_bus(struct rtpcs_ctrl *ctrl)
  * itself. Comparing a full dump between a working and a failing boot is the
  * only way to see it.
  */
+static int rtpcs_dbgfs_sds_get(void *data, u64 *val)
+{
+	struct rtpcs_ctrl *ctrl = data;
+
+	mutex_lock(&ctrl->lock);
+	*val = ctrl->dbg_sds;
+	mutex_unlock(&ctrl->lock);
+
+	return 0;
+}
+
+static int rtpcs_dbgfs_sds_set(void *data, u64 val)
+{
+	struct rtpcs_ctrl *ctrl = data;
+
+	mutex_lock(&ctrl->lock);
+	ctrl->dbg_sds = val;
+	mutex_unlock(&ctrl->lock);
+
+	return 0;
+}
+DEFINE_DEBUGFS_ATTRIBUTE(rtpcs_dbgfs_sds_fops, rtpcs_dbgfs_sds_get,
+			 rtpcs_dbgfs_sds_set, "%llu\n");
+
+static int rtpcs_dbgfs_addr_get(void *data, u64 *val)
+{
+	struct rtpcs_ctrl *ctrl = data;
+
+	mutex_lock(&ctrl->lock);
+	*val = ctrl->dbg_addr;
+	mutex_unlock(&ctrl->lock);
+
+	return 0;
+}
+
+static int rtpcs_dbgfs_addr_set(void *data, u64 val)
+{
+	struct rtpcs_ctrl *ctrl = data;
+
+	mutex_lock(&ctrl->lock);
+	ctrl->dbg_addr = val;
+	mutex_unlock(&ctrl->lock);
+
+	return 0;
+}
+DEFINE_DEBUGFS_ATTRIBUTE(rtpcs_dbgfs_addr_fops, rtpcs_dbgfs_addr_get,
+			 rtpcs_dbgfs_addr_set, "0x%08llx\n");
+
 static int rtpcs_dbgfs_val_get(void *data, u64 *val)
 {
 	struct rtpcs_ctrl *ctrl = data;
 	int ret;
 
+	mutex_lock(&ctrl->lock);
+
 	if (ctrl->dbg_sds >= RTPCS_SDS_CNT)
-		return -EINVAL;
+		goto err;
 
 	ret = rtpcs_sds_read(&ctrl->serdes[ctrl->dbg_sds],
 			     ctrl->dbg_addr >> 8, ctrl->dbg_addr & 0xff);
 	if (ret < 0)
-		return ret;
+		goto out;
 
 	*val = ret;
+	ret = 0;
 
-	return 0;
+out:
+	mutex_unlock(&ctrl->lock);
+	return ret;
+err:
+	ret = -EINVAL;
+	goto out;
 }
 
 static int rtpcs_dbgfs_val_set(void *data, u64 val)
 {
 	struct rtpcs_ctrl *ctrl = data;
+	int ret;
+
+	mutex_lock(&ctrl->lock);
 
 	if (ctrl->dbg_sds >= RTPCS_SDS_CNT)
-		return -EINVAL;
+		ret = -EINVAL;
+	else
+		ret = rtpcs_sds_write(&ctrl->serdes[ctrl->dbg_sds],
+				      ctrl->dbg_addr >> 8, ctrl->dbg_addr & 0xff, val);
 
-	return rtpcs_sds_write(&ctrl->serdes[ctrl->dbg_sds],
-			       ctrl->dbg_addr >> 8, ctrl->dbg_addr & 0xff, val);
+	mutex_unlock(&ctrl->lock);
+	return ret;
 }
 DEFINE_DEBUGFS_ATTRIBUTE(rtpcs_dbgfs_val_fops, rtpcs_dbgfs_val_get,
 			 rtpcs_dbgfs_val_set, "0x%04llx\n");
+
+static struct rtpcs_link *rtpcs_dbgfs_find_link(struct rtpcs_ctrl *ctrl,
+						u32 sds_id)
+{
+	for (int port = 0; port < RTPCS_PORT_CNT; port++) {
+		if (ctrl->link[port] && ctrl->link[port]->sds->id == sds_id)
+			return ctrl->link[port];
+	}
+
+	return NULL;
+}
+
+/* Debug-only, one-shot RX verification failure. Writing a SerDes number
+ * queues its configured port immediately and verifies the real signal first.
+ * A stable healthy link vetoes the injected recovery, so the test cannot
+ * churn production traffic.
+ */
+static int rtpcs_dbgfs_inject_rx_failure_set(void *data, u64 val)
+{
+	struct rtpcs_ctrl *ctrl = data;
+	struct rtpcs_link *link;
+	int ret = 0;
+
+	if (val >= ctrl->cfg->serdes_count)
+		return -EINVAL;
+
+	mutex_lock(&ctrl->lock);
+	if (!ctrl->cfg->verify_rx) {
+		ret = -EOPNOTSUPP;
+		goto out;
+	}
+
+	link = rtpcs_dbgfs_find_link(ctrl, val);
+	if (!link || link->sds->configured_mode == PHY_INTERFACE_MODE_NA ||
+	    rtpcs_sfp_module_absent(link)) {
+		ret = -EINVAL;
+		goto out;
+	}
+
+	ctrl->dbg_fail_sds = val;
+	link->retry_attempt = 0;
+	link->retry_bad_samples = 0;
+	link->retry_verify = true;
+	link->retry_escalating = false;
+	link->retry_ladder_exhausted = false;
+	link->retry_recovery_active = false;
+	link->retry_clean_linkless_reported = false;
+	link->retry_force = true;
+	link->retry_bad_link_up = false;
+	link->retry_injected = false;
+	mod_delayed_work(system_power_efficient_wq, &link->retry_work, 0);
+	mutex_unlock(&ctrl->lock);
+
+	/* simple_attr_write() turns zero into a successful byte-count return. */
+	return 0;
+
+out:
+	mutex_unlock(&ctrl->lock);
+	return ret;
+}
+DEFINE_DEBUGFS_ATTRIBUTE(rtpcs_dbgfs_inject_rx_failure_fops, NULL,
+			 rtpcs_dbgfs_inject_rx_failure_set, "%llu\n");
 
 static int rtpcs_dbgfs_dump_show(struct seq_file *s, void *v)
 {
 	struct rtpcs_ctrl *ctrl = s->private;
 	struct rtpcs_serdes *sds;
+	int ret = 0;
 
-	if (ctrl->dbg_sds >= RTPCS_SDS_CNT)
-		return -EINVAL;
+	mutex_lock(&ctrl->lock);
+	if (ctrl->dbg_sds >= RTPCS_SDS_CNT) {
+		ret = -EINVAL;
+	} else {
+		sds = &ctrl->serdes[ctrl->dbg_sds];
+		for (int page = 0; page < RTPCS_SDS_PAGE_CNT; page++) {
+			for (int reg = 0; reg < RTPCS_SDS_REG_CNT; reg++) {
+				int val = rtpcs_sds_read(sds, page, reg);
 
-	sds = &ctrl->serdes[ctrl->dbg_sds];
-	for (int page = 0; page < RTPCS_SDS_PAGE_CNT; page++) {
-		for (int reg = 0; reg < RTPCS_SDS_REG_CNT; reg++) {
-			int val = rtpcs_sds_read(sds, page, reg);
-
-			seq_printf(s, "%02x %02x %04x\n", page, reg,
-				   val < 0 ? 0xffff : val);
+				seq_printf(s, "%02x %02x %04x\n", page, reg,
+					   val < 0 ? 0xffff : val);
+			}
 		}
 	}
 
-	return 0;
+	mutex_unlock(&ctrl->lock);
+	return ret;
 }
 DEFINE_SHOW_ATTRIBUTE(rtpcs_dbgfs_dump);
 
@@ -3887,10 +4598,12 @@ static void rtpcs_dbgfs_init(struct rtpcs_ctrl *ctrl)
 {
 	struct dentry *dir = debugfs_create_dir("rtl-otto-pcs", NULL);
 
-	debugfs_create_u32("sds", 0644, dir, &ctrl->dbg_sds);
-	debugfs_create_x32("addr", 0644, dir, &ctrl->dbg_addr);
+	debugfs_create_file("sds", 0644, dir, ctrl, &rtpcs_dbgfs_sds_fops);
+	debugfs_create_file("addr", 0644, dir, ctrl, &rtpcs_dbgfs_addr_fops);
 	debugfs_create_file("val", 0600, dir, ctrl, &rtpcs_dbgfs_val_fops);
 	debugfs_create_file("dump", 0400, dir, ctrl, &rtpcs_dbgfs_dump_fops);
+	debugfs_create_file("inject_rx_failure", 0200, dir, ctrl,
+			    &rtpcs_dbgfs_inject_rx_failure_fops);
 }
 #else
 static void rtpcs_dbgfs_init(struct rtpcs_ctrl *ctrl) { }
@@ -3911,6 +4624,9 @@ static int rtpcs_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	mutex_init(&ctrl->lock);
+#ifdef CONFIG_DEBUG_FS
+	ctrl->dbg_fail_sds = RTPCS_SDS_CNT;
+#endif
 
 	ctrl->dev = dev;
 	ctrl->cfg = (const struct rtpcs_config *)device_get_match_data(ctrl->dev);
@@ -3943,7 +4659,9 @@ static int rtpcs_probe(struct platform_device *pdev)
 	}
 
 	if (ctrl->cfg->init_serdes_common) {
+		mutex_lock(&ctrl->lock);
 		ret = ctrl->cfg->init_serdes_common(ctrl);
+		mutex_unlock(&ctrl->lock);
 		if (ret)
 			return ret;
 	}
@@ -4027,6 +4745,8 @@ static const struct rtpcs_config rtpcs_930x_cfg = {
 	.pcs_ops		= &rtpcs_930x_pcs_ops,
 	.set_autoneg		= rtpcs_93xx_set_autoneg,
 	.setup_serdes		= rtpcs_930x_setup_serdes,
+	.verify_rx		= rtpcs_930x_verify_rx,
+	.recover_serdes	= rtpcs_930x_recover_serdes,
 };
 
 static const struct phylink_pcs_ops rtpcs_931x_pcs_ops = {
@@ -4048,6 +4768,8 @@ static const struct rtpcs_config rtpcs_931x_cfg = {
 	.pcs_ops		= &rtpcs_931x_pcs_ops,
 	.set_autoneg		= rtpcs_93xx_set_autoneg,
 	.setup_serdes		= rtpcs_931x_setup_serdes,
+	.verify_rx		= rtpcs_931x_verify_rx,
+	.recover_serdes	= rtpcs_931x_recover_serdes,
 };
 
 static const struct of_device_id rtpcs_of_match[] = {
