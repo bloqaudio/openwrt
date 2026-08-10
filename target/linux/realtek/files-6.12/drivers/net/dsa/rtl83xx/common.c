@@ -2512,6 +2512,25 @@ static void rtl83xx_fib_event_work_do(struct work_struct *work)
 	kfree(fib_work);
 }
 
+static bool rtldsa_fib_multipath(struct fib_notifier_info *info)
+{
+	if (info->family == AF_INET) {
+		struct fib_entry_notifier_info *fen_info = (void *)info;
+
+		return fib_info_num_path(fen_info->fi) > 1;
+	}
+
+#if IS_BUILTIN(CONFIG_IPV6)
+	if (info->family == AF_INET6) {
+		struct fib6_entry_notifier_info *fen6_info = (void *)info;
+
+		return fen6_info->rt->fib6_nsiblings;
+	}
+#endif
+
+	return false;
+}
+
 /* Called with rcu_read_lock() */
 static int rtl83xx_fib_event(struct notifier_block *this, unsigned long event, void *ptr)
 {
@@ -2533,6 +2552,18 @@ static int rtl83xx_fib_event(struct notifier_block *this, unsigned long event, v
 	/* ignore FIB events for HW with missing L3 offloading implementation */
 	if (!priv->r->l3_setup)
 		return NOTIFY_DONE;
+
+	if ((event == FIB_EVENT_ENTRY_ADD || event == FIB_EVENT_ENTRY_REPLACE ||
+	     event == FIB_EVENT_ENTRY_APPEND) && !priv->r->l3_ecmp_offload &&
+	    rtldsa_fib_multipath(info)) {
+		/* Linux 6.12 sends this extack in the successful netlink ACK.
+		 * Leave ECMP in software rather than mark the ASIC's path-0
+		 * programming as offloaded. A future RTL931x ECMP implementation
+		 * only needs to enable this capability in its op table.
+		 */
+		NL_SET_ERR_MSG_MOD(info->extack, "ECMP route offload is not supported");
+		return NOTIFY_DONE;
+	}
 
 	fib_work = kzalloc(sizeof(*fib_work), GFP_ATOMIC);
 	if (!fib_work)

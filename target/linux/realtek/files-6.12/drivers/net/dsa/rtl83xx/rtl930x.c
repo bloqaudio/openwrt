@@ -3310,6 +3310,7 @@ const struct rtl838x_reg rtl930x_reg = {
 	.route_write = rtl930x_route_write,
 	.host_route_write = rtl930x_host_route_write,
 	.l3_setup = rtl930x_l3_setup,
+	.l3_ecmp_offload = false,
 	.set_l3_nexthop = rtl930x_set_l3_nexthop,
 	.get_l3_nexthop = rtl930x_get_l3_nexthop,
 	.get_l3_egress_mac = rtl930x_get_l3_egress_mac,

@@ -3749,6 +3749,7 @@ const struct rtl838x_reg rtl931x_reg = {
 	.packet_cntr_clear = rtl931x_packet_cntr_clear,
 #ifdef CONFIG_NET_DSA_RTL83XX_RTL930X_L3_OFFLOAD
 	.l3_setup = rtl931x_l3_setup,
+	.l3_ecmp_offload = false,
 	.get_l3_router_mac = rtl931x_get_l3_router_mac,
 	.set_l3_router_mac = rtl931x_set_l3_router_mac,
 	.set_l3_egress_intf = rtl931x_set_l3_egress_intf,
