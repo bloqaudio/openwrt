@@ -494,6 +494,14 @@ int rtl83xx_lag_add(struct dsa_switch *ds, int group, int port, struct netdev_la
 		algoidx = 1;
 	break;
 	case NETDEV_LAG_HASH_L34:
+		/* The MAC fields are what feeds the L2 half of the hardware
+		 * hash, which is the half that non-IP bridged frames (ARP,
+		 * PPPoE discovery, ...) are hashed by. Leaving them out
+		 * programs an empty L2 mask, and every such frame then hashes
+		 * identically and leaves through a single member.
+		 */
+		algomsk |= TRUNK_DISTRIBUTION_ALGO_DMAC_BIT;
+		algomsk |= TRUNK_DISTRIBUTION_ALGO_SMAC_BIT;
 		algomsk |= TRUNK_DISTRIBUTION_ALGO_SRC_L4PORT_BIT; /* sport */
 		algomsk |= TRUNK_DISTRIBUTION_ALGO_DST_L4PORT_BIT; /* dport */
 		algomsk |= TRUNK_DISTRIBUTION_ALGO_SIP_BIT; /* source ip */
