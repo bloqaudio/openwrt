@@ -4190,7 +4190,7 @@ static int rtl931x_l3_setup(struct rtl838x_switch_priv *priv)
 	       rtl_table_data(r, 3));
 	sw_w32(0, rtl_table_data(r, 4));
 	sw_w32(0, rtl_table_data(r, 5));
-	rtl_table_write(r, RTL931X_L3_ROUTE_IDX_CATCHALL_IP4);
+	rtl_table_write(r, rtl931x_l3_idx_to_addr(RTL931X_L3_ROUTE_IDX_CATCHALL_IP4));
 	rtl_table_release(r);
 
 	return 0;
