@@ -1636,6 +1636,9 @@ struct rtl838x_reg {
 	void (*set_distribution_algorithm)(int group, int algoidx, u32 algomask);
 	void (*set_receive_management_action)(int port, rma_ctrl_t type, action_type_t action);
 	void (*led_init)(struct rtl838x_switch_priv *priv);
+	void (*vendor_init)(struct rtl838x_switch_priv *priv);
+	void (*vendor_init_dump)(struct rtl838x_switch_priv *priv,
+				 struct seq_file *m);
 	void (*flow_control_init)(struct rtl838x_switch_priv *priv);
 	void (*flow_control_dump)(struct rtl838x_switch_priv *priv, int port,
 				  struct seq_file *m);

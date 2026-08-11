@@ -810,6 +810,31 @@ static const struct file_operations flow_control_fops = {
 	.release = single_release,
 };
 
+static int vendor_init_show(struct seq_file *m, void *v)
+{
+	struct rtl838x_switch_priv *priv = m->private;
+
+	if (!priv->r->vendor_init_dump)
+		return -EOPNOTSUPP;
+
+	priv->r->vendor_init_dump(priv, m);
+
+	return 0;
+}
+
+static int vendor_init_open(struct inode *inode, struct file *filp)
+{
+	return single_open(filp, vendor_init_show, inode->i_private);
+}
+
+static const struct file_operations vendor_init_fops = {
+	.owner = THIS_MODULE,
+	.open = vendor_init_open,
+	.read = seq_read,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
+
 #define RTL838X_SWRED_DEBUGFS_BUFSIZE	1536
 
 /* Per-port SWRED state (read-only). The thresholds and probabilities are
@@ -1402,6 +1427,9 @@ void rtl930x_dbgfs_init(struct rtl838x_switch_priv *priv)
 	debugfs_create_file("drop_counters", 0400, dbg_dir, priv, &drop_counter_fops);
 
 	debugfs_create_file("l2_table", 0400, dbg_dir, priv, &l2_table_fops);
+	if (priv->r->vendor_init_dump)
+		debugfs_create_file("vendor_init", 0400, dbg_dir, priv,
+				    &vendor_init_fops);
 
 	if (priv->family_id == RTL9300_FAMILY_ID) {
 		/* Per-port storm-control exceed flags, one bit per port, write 1 to clear */

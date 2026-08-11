@@ -3327,6 +3327,174 @@ static void rtl930x_flow_control_dump(struct rtl838x_switch_priv *priv,
 	mutex_unlock(&priv->reg_mutex);
 }
 
+/* Remaining Longan construction rows. Register addresses and fields are from
+ * rtk_longan_{reg,regField}_list.c.
+ */
+#define RTL930X_VENDOR_PARSER_CTRL		0xd724
+#define RTL930X_VENDOR_PPPOE_PARSE_EN		BIT(1)
+#define RTL930X_VENDOR_RFC1042_OUI_IGNORE	BIT(0)
+
+#define RTL930X_VENDOR_CPU_QID_MAP		0xa324
+#define RTL930X_VENDOR_CPU_QID_WIDTH		3
+#define RTL930X_VENDOR_CPU_QID_WORDS		3
+#define RTL930X_VENDOR_STACK_QID_MAP		0xa334
+#define RTL930X_VENDOR_STACK_QID_WIDTH		4
+#define RTL930X_VENDOR_STACK_QID_WORDS		4
+#define RTL930X_VENDOR_QID_ENTRY_COUNT		32
+/* The driver's QoS map exposes queues 0..7; this also matches
+ * rtl9300_capacityInfo.max_num_of_queue in the SDK's chipdef.c.
+ */
+#define RTL930X_VENDOR_QUEUE_COUNT		8
+
+#define RTL930X_VENDOR_L2_NTFY_CTRL		0xeb00
+#define RTL930X_VENDOR_LD_FLUSH_NTFY_EN		BIT(17)
+#define RTL930X_VENDOR_DYN_NTFY_EN		BIT(12)
+#define RTL930X_VENDOR_NTFY_TYPE_M		GENMASK(20, 19)
+#define RTL930X_VENDOR_BP_THR_M			GENMASK(11, 2)
+#define RTL930X_VENDOR_NTFY_EN			BIT(0)
+
+#define RTL930X_VENDOR_EGBW_CTRL			0x78e4
+#define RTL930X_VENDOR_RATE_MODE_CPU		BIT(0)
+
+/* The reg list describes 32 array entries with a bit offset of width bits,
+ * so entry n starts at bit (n * width) % 32 in word (n * width) / 32.
+ */
+static void rtl930x_vendor_packed_write(u32 base, int index, int width,
+					u32 value)
+{
+	u32 value_mask = GENMASK(width - 1, 0);
+	u32 bit = index * width;
+	u32 shift = bit & 0x1f;
+	u32 reg = base + ((bit >> 5) << 2);
+	u32 mask = value_mask << shift;
+
+	sw_w32_mask(mask, (value & value_mask) << shift, reg);
+	if (shift + width > 32) {
+		u32 high_bits = shift + width - 32;
+		u32 high_mask = GENMASK(high_bits - 1, 0);
+
+		sw_w32_mask(high_mask, value >> (32 - shift), reg + 4);
+	}
+}
+
+static u32 rtl930x_vendor_packed_read(u32 base, int index, int width)
+{
+	u32 bit = index * width;
+	u32 shift = bit & 0x1f;
+	u32 reg = base + ((bit >> 5) << 2);
+	u32 value = sw_r32(reg) >> shift;
+
+	if (shift + width > 32)
+		value |= sw_r32(reg + 4) << (32 - shift);
+
+	return value & GENMASK(width - 1, 0);
+}
+
+static void rtl930x_vendor_init(struct rtl838x_switch_priv *priv)
+{
+	mutex_lock(&priv->reg_mutex);
+
+	/* Only PPPOE_PARSE_EN is part of the vendor construction row. */
+	sw_w32_mask(RTL930X_VENDOR_PPPOE_PARSE_EN,
+		    RTL930X_VENDOR_PPPOE_PARSE_EN, RTL930X_VENDOR_PARSER_CTRL);
+
+	for (int queue = 0; queue < RTL930X_VENDOR_QUEUE_COUNT; queue++)
+		rtl930x_vendor_packed_write(RTL930X_VENDOR_CPU_QID_MAP, queue,
+					     RTL930X_VENDOR_CPU_QID_WIDTH, queue);
+
+	for (int queue = 0; queue < RTL930X_FC_STACK_QUEUE_COUNT; queue++)
+		rtl930x_vendor_packed_write(RTL930X_VENDOR_STACK_QID_MAP, queue,
+					     RTL930X_VENDOR_STACK_QID_WIDTH, queue);
+
+	/* These per-type notification enables remain behind NTFY_EN, the master
+	 * switch that neither the vendor construction nor this driver enables;
+	 * this row is construction parity, not a functional notification path.
+	 */
+	sw_w32_mask(RTL930X_VENDOR_LD_FLUSH_NTFY_EN |
+		    RTL930X_VENDOR_DYN_NTFY_EN,
+		    RTL930X_VENDOR_LD_FLUSH_NTFY_EN |
+		    RTL930X_VENDOR_DYN_NTFY_EN,
+		    RTL930X_VENDOR_L2_NTFY_CTRL);
+
+	/* EGBW_CTRL.RATE_MODE_CPU already has the vendor's packet-mode value on
+	 * live Longan hardware, so leave it untouched and expose it in debugfs.
+	 */
+
+	mutex_unlock(&priv->reg_mutex);
+}
+
+static void rtl930x_vendor_qid_map_dump(struct seq_file *m, const char *name,
+					u32 base, int words, int width,
+					int programmed)
+{
+	seq_printf(m, "%s addr 0x%08x raw", name, base);
+	for (int word = 0; word < words; word++)
+		seq_printf(m, " 0x%08x", sw_r32(base + (word << 2)));
+	seq_printf(m, " qid[0..%d]", programmed - 1);
+	for (int queue = 0; queue < programmed; queue++)
+		seq_printf(m, " %u",
+			   rtl930x_vendor_packed_read(base, queue, width));
+	seq_puts(m, " status programmed\n");
+
+	seq_printf(m, "%s_tail addr 0x%08x raw", name, base);
+	for (int word = 0; word < words; word++)
+		seq_printf(m, " 0x%08x", sw_r32(base + (word << 2)));
+	seq_printf(m, " qid[%d..%d]", programmed,
+		   RTL930X_VENDOR_QID_ENTRY_COUNT - 1);
+	for (int queue = programmed;
+	     queue < RTL930X_VENDOR_QID_ENTRY_COUNT; queue++)
+		seq_printf(m, " %u",
+			   rtl930x_vendor_packed_read(base, queue, width));
+	seq_puts(m, " status reset_deliberate\n");
+}
+
+static void rtl930x_vendor_init_dump(struct rtl838x_switch_priv *priv,
+				     struct seq_file *m)
+{
+	u32 raw;
+
+	mutex_lock(&priv->reg_mutex);
+	seq_puts(m, "family longan\n");
+
+	raw = sw_r32(RTL930X_VENDOR_PARSER_CTRL);
+	seq_printf(m, "parser_ctrl addr 0x%08x raw 0x%08x "
+		   "pppoe_parse_en %u rfc1042_oui_ignore %u status programmed\n",
+		   RTL930X_VENDOR_PARSER_CTRL, raw,
+		   !!(raw & RTL930X_VENDOR_PPPOE_PARSE_EN),
+		   !!(raw & RTL930X_VENDOR_RFC1042_OUI_IGNORE));
+
+	rtl930x_vendor_qid_map_dump(m, "cpu_qid_map",
+				     RTL930X_VENDOR_CPU_QID_MAP,
+				     RTL930X_VENDOR_CPU_QID_WORDS,
+				     RTL930X_VENDOR_CPU_QID_WIDTH,
+				     RTL930X_VENDOR_QUEUE_COUNT);
+	rtl930x_vendor_qid_map_dump(m, "stack_qid_map",
+				     RTL930X_VENDOR_STACK_QID_MAP,
+				     RTL930X_VENDOR_STACK_QID_WORDS,
+				     RTL930X_VENDOR_STACK_QID_WIDTH,
+				     RTL930X_FC_STACK_QUEUE_COUNT);
+
+	raw = sw_r32(RTL930X_VENDOR_L2_NTFY_CTRL);
+	seq_printf(m, "l2_notify addr 0x%08x raw 0x%08x ld_flush_notify_en %u "
+		   "dyn_notify_en %u bp_thr %u notify_type %u status programmed\n",
+		   RTL930X_VENDOR_L2_NTFY_CTRL, raw,
+		   !!(raw & RTL930X_VENDOR_LD_FLUSH_NTFY_EN),
+		   !!(raw & RTL930X_VENDOR_DYN_NTFY_EN),
+		   (u32)FIELD_GET(RTL930X_VENDOR_BP_THR_M, raw),
+		   (u32)FIELD_GET(RTL930X_VENDOR_NTFY_TYPE_M, raw));
+	seq_printf(m, "l2_notify_master addr 0x%08x raw 0x%08x notify_en %u "
+		   "status reset_deliberate\n",
+		   RTL930X_VENDOR_L2_NTFY_CTRL, raw,
+		   !!(raw & RTL930X_VENDOR_NTFY_EN));
+
+	raw = sw_r32(RTL930X_VENDOR_EGBW_CTRL);
+	seq_printf(m, "egbw_ctrl addr 0x%08x raw 0x%08x rate_mode_cpu %u "
+		   "status already_vendor\n",
+		   RTL930X_VENDOR_EGBW_CTRL, raw,
+		   !!(raw & RTL930X_VENDOR_RATE_MODE_CPU));
+	mutex_unlock(&priv->reg_mutex);
+}
+
 static void rtldsa_930x_qos_set_group_selector(int port, int group)
 {
 	sw_w32_mask(RTL93XX_PORT_TBL_IDX_CTRL_IDX_MASK(port),
@@ -3761,6 +3929,8 @@ const struct rtl838x_reg rtl930x_reg = {
 	.enable_mcast_flood = rtldsa_930x_enable_mcast_flood,
 	.enable_bcast_flood = rtldsa_930x_enable_bcast_flood,
 	.set_receive_management_action = rtldsa_930x_set_receive_management_action,
+	.vendor_init = rtl930x_vendor_init,
+	.vendor_init_dump = rtl930x_vendor_init_dump,
 	.flow_control_init = rtl930x_flow_control_init,
 	.flow_control_dump = rtl930x_flow_control_dump,
 	.qos_init = rtldsa_930x_qos_init,

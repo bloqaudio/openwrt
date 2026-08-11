@@ -2900,6 +2900,9 @@ static int rtl83xx_sw_probe(struct platform_device *pdev)
 	if (priv->r->flow_control_init)
 		priv->r->flow_control_init(priv);
 
+	if (priv->r->vendor_init)
+		priv->r->vendor_init(priv);
+
 	if (priv->r->qos_init)
 		priv->r->qos_init(priv);
 

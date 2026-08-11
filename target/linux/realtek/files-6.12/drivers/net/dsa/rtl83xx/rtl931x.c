@@ -2589,6 +2589,201 @@ static void rtl931x_flow_control_dump(struct rtl838x_switch_priv *priv,
 	mutex_unlock(&priv->reg_mutex);
 }
 
+/* Remaining Mango construction rows. Register addresses and fields are from
+ * rtk_mango_{reg,regField}_list.c.
+ */
+#define RTL931X_VENDOR_PARSER_CTRL		0x056c
+#define RTL931X_VENDOR_VXLAN_GPE_UDP_PORT_M	GENMASK(31, 16)
+#define RTL931X_VENDOR_MALFORMED_PKT_ACT_M	GENMASK(6, 5)
+#define RTL931X_VENDOR_PARSER_CANT_HANDLE_ACT_M	GENMASK(4, 3)
+#define RTL931X_VENDOR_WL_OFFSET_EN		BIT(2)
+#define RTL931X_VENDOR_PPPOE_PARSE_EN		BIT(1)
+#define RTL931X_VENDOR_RFC1042_OUI_IGNORE	BIT(0)
+
+#define RTL931X_VENDOR_METER_BYTE_TB_CTRL	0x4178
+#define RTL931X_VENDOR_METER_PKT_TB_CTRL		0x417c
+#define RTL931X_VENDOR_IGBW_LB_CTRL		0xe004
+#define RTL931X_VENDOR_TICK_M			GENMASK(31, 16)
+#define RTL931X_VENDOR_TOKEN_M			GENMASK(15, 0)
+
+#define RTL931X_VENDOR_IGBW_PORT_SCHED_BASE	0xe914
+#define RTL931X_VENDOR_IGBW_PORT_SCHED(p, q) \
+	(RTL931X_VENDOR_IGBW_PORT_SCHED_BASE + \
+	 ((((p) * RTL931X_IGBW_QUEUE_COUNT) + (q)) << 2))
+#define RTL931X_VENDOR_IGBW_SP			BIT(8)
+#define RTL931X_VENDOR_IGBW_WEIGHT_M		GENMASK(4, 0)
+
+struct rtl931x_vendor_rate_defaults {
+	u16 mhz;
+	u16 byte_tick;
+	u16 byte_token;
+	u16 packet_tick;
+	u16 packet_token;
+	u16 ingress_tick;
+	u16 ingress_token;
+};
+
+/* Indexed by MAC_L2_GLOBAL_CTRL2.SYS_CLK_SEL. The SDK treats every value
+ * other than the explicit 325 MHz and 175 MHz selectors as 650 MHz.
+ */
+static const struct rtl931x_vendor_rate_defaults rtl931x_vendor_rates[] = {
+	{
+		.mhz = 650,
+		.byte_tick = 53,
+		.byte_token = 171,
+		.packet_tick = 620,
+		.packet_token = 1,
+		.ingress_tick = 53,
+		.ingress_token = 171,
+	},
+	{
+		.mhz = 325,
+		.byte_tick = 53,
+		.byte_token = 342,
+		.packet_tick = 310,
+		.packet_token = 1,
+		.ingress_tick = 53,
+		.ingress_token = 342,
+	},
+	{
+		.mhz = 175,
+		.byte_tick = 123,
+		.byte_token = 1474,
+		.packet_tick = 167,
+		.packet_token = 1,
+		.ingress_tick = 123,
+		.ingress_token = 1474,
+	},
+};
+
+static const struct rtl931x_vendor_rate_defaults *
+rtl931x_vendor_rate_defaults_get(u32 sys_clk)
+{
+	if (sys_clk == 1 || sys_clk == 2)
+		return &rtl931x_vendor_rates[sys_clk];
+
+	return &rtl931x_vendor_rates[0];
+}
+
+static void rtl931x_vendor_init(struct rtl838x_switch_priv *priv)
+{
+	struct dsa_port *dp;
+
+	mutex_lock(&priv->reg_mutex);
+
+	/* Preserve every other parser field, including the live VXLAN port and
+	 * word-length offset setting.
+	 */
+	sw_w32_mask(RTL931X_VENDOR_PPPOE_PARSE_EN,
+		    RTL931X_VENDOR_PPPOE_PARSE_EN, RTL931X_VENDOR_PARSER_CTRL);
+
+	/* dsa_switch_for_each_user_port() is the driver's equivalent of the
+	 * vendor HWP_PORT_TRAVS_EXCEPT_CPU: absent MACs and CPU port 56 remain
+	 * untouched. SP is independent of the reset WEIGHT field.
+	 */
+	dsa_switch_for_each_user_port(dp, priv->ds) {
+		for (int queue = 0; queue < RTL931X_IGBW_QUEUE_COUNT; queue++)
+			sw_w32_mask(RTL931X_VENDOR_IGBW_SP,
+				    RTL931X_VENDOR_IGBW_SP,
+				    RTL931X_VENDOR_IGBW_PORT_SCHED(dp->index,
+								    queue));
+	}
+
+	/* METER_BYTE_TB_CTRL, METER_PKT_TB_CTRL, and IGBW_LB_CTRL already match
+	 * the clock-selected vendor values on live Mango hardware, so do not
+	 * rewrite them; debugfs derives their expected values from SYS_CLK_SEL.
+	 * The initialized meter state rules out an uninitialized meter as the
+	 * reason SWRED is inert.
+	 */
+
+	mutex_unlock(&priv->reg_mutex);
+}
+
+static void rtl931x_vendor_rate_dump(struct seq_file *m, const char *name,
+				     u32 reg, u16 vendor_tick,
+				     u16 vendor_token)
+{
+	u32 raw = sw_r32(reg);
+
+	seq_printf(m, "%s addr 0x%08x raw 0x%08x tick %u token %u "
+		   "vendor_tick %u vendor_token %u status already_vendor\n",
+		   name, reg, raw, (u32)FIELD_GET(RTL931X_VENDOR_TICK_M, raw),
+		   (u32)FIELD_GET(RTL931X_VENDOR_TOKEN_M, raw), vendor_tick,
+		   vendor_token);
+}
+
+static void rtl931x_vendor_sched_dump(struct seq_file *m, int port, int queue,
+				      const char *status)
+{
+	u32 reg = RTL931X_VENDOR_IGBW_PORT_SCHED(port, queue);
+	u32 raw = sw_r32(reg);
+
+	seq_printf(m, "igbw_port_sched port %d queue %d addr 0x%08x "
+		   "raw 0x%08x sp %u status %s weight %u "
+		   "weight_status reset_deliberate\n",
+		   port, queue, reg, raw, !!(raw & RTL931X_VENDOR_IGBW_SP),
+		   status, (u32)FIELD_GET(RTL931X_VENDOR_IGBW_WEIGHT_M, raw));
+}
+
+static void rtl931x_vendor_init_dump(struct rtl838x_switch_priv *priv,
+				     struct seq_file *m)
+{
+	const struct rtl931x_vendor_rate_defaults *rates;
+	struct dsa_port *dp;
+	u32 clock_raw;
+	u32 sys_clk;
+	u32 raw;
+
+	mutex_lock(&priv->reg_mutex);
+	seq_puts(m, "family mango\n");
+
+	clock_raw = sw_r32(RTL931X_MAC_L2_GLOBAL_CTRL2);
+	sys_clk = (u32)FIELD_GET(RTL931X_SYS_CLK_SEL_M, clock_raw);
+	rates = rtl931x_vendor_rate_defaults_get(sys_clk);
+	seq_printf(m, "system_clock addr 0x%08x raw 0x%08x sys_clk_sel %u "
+		   "mhz %u\n",
+		   RTL931X_MAC_L2_GLOBAL_CTRL2, clock_raw, sys_clk, rates->mhz);
+
+	raw = sw_r32(RTL931X_VENDOR_PARSER_CTRL);
+	seq_printf(m, "parser_ctrl addr 0x%08x raw 0x%08x pppoe_parse_en %u "
+		   "vxlan_gpe_udp_port %u malformed_pkt_act %u "
+		   "parser_cant_handle_act %u wl_offset_en %u "
+		   "rfc1042_oui_ignore %u status programmed\n",
+		   RTL931X_VENDOR_PARSER_CTRL, raw,
+		   !!(raw & RTL931X_VENDOR_PPPOE_PARSE_EN),
+		   (u32)FIELD_GET(RTL931X_VENDOR_VXLAN_GPE_UDP_PORT_M, raw),
+		   (u32)FIELD_GET(RTL931X_VENDOR_MALFORMED_PKT_ACT_M, raw),
+		   (u32)FIELD_GET(RTL931X_VENDOR_PARSER_CANT_HANDLE_ACT_M, raw),
+		   !!(raw & RTL931X_VENDOR_WL_OFFSET_EN),
+		   !!(raw & RTL931X_VENDOR_RFC1042_OUI_IGNORE));
+
+	rtl931x_vendor_rate_dump(m, "meter_byte_tb",
+				 RTL931X_VENDOR_METER_BYTE_TB_CTRL,
+				 rates->byte_tick, rates->byte_token);
+	rtl931x_vendor_rate_dump(m, "meter_packet_tb",
+				 RTL931X_VENDOR_METER_PKT_TB_CTRL,
+				 rates->packet_tick, rates->packet_token);
+	rtl931x_vendor_rate_dump(m, "igbw_lb", RTL931X_VENDOR_IGBW_LB_CTRL,
+				 rates->ingress_tick, rates->ingress_token);
+	raw = sw_r32(RTL931X_FC_REPCT_FCOFF_THR);
+	seq_printf(m, "repeater_flow_control addr 0x%08x raw 0x%08x "
+		   "drop_on %u drop_off %u status programmed\n",
+		   RTL931X_FC_REPCT_FCOFF_THR, raw,
+		   (u32)FIELD_GET(RTL931X_FC_THR_ON_M, raw),
+		   (u32)FIELD_GET(RTL931X_FC_THR_OFF_M, raw));
+
+	dsa_switch_for_each_user_port(dp, priv->ds) {
+		for (int queue = 0; queue < RTL931X_IGBW_QUEUE_COUNT; queue++)
+			rtl931x_vendor_sched_dump(m, dp->index, queue,
+						  "programmed");
+	}
+	for (int queue = 0; queue < RTL931X_IGBW_QUEUE_COUNT; queue++)
+		rtl931x_vendor_sched_dump(m, priv->cpu_port, queue,
+					  "reset_deliberate");
+
+	mutex_unlock(&priv->reg_mutex);
+}
+
 static void rtldsa_931x_qos_set_group_selector(int port, int group)
 {
 	sw_w32_mask(RTL93XX_PORT_TBL_IDX_CTRL_IDX_MASK(port),
@@ -4081,6 +4276,8 @@ const struct rtl838x_reg rtl931x_reg = {
 	.enable_flood = rtldsa_931x_enable_flood,
 	.enable_bcast_flood = rtldsa_931x_enable_bcast_flood,
 	.set_receive_management_action = rtldsa_931x_set_receive_management_action,
+	.vendor_init = rtl931x_vendor_init,
+	.vendor_init_dump = rtl931x_vendor_init_dump,
 	.flow_control_init = rtl931x_flow_control_init,
 	.flow_control_dump = rtl931x_flow_control_dump,
 	.qos_init = rtldsa_931x_qos_init,
