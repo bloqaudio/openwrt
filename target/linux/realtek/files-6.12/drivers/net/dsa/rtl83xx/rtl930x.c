@@ -2116,7 +2116,12 @@ static int rtl930x_pie_rule_add(struct rtl838x_switch_priv *priv, struct pie_rul
 			break;
 	}
 
-	if (block >= priv->n_pie_blocks) {
+	/* Ingress rules only ever search the first half of the blocks, so the
+	 * exhaustion test has to be against max_block: comparing against
+	 * n_pie_blocks never fires for them and the code below would then run
+	 * with the -1 that verify_template returned on its last attempt.
+	 */
+	if (block >= max_block) {
 		mutex_unlock(&priv->pie_mutex);
 		return -EOPNOTSUPP;
 	}
