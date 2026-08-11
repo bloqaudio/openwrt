@@ -1555,6 +1555,17 @@ static int rtl931x_pie_verify_template(struct rtl838x_switch_priv *priv,
 	if (ether_addr_to_u64(pr->dmac) && !rtl931x_pie_templ_has(t, TEMPLATE_FIELD_DMAC0))
 		return -1;
 
+	/* A rule whose match fields are absent from the template would be
+	 * programmed without them and match more traffic than requested.
+	 * Reject the template so selection falls through to one that fits
+	 * (templates 1-3 carry the L4 port fields).
+	 */
+	if (pr->sport_m && !rtl931x_pie_templ_has(t, TEMPLATE_FIELD_L4_SPORT))
+		return -1;
+
+	if (pr->dport_m && !rtl931x_pie_templ_has(t, TEMPLATE_FIELD_L4_DPORT))
+		return -1;
+
 	/* The source port mask used for per-port scoping spans SPM0-3
 	 * (16 ports each); without the matching template field the rule
 	 * would match on more ports than requested.
