@@ -40,7 +40,12 @@
 
 /* A live lane needs two bad symbol-error windows before it may be disturbed. */
 #define RTPCS_SDS_RX_BAD_SAMPLES		2
+#define RTPCS_SDS_RX_CLEAN_LINKLESS_SAMPLES	2
 #define RTPCS_SDS_RX_SAMPLE_DELAY		msecs_to_jiffies(100)
+#define RTPCS_SDS_LINK_SETTLE_DELAY		msecs_to_jiffies(500)
+#define RTPCS_SDS_LINK_ACTION_SAMPLES		2
+#define RTPCS_SDS_LINK_SETTLE_SAMPLES		4
+#define RTPCS_SDS_LINK_UP_SAMPLES		2
 
 #define RTPCS_838X_CPU_PORT			28
 #define RTPCS_838X_SERDES_CNT			6
@@ -156,6 +161,13 @@ enum rtpcs_sds_recovery_tier {
 	RTPCS_SDS_RECOVERY_TIERS,
 };
 
+enum rtpcs_sds_retry_resume {
+	RTPCS_SDS_RETRY_RESUME_NONE,
+	RTPCS_SDS_RETRY_RESUME_VERIFY,
+	RTPCS_SDS_RETRY_RESUME_RECOVERY,
+	RTPCS_SDS_RETRY_RESUME_SETUP,
+};
+
 struct rtpcs_ctrl;
 
 struct rtpcs_serdes {
@@ -205,11 +217,19 @@ struct rtpcs_link {
 	unsigned int retry_neg_mode;
 	unsigned int retry_attempt;
 	unsigned int retry_bad_samples;
+	unsigned int retry_clean_linkless_samples;
+	unsigned int retry_settle_samples;
+	unsigned int retry_settle_up_samples;
+	enum rtpcs_sds_retry_resume retry_settle_resume;
 	bool retry_verify;
 	bool retry_escalating;
 	bool retry_ladder_exhausted;
 	bool retry_recovery_active;
 	bool retry_clean_linkless_reported;
+	bool retry_settling;
+	bool retry_action_active;
+	bool retry_action_linkless;
+	bool retry_link_seen;
 	bool retry_force;
 	bool retry_bad_link_up;
 	bool retry_injected;
@@ -228,12 +248,15 @@ struct rtpcs_config {
 	const struct phylink_pcs_ops *pcs_ops;
 	int (*init_serdes_common)(struct rtpcs_ctrl *ctrl);
 	int (*set_autoneg)(struct rtpcs_serdes *sds, unsigned int neg_mode);
-	int (*setup_serdes)(struct rtpcs_serdes *sds, phy_interface_t mode);
+	int (*setup_serdes)(struct rtpcs_link *link, phy_interface_t mode);
 	int (*verify_rx)(struct rtpcs_link *link);
 	int (*recover_serdes)(struct rtpcs_serdes *sds,
 			      phy_interface_t mode,
 			      enum rtpcs_sds_recovery_tier tier);
 };
+
+static bool rtpcs_sds_retry_wait_for_link(struct rtpcs_link *link,
+					  bool discard_prior);
 
 typedef struct {
 	u8 page;
@@ -610,9 +633,10 @@ static int rtpcs_838x_init_serdes_common(struct rtpcs_ctrl *ctrl)
 	return 0;
 }
 
-static int rtpcs_838x_setup_serdes(struct rtpcs_serdes *sds,
+static int rtpcs_838x_setup_serdes(struct rtpcs_link *link,
 				   phy_interface_t mode)
 {
+	struct rtpcs_serdes *sds = link->sds;
 	int ret;
 
 	if (!rtpcs_838x_sds_is_mode_supported(sds, mode))
@@ -2306,9 +2330,10 @@ static int rtpcs_930x_sds_cmu_band_get(struct rtpcs_serdes *sds)
 	return cmu_band;
 }
 
-static int rtpcs_930x_setup_serdes(struct rtpcs_serdes *sds,
+static int rtpcs_930x_setup_serdes(struct rtpcs_link *link,
 				   phy_interface_t phy_mode)
 {
+	struct rtpcs_serdes *sds = link->sds;
 	int calib_tries = 0;
 	bool calib_ok;
 	int ret;
@@ -2348,19 +2373,26 @@ static int rtpcs_930x_setup_serdes(struct rtpcs_serdes *sds,
 	/* Enable Fiber RX */
 	rtpcs_sds_write_bits(sds, 0x20, 2, 12, 12, 0);
 
-	/* RX-idle is a pre-calibration quiesce operation from the Longan SDK.
-	 * Do not use it after the lane has been returned to its live peer.
+	/* A retrying lane can lock as soon as the requested mode is enabled.
+	 * Observe that state before calibration disturbs the receiver again.
+	 * Initial configuration does not wait here; its worker observes the
+	 * completed setup instead.
 	 */
-	rtpcs_930x_sds_10g_idle(sds);
-	do {
-		rtpcs_930x_sds_do_rx_calibration(sds, phy_mode);
-		calib_tries++;
-		mdelay(50);
-		calib_ok = !rtpcs_930x_sds_check_calibration(sds, phy_mode);
-	} while (!calib_ok && calib_tries < 3);
-	if (!calib_ok) {
-		pr_debug("%s: SerDes RX calibration failed\n", __func__);
-		ret = -EIO;
+	if (!rtpcs_sds_retry_wait_for_link(link, true)) {
+		/* RX-idle is a pre-calibration quiesce operation from the Longan SDK.
+		 * Do not use it after the lane has been returned to its live peer.
+		 */
+		rtpcs_930x_sds_10g_idle(sds);
+		do {
+			rtpcs_930x_sds_do_rx_calibration(sds, phy_mode);
+			calib_tries++;
+			mdelay(50);
+			calib_ok = !rtpcs_930x_sds_check_calibration(sds, phy_mode);
+		} while (!calib_ok && calib_tries < 3);
+		if (!calib_ok) {
+			pr_debug("%s: SerDes RX calibration failed\n", __func__);
+			ret = -EIO;
+		}
 	}
 
 	/* Leave loopback mode */
@@ -3391,9 +3423,10 @@ static void rtpcs_931x_sds_rx_calibrate(struct rtpcs_serdes *sds)
 	mdelay(50);
 }
 
-static int rtpcs_931x_setup_serdes(struct rtpcs_serdes *sds,
+static int rtpcs_931x_setup_serdes(struct rtpcs_link *link,
 				   phy_interface_t mode)
 {
+	struct rtpcs_serdes *sds = link->sds;
 	u32 board_sds_tx_type1[] = {
 		0x01c3, 0x01c3, 0x01c3, 0x01a3, 0x01a3, 0x01a3,
 		0x0143, 0x0143, 0x0143, 0x0143, 0x0163, 0x0163,
@@ -3670,8 +3703,11 @@ static int rtpcs_931x_setup_serdes(struct rtpcs_serdes *sds,
 	    mode == PHY_INTERFACE_MODE_USXGMII ||
 	    mode == PHY_INTERFACE_MODE_XGMII ||
 	    mode == PHY_INTERFACE_MODE_10GBASER ||
-	    mode == PHY_INTERFACE_MODE_10GKR)
+	    mode == PHY_INTERFACE_MODE_10GKR) {
+		if (rtpcs_sds_retry_wait_for_link(link, true))
+			return 0;
 		rtpcs_931x_sds_rx_calibrate(sds);
+	}
 
 	return 0;
 }
@@ -3758,6 +3794,14 @@ static void rtpcs_pcs_get_state(struct phylink_pcs *pcs, struct phylink_link_sta
 		return;
 
 	state->link = 1;
+	/* pcs_get_state() is also the event path behind phylink's Link is Up
+	 * report. Latch a link seen while the retry worker is settling so a
+	 * short-lived result cannot be lost between worker samples. The retry
+	 * worker owns the state under ctrl->lock; this callback only sets the
+	 * monotonic observation bit, so READ_ONCE/WRITE_ONCE is sufficient.
+	 */
+	if (READ_ONCE(link->retry_settling))
+		WRITE_ONCE(link->retry_link_seen, true);
 
 	/*
 	 * Fixed-speed SerDes modes: the MAC speed status only reflects the
@@ -3837,6 +3881,54 @@ static bool rtpcs_mac_link_up(struct rtpcs_link *link)
 static bool rtpcs_mac_link_stable(struct rtpcs_link *link)
 {
 	return rtpcs_mac_link_up(link) && rtpcs_mac_link_up(link);
+}
+
+/* A retry action starts only on a linkless lane. Once the family sequence has
+ * enabled its final mode, watch for a second before allowing another
+ * disruptive step. Two sampled link-up results are stable; the phylink event
+ * latch also preserves a shorter pulse that fell between samples. This helper
+ * is inert during pcs_config(), keeping the long settle in retry_work.
+ */
+static bool rtpcs_sds_retry_wait_for_link(struct rtpcs_link *link,
+					  bool discard_prior)
+{
+	struct rtpcs_ctrl *ctrl = link->ctrl;
+	unsigned int up_samples = 0;
+	unsigned int i;
+
+	lockdep_assert_held(&ctrl->lock);
+
+	if (!link->retry_action_active ||
+	    !link->retry_action_linkless)
+		return false;
+
+	/* A family setup discards the internal-loopback indication from its
+	 * preceding mode transition. A completed recovery primitive preserves
+	 * every link indication it produced so re-setup can be skipped.
+	 */
+	if (discard_prior) {
+		WRITE_ONCE(link->retry_link_seen, false);
+		if (rtpcs_mac_link_up(link)) {
+			WRITE_ONCE(link->retry_link_seen, true);
+			up_samples = 1;
+		}
+	} else if (READ_ONCE(link->retry_link_seen)) {
+		return true;
+	}
+
+	for (i = 0; i < RTPCS_SDS_LINK_ACTION_SAMPLES; i++) {
+		msleep(jiffies_to_msecs(RTPCS_SDS_LINK_SETTLE_DELAY));
+		if (rtpcs_mac_link_up(link)) {
+			WRITE_ONCE(link->retry_link_seen, true);
+			up_samples++;
+			if (up_samples >= RTPCS_SDS_LINK_UP_SAMPLES)
+				return true;
+		} else {
+			up_samples = 0;
+		}
+	}
+
+	return READ_ONCE(link->retry_link_seen);
 }
 
 /* MOD-DEF0 is the only SFP presence signal that is valid at any time: it
@@ -3923,6 +4015,7 @@ static int rtpcs_sds_verify_rx(struct rtpcs_link *link)
 
 	ret = ctrl->cfg->verify_rx(link);
 	if (ret) {
+		link->retry_clean_linkless_samples = 0;
 		link->retry_bad_samples++;
 		link->retry_bad_link_up = rtpcs_mac_link_stable(link);
 		if (link->retry_bad_samples < RTPCS_SDS_RX_BAD_SAMPLES)
@@ -3937,6 +4030,7 @@ static int rtpcs_sds_verify_rx(struct rtpcs_link *link)
 #ifdef CONFIG_DEBUG_FS
 	if (ctrl->dbg_fail_sds == link->sds->id) {
 		ctrl->dbg_fail_sds = RTPCS_SDS_CNT;
+		link->retry_clean_linkless_samples = 0;
 		link->retry_injected = true;
 		dev_warn(ctrl->dev,
 			 "port %d, sds %d: debug: forcing RX verification failure\n",
@@ -3955,7 +4049,7 @@ static int rtpcs_sds_setup(struct rtpcs_link *link)
 
 	lockdep_assert_held(&ctrl->lock);
 
-	ret = ctrl->cfg->setup_serdes(link->sds, link->retry_mode);
+	ret = ctrl->cfg->setup_serdes(link, link->retry_mode);
 	if (ret)
 		return ret;
 
@@ -3988,14 +4082,58 @@ static void rtpcs_sds_retry_reset(struct rtpcs_link *link)
 
 	link->retry_attempt = 0;
 	link->retry_bad_samples = 0;
+	link->retry_clean_linkless_samples = 0;
+	link->retry_settle_samples = 0;
+	link->retry_settle_up_samples = 0;
+	link->retry_settle_resume = RTPCS_SDS_RETRY_RESUME_NONE;
 	link->retry_verify = false;
 	link->retry_escalating = false;
 	link->retry_ladder_exhausted = false;
 	link->retry_recovery_active = false;
 	link->retry_clean_linkless_reported = false;
+	WRITE_ONCE(link->retry_settling, false);
+	link->retry_action_active = false;
+	link->retry_action_linkless = false;
+	WRITE_ONCE(link->retry_link_seen, false);
 	link->retry_force = false;
 	link->retry_bad_link_up = false;
 	link->retry_injected = false;
+}
+
+static void rtpcs_sds_retry_action_begin(struct rtpcs_link *link)
+{
+	struct rtpcs_ctrl *ctrl = link->ctrl;
+
+	lockdep_assert_held(&ctrl->lock);
+
+	link->retry_settle_samples = 0;
+	link->retry_settle_up_samples = 0;
+	link->retry_settle_resume = RTPCS_SDS_RETRY_RESUME_NONE;
+	link->retry_action_active = true;
+	link->retry_action_linkless = !rtpcs_mac_link_up(link);
+	WRITE_ONCE(link->retry_link_seen, false);
+	WRITE_ONCE(link->retry_settling, true);
+}
+
+static void
+rtpcs_sds_retry_settle_start(struct rtpcs_link *link,
+			     enum rtpcs_sds_retry_resume resume)
+{
+	struct rtpcs_ctrl *ctrl = link->ctrl;
+
+	lockdep_assert_held(&ctrl->lock);
+
+	link->retry_settle_samples = 0;
+	link->retry_settle_up_samples = 0;
+	link->retry_settle_resume = resume;
+	link->retry_action_active = false;
+	if (rtpcs_mac_link_up(link)) {
+		WRITE_ONCE(link->retry_link_seen, true);
+		link->retry_settle_up_samples = 1;
+	}
+	WRITE_ONCE(link->retry_settling, true);
+	mod_delayed_work(system_power_efficient_wq, &link->retry_work,
+			 RTPCS_SDS_LINK_SETTLE_DELAY);
 }
 
 static void rtpcs_sds_retry_completed(struct rtpcs_link *link)
@@ -4011,17 +4149,99 @@ static void rtpcs_sds_retry_completed(struct rtpcs_link *link)
 		 link->port, link->sds->id);
 }
 
+static void rtpcs_sds_retry_linkless(struct rtpcs_link *link, bool clean);
+
+/* Return true while a completed setup/recovery action owns the worker. Link
+ * must be sampled up twice before success is reported. If no stable link is
+ * present after the settle window, resume the exact state-machine edge that
+ * the action deferred; no further SerDes operation runs from this invocation.
+ */
+static bool rtpcs_sds_retry_handle_settle(struct rtpcs_link *link)
+{
+	struct rtpcs_ctrl *ctrl = link->ctrl;
+	bool link_up;
+
+	lockdep_assert_held(&ctrl->lock);
+
+	if (!READ_ONCE(link->retry_settling))
+		return false;
+
+	link->retry_settle_samples++;
+	link_up = rtpcs_mac_link_up(link);
+	if (link_up) {
+		WRITE_ONCE(link->retry_link_seen, true);
+		link->retry_settle_up_samples++;
+		if (link->retry_settle_up_samples >=
+		    RTPCS_SDS_LINK_UP_SAMPLES) {
+			if (link->retry_recovery_active)
+				rtpcs_sds_retry_completed(link);
+			else
+				rtpcs_sds_retry_reset(link);
+			return true;
+		}
+	} else {
+		link->retry_settle_up_samples = 0;
+	}
+
+	/* Give a first up sample its confirmation interval even when it lands
+	 * at the end of the nominal two-second settle window.
+	 */
+	if (link->retry_settle_samples < RTPCS_SDS_LINK_SETTLE_SAMPLES ||
+	    link->retry_settle_up_samples) {
+		mod_delayed_work(system_power_efficient_wq, &link->retry_work,
+				 RTPCS_SDS_LINK_SETTLE_DELAY);
+		return true;
+	}
+
+	WRITE_ONCE(link->retry_settling, false);
+	link->retry_action_linkless = false;
+	WRITE_ONCE(link->retry_link_seen, false);
+
+	switch (link->retry_settle_resume) {
+	case RTPCS_SDS_RETRY_RESUME_VERIFY:
+		link->retry_settle_resume = RTPCS_SDS_RETRY_RESUME_NONE;
+		link->retry_verify = true;
+		mod_delayed_work(system_power_efficient_wq, &link->retry_work, 0);
+		break;
+	case RTPCS_SDS_RETRY_RESUME_RECOVERY:
+		link->retry_settle_resume = RTPCS_SDS_RETRY_RESUME_NONE;
+		mod_delayed_work(system_power_efficient_wq, &link->retry_work, 0);
+		break;
+	case RTPCS_SDS_RETRY_RESUME_SETUP:
+		link->retry_settle_resume = RTPCS_SDS_RETRY_RESUME_NONE;
+		rtpcs_sds_retry_linkless(link, false);
+		break;
+	case RTPCS_SDS_RETRY_RESUME_NONE:
+		break;
+	}
+
+	return true;
+}
+
 static void rtpcs_sds_retry_linkless(struct rtpcs_link *link, bool clean)
 {
 	struct rtpcs_ctrl *ctrl = link->ctrl;
 
 	lockdep_assert_held(&ctrl->lock);
 
-	if (clean && !link->retry_clean_linkless_reported) {
-		dev_info(ctrl->dev,
-			 "port %d, sds %d: RX verification clean but link is down; retaining setup retry\n",
-			 link->port, link->sds->id);
-		link->retry_clean_linkless_reported = true;
+	if (clean) {
+		if (!link->retry_escalating && !link->retry_ladder_exhausted) {
+			link->retry_clean_linkless_samples++;
+			if (link->retry_clean_linkless_samples >=
+			    RTPCS_SDS_RX_CLEAN_LINKLESS_SAMPLES)
+				link->retry_escalating = true;
+			else
+				link->retry_verify = true;
+		}
+
+		if (!link->retry_clean_linkless_reported) {
+			dev_info(ctrl->dev,
+				 "port %d, sds %d: RX verification clean but link is down; retaining setup retry\n",
+				 link->port, link->sds->id);
+			link->retry_clean_linkless_reported = true;
+		}
+	} else {
+		link->retry_clean_linkless_samples = 0;
 	}
 
 	mod_delayed_work(system_power_efficient_wq, &link->retry_work,
@@ -4043,6 +4263,12 @@ static void rtpcs_sds_setup_retry(struct work_struct *work)
 		rtpcs_sds_retry_reset(link);
 		goto out;
 	}
+
+	/* Setups and recovery actions always yield to a multi-sample link
+	 * settle before verification or another state-machine edge may run.
+	 */
+	if (rtpcs_sds_retry_handle_settle(link))
+		goto out;
 
 	/* A link is the only success condition.  The forced debug check must run
 	 * even on a live lane so that the stable-link veto can prove it harmless.
@@ -4111,15 +4337,16 @@ static void rtpcs_sds_setup_retry(struct work_struct *work)
 			goto out;
 	}
 
-	/* A clean error counter is not evidence of a working receiver when no
-	 * partner is present.  It stops a *new* escalation, but never stops the
-	 * populated-cage retry.  Once a health failure has entered the bounded
-	 * ladder, retain its state across clean linkless samples so that it gets
-	 * all recovery tiers.  After that, only ordinary setup retries remain:
-	 * a module with an unplugged DAC peer cannot repeatedly pulse reset or
-	 * re-initialize the SerDes forever.
+	/* A clean error counter is not evidence of a working receiver while the
+	 * link is down.  Two consecutive clean linkless samples enter the same
+	 * bounded ladder as a health failure.  Once escalation starts, retain its
+	 * state across clean linkless samples so that it gets all recovery tiers.
+	 * After that, only ordinary setup retries remain: a module with an
+	 * unplugged DAC peer cannot repeatedly pulse reset or re-initialize the
+	 * SerDes forever.
 	 */
 	if (!link->retry_escalating || link->retry_ladder_exhausted) {
+		rtpcs_sds_retry_action_begin(link);
 		ret = rtpcs_sds_setup(link);
 		if (!ret) {
 			link->sds->first_start = false;
@@ -4127,7 +4354,9 @@ static void rtpcs_sds_setup_retry(struct work_struct *work)
 			if (ctrl->cfg->set_autoneg)
 				ctrl->cfg->set_autoneg(link->sds, link->retry_neg_mode);
 		}
-		rtpcs_sds_retry_linkless(link, false);
+		link->retry_force = false;
+		rtpcs_sds_retry_settle_start(link,
+					     RTPCS_SDS_RETRY_RESUME_SETUP);
 		goto out;
 	}
 
@@ -4171,45 +4400,50 @@ static void rtpcs_sds_setup_retry(struct work_struct *work)
 			 link->retry_attempt,
 			 RTPCS_SDS_RECOVERY_TRIES * RTPCS_SDS_RECOVERY_TIERS);
 
+	rtpcs_sds_retry_action_begin(link);
 	if (ctrl->cfg->recover_serdes)
 		ret = ctrl->cfg->recover_serdes(link->sds, link->retry_mode, tier);
 	else
 		ret = 0;
-	if (!ret)
+
+	/* A reset can restore the lane by itself. Observe it before the full
+	 * re-setup so the operation that recovered link is not immediately
+	 * followed by another disruptive sequence.
+	 */
+	if (!ret && !rtpcs_sds_retry_wait_for_link(link, false))
 		ret = rtpcs_sds_setup(link);
-	if (!ret)
-		ret = rtpcs_sds_verify_rx(link);
-	if (rtpcs_mac_link_up(link)) {
-		rtpcs_sds_retry_completed(link);
-		goto out;
-	}
-	if (ret == -EAGAIN) {
-		/* setup succeeded; retain that state if the lane comes up while
-		 * the second confirmation sample is pending.
-		 */
+	if (!ret) {
 		link->sds->first_start = false;
 		link->sds->configured_mode = link->retry_mode;
-		link->retry_verify = true;
-		mod_delayed_work(system_power_efficient_wq, &link->retry_work,
-				 RTPCS_SDS_RX_SAMPLE_DELAY);
-		goto out;
-	}
-	if (ret) {
-		if (rtpcs_sfp_module_absent(link))
-			goto out;
-		rtpcs_sds_retry_linkless(link, false);
-		goto out;
+		if (ctrl->cfg->set_autoneg)
+			ctrl->cfg->set_autoneg(link->sds, link->retry_neg_mode);
 	}
 
-	link->sds->first_start = false;
-	link->sds->configured_mode = link->retry_mode;
-	if (ctrl->cfg->set_autoneg)
-		ctrl->cfg->set_autoneg(link->sds, link->retry_neg_mode);
 	link->retry_force = false;
-	rtpcs_sds_retry_linkless(link, true);
+	rtpcs_sds_retry_settle_start(link, ret ?
+				     RTPCS_SDS_RETRY_RESUME_SETUP :
+				     RTPCS_SDS_RETRY_RESUME_VERIFY);
 
 out:
 	mutex_unlock(&ctrl->lock);
+}
+
+static bool rtpcs_sds_arm_linkless_retry(struct rtpcs_link *link)
+{
+	struct rtpcs_ctrl *ctrl = link->ctrl;
+
+	lockdep_assert_held(&ctrl->lock);
+
+	if (!link->sfp_node || rtpcs_mac_link_up(link) ||
+	    rtpcs_sfp_module_absent(link))
+		return false;
+
+	mod_delayed_work(system_power_efficient_wq, &link->retry_work,
+			 READ_ONCE(link->retry_settling) ?
+			 RTPCS_SDS_LINK_SETTLE_DELAY :
+			 ctrl->cfg->verify_rx ? 0 : RTPCS_SDS_SETUP_RETRY_DELAY);
+
+	return true;
 }
 
 static void rtpcs_pcs_disable(struct phylink_pcs *pcs)
@@ -4217,6 +4451,19 @@ static void rtpcs_pcs_disable(struct phylink_pcs *pcs)
 	struct rtpcs_link *link = rtpcs_phylink_pcs_to_link(pcs);
 
 	cancel_delayed_work_sync(&link->retry_work);
+}
+
+static int rtpcs_pcs_enable(struct phylink_pcs *pcs)
+{
+	struct rtpcs_link *link = rtpcs_phylink_pcs_to_link(pcs);
+	struct rtpcs_ctrl *ctrl = link->ctrl;
+
+	mutex_lock(&ctrl->lock);
+	if (ctrl->cfg->setup_serdes)
+		rtpcs_sds_arm_linkless_retry(link);
+	mutex_unlock(&ctrl->lock);
+
+	return 0;
 }
 
 static int rtpcs_pcs_config(struct phylink_pcs *pcs, unsigned int neg_mode,
@@ -4244,9 +4491,11 @@ static int rtpcs_pcs_config(struct phylink_pcs *pcs, unsigned int neg_mode,
 		if (interface == link->sds->configured_mode) {
 			dev_dbg(ctrl->dev, "sds %d already in mode %s, no change\n",
 				link->sds->id, phy_modes(interface));
+			rtpcs_sds_arm_linkless_retry(link);
 		} else if (rtpcs_sfp_skip_setup(link)) {
 			dev_dbg(ctrl->dev, "sds %d: no module, skip setup for mode %s\n",
 				link->sds->id, phy_modes(interface));
+			rtpcs_sds_arm_linkless_retry(link);
 		} else {
 			link->retry_verify = false;
 			ret = rtpcs_sds_setup(link);
@@ -4260,31 +4509,35 @@ static int rtpcs_pcs_config(struct phylink_pcs *pcs, unsigned int neg_mode,
 
 			/* A checked family verifies a successful setup in the worker, but
 			 * any populated cage that is still linkless retains patch 130's
-			 * retry.  A clean error count can block a new escalation only; it
-			 * cannot abandon a lane with no signal to measure.
+			 * retry. Repeated clean linkless samples enter the bounded ladder;
+			 * they cannot abandon a lane with no signal to measure.
 			 */
-			if (link->sfp_node && !rtpcs_mac_link_up(link) &&
-			    !rtpcs_sfp_module_absent(link)) {
-				if (ctrl->cfg->verify_rx) {
-					link->retry_attempt = 0;
-					link->retry_bad_samples = 0;
-					link->retry_escalating = ret < 0;
-					link->retry_ladder_exhausted = false;
-					link->retry_recovery_active = false;
-					link->retry_clean_linkless_reported = false;
-					link->retry_bad_link_up = false;
-					link->retry_injected = false;
-					if (!ret)
-						link->retry_verify = true;
-					else
-						dev_warn(ctrl->dev,
-							 "port %d, sds %d: RX setup failed (%d), scheduling recovery\n",
-							 link->port, link->sds->id, ret);
-				}
-				mod_delayed_work(system_power_efficient_wq,
-						 &link->retry_work,
-						 ctrl->cfg->verify_rx ? 0 :
-						 RTPCS_SDS_SETUP_RETRY_DELAY);
+			if (rtpcs_sds_arm_linkless_retry(link) &&
+			    ctrl->cfg->verify_rx) {
+				link->retry_attempt = 0;
+				link->retry_bad_samples = 0;
+				link->retry_clean_linkless_samples = 0;
+				link->retry_settle_samples = 0;
+				link->retry_settle_up_samples = 0;
+				link->retry_settle_resume =
+					RTPCS_SDS_RETRY_RESUME_NONE;
+				link->retry_escalating = ret < 0;
+				link->retry_ladder_exhausted = false;
+				link->retry_recovery_active = false;
+				link->retry_clean_linkless_reported = false;
+				link->retry_action_active = false;
+				link->retry_action_linkless = false;
+				WRITE_ONCE(link->retry_link_seen, false);
+				link->retry_bad_link_up = false;
+				link->retry_injected = false;
+				link->retry_verify = false;
+				rtpcs_sds_retry_settle_start(link, ret ?
+						RTPCS_SDS_RETRY_RESUME_RECOVERY :
+						RTPCS_SDS_RETRY_RESUME_VERIFY);
+				if (ret)
+					dev_warn(ctrl->dev,
+						 "port %d, sds %d: RX setup failed (%d), scheduling recovery\n",
+						 link->port, link->sds->id, ret);
 			}
 
 			if (ret < 0)
@@ -4547,6 +4800,7 @@ static int rtpcs_dbgfs_inject_rx_failure_set(void *data, u64 val)
 	ctrl->dbg_fail_sds = val;
 	link->retry_attempt = 0;
 	link->retry_bad_samples = 0;
+	link->retry_clean_linkless_samples = 0;
 	link->retry_verify = true;
 	link->retry_escalating = false;
 	link->retry_ladder_exhausted = false;
@@ -4689,6 +4943,7 @@ static int rtpcs_93xx_set_autoneg(struct rtpcs_serdes *sds, unsigned int neg_mod
 static const struct phylink_pcs_ops rtpcs_838x_pcs_ops = {
 	.pcs_an_restart		= rtpcs_pcs_an_restart,
 	.pcs_disable		= rtpcs_pcs_disable,
+	.pcs_enable		= rtpcs_pcs_enable,
 	.pcs_config		= rtpcs_pcs_config,
 	.pcs_get_state		= rtpcs_pcs_get_state,
 };
@@ -4710,6 +4965,7 @@ static const struct rtpcs_config rtpcs_838x_cfg = {
 static const struct phylink_pcs_ops rtpcs_839x_pcs_ops = {
 	.pcs_an_restart		= rtpcs_pcs_an_restart,
 	.pcs_disable		= rtpcs_pcs_disable,
+	.pcs_enable		= rtpcs_pcs_enable,
 	.pcs_config		= rtpcs_pcs_config,
 	.pcs_get_state		= rtpcs_pcs_get_state,
 };
@@ -4729,6 +4985,7 @@ static const struct rtpcs_config rtpcs_839x_cfg = {
 static const struct phylink_pcs_ops rtpcs_930x_pcs_ops = {
 	.pcs_an_restart		= rtpcs_pcs_an_restart,
 	.pcs_disable		= rtpcs_pcs_disable,
+	.pcs_enable		= rtpcs_pcs_enable,
 	.pcs_config		= rtpcs_pcs_config,
 	.pcs_get_state		= rtpcs_pcs_get_state,
 };
@@ -4752,6 +5009,7 @@ static const struct rtpcs_config rtpcs_930x_cfg = {
 static const struct phylink_pcs_ops rtpcs_931x_pcs_ops = {
 	.pcs_an_restart		= rtpcs_pcs_an_restart,
 	.pcs_disable		= rtpcs_pcs_disable,
+	.pcs_enable		= rtpcs_pcs_enable,
 	.pcs_config		= rtpcs_pcs_config,
 	.pcs_get_state		= rtpcs_pcs_get_state,
 };
