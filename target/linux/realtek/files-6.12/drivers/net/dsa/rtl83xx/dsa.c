@@ -1084,6 +1084,7 @@ static int rtldsa_93xx_tc_setup_qdisc_red(struct dsa_switch *ds, int port,
 				   RTL930X_SWRED_THR_MAX_PAGES;
 	u32 min_pages, max_pages;
 	u8 probability;
+	u32 prob1023;
 	int ret;
 	int queue = -1;
 
@@ -1134,8 +1135,11 @@ static int rtldsa_93xx_tc_setup_qdisc_red(struct dsa_switch *ds, int port,
 		return -EINVAL;
 	}
 
-	/* Thresholds are programmed in units of 256-byte pages, the
-	 * 2^32 fixed-point drop probability maps onto a rate of 0-255.
+	/* Thresholds are programmed in units of 256-byte pages. The
+	 * hardware drop curve is RATE/1023 with an 8-bit RATE field, so
+	 * ~25% is the densest drop the engine can apply below the max
+	 * threshold; clamp and say so rather than silently delivering a
+	 * quarter of the requested probability.
 	 */
 	min_pages = DIV_ROUND_UP(p->min, page_bytes);
 	max_pages = p->max / page_bytes;
@@ -1148,14 +1152,20 @@ static int rtldsa_93xx_tc_setup_qdisc_red(struct dsa_switch *ds, int port,
 		return -EINVAL;
 	}
 
-	probability = ((u64)p->probability * 255 +
-		       BIT_ULL(32) - 1) >> 32;
-	if (!probability) {
+	prob1023 = ((u64)p->probability * 1023 + BIT_ULL(32) - 1) >> 32;
+	if (!prob1023) {
 		dev_warn(priv->dev,
-			 "port %d RED offload rejected: probability %#x -> %u; require 1..0xffffffff (2^32 fixed-point scaled to 1..255)\n",
-			 port, p->probability, probability);
+			 "port %d RED offload rejected: probability %#x -> %u; require 1..0xffffffff (2^32 fixed-point scaled to 1..1023)\n",
+			 port, p->probability, prob1023);
 		return -EINVAL;
 	}
+	if (prob1023 > 255) {
+		dev_warn(priv->dev,
+			 "port %d RED probability %llu%% exceeds the hardware ceiling, clamped to 255/1023 (~25%%)\n",
+			 port, ((u64)p->probability * 100) >> 32);
+		prob1023 = 255;
+	}
+	probability = prob1023;
 
 	if (is_rtl931x)
 		ret = rtl931x_qos_swred_set(priv, port, queue, min_pages,
