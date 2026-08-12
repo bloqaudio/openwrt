@@ -27,6 +27,14 @@
  */
 #define RTL930X_MAC_L2_PORT_MAX_LEN_CTRL(port)	(0x326C + (((port) << 6)))
 
+/* The CPU port needs a second register for the direction the per-port array does
+ * not cover. Unlike the per-port register this holds a single 14-bit length
+ * (CPU_PORT_TX_MAX_LEN, bits 13:0); bits 31:14 are reserved, so it must not be
+ * written with the two speed-selected halves the per-port register uses.
+ */
+#define RTL930X_MAC_L2_CPU_MAX_LEN_CTRL		(0xA3A0)
+#define RTL930X_CPU_MAX_LEN_M			GENMASK(13, 0)
+
 /* Silicon maximum frame length (Longan capacity: 12 KB) */
 #define RTL930X_MAX_FRAME_LEN			12288
 #define RTL931X_MAC_L2_PORT_MAX_LEN_CTRL(port)	(0x5554 + (((port) << 2)))

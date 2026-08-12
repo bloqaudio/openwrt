@@ -3834,6 +3834,20 @@ void rtl930x_port_max_frame_set(int port, int frame_len)
 	frame_len = min(frame_len, RTL930X_MAX_FRAME_LEN);
 	sw_w32_mask(0x0fffffff, (frame_len << 14) | frame_len,
 		    RTL930X_MAC_L2_PORT_MAX_LEN_CTRL(port));
+
+	/* The per-port register above covers only one of the CPU port's two
+	 * directions. The vendor programs both, from the same requested length:
+	 * MAC_L2_PORT_MAX_LEN_CTRL[cpu] for one and MAC_L2_CPU_MAX_LEN_CTRL for
+	 * the other (dal_longan_switch.c, cpuPortMaxPktLen_set/_get, which write
+	 * PORT_MAX_LEN_CTRL for PKTDIR_TX and CPU_MAX_LEN_CTRL for PKTDIR_RX;
+	 * note the field is named CPU_PORT_TX_MAX_LEN despite serving the RX
+	 * direction there). Leaving the second register at its 1536-byte reset
+	 * value silently discards CPU-terminated frames larger than that no
+	 * matter how high the port MTU is raised.
+	 */
+	if (port == RTL930X_CPU_PORT)
+		sw_w32_mask(RTL930X_CPU_MAX_LEN_M, frame_len,
+			    RTL930X_MAC_L2_CPU_MAX_LEN_CTRL);
 }
 
 const struct rtl838x_reg rtl930x_reg = {
