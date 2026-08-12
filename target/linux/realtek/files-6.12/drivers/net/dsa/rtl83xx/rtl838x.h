@@ -971,6 +971,7 @@ typedef enum {
 #define RTL931X_L3_IP_ROUTE_CTRL		(0xF000)
 #define RTL931X_L3_HOST_TBL_CTRL		(0xF004)
 #define RTL931X_L3_IPUC_ROUTE_CTRL		(0xF008)
+#define RTL931X_L3_IP6UC_ROUTE_CTRL		(0xF00C)
 #define RTL931X_L3_INTF_IP_MTU(i)		(0xF1E0 + ((i) << 2))
 #define RTL931X_L3_INTF_IP6_MTU(i)		(0xF220 + ((i) << 2))
 #define RTL931X_L3_ENTRY_MV_CTRL		(0xF260)
@@ -1750,6 +1751,8 @@ int rtl931x_storm_port_type_set(struct rtl838x_switch_priv *priv, int port,
 bool rtl931x_storm_port_type_get(int port, enum rtldsa_storm_class class);
 void rtl930x_port_max_frame_set(int port, int frame_len);
 void rtl931x_port_max_frame_set(int port, int frame_len);
+int rtldsa_ip6_mask_len(struct in6_addr *ip6_m);
+void rtldsa_net6_mask(int prefix_len, struct in6_addr *ip6_m);
 void rtldsa_930x_qos_setup_default_dscp2queue_map(void);
 int rtl930x_qos_default_prio_get(int port);
 int rtl930x_qos_default_prio_set(struct rtl838x_switch_priv *priv, int port,

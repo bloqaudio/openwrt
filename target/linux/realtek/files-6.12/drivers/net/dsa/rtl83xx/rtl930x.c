@@ -1120,22 +1120,6 @@ static u32 rtl930x_l3_hash6(struct in6_addr *ip6, int algorithm, bool move_dip)
 	return hash;
 }
 
-/* Length of a contiguous prefix mask stored as four big-endian words */
-static int rtl930x_ip6_mask_len(struct in6_addr *ip6_m)
-{
-	int len = 0;
-
-	for (int i = 0; i < 4; i++) {
-		u32 v = be32_to_cpu(ip6_m->s6_addr32[i]);
-
-		len += 32 - fls(~v);
-		if (v != 0xffffffff)
-			break;
-	}
-
-	return len;
-}
-
 /* Read a prefix route entry from the L3_PREFIX_ROUTE_IPUC table
  * We currently only support IPv4 and IPv6 unicast route
  */
@@ -1183,7 +1167,7 @@ static void rtl930x_route_read(int idx, struct rtl83xx_route *rt)
 		if (rt->prefix_len < 0 && default_route)
 			rt->prefix_len = 0;
 		if (rt->prefix_len < 0)
-			rt->prefix_len = rtl930x_ip6_mask_len(&ip6_m);
+			rt->prefix_len = rtldsa_ip6_mask_len(&ip6_m);
 		break;
 	case 1: /* IPv4 Multicast route */
 	case 3: /* IPv6 Multicast route */
@@ -1206,25 +1190,6 @@ static void rtl930x_route_read(int idx, struct rtl83xx_route *rt)
 	pr_debug("%s: GW: %pI4, prefix_len: %d\n", __func__, &rt->dst_ip, rt->prefix_len);
 out:
 	rtl_table_release(r);
-}
-
-static void rtl930x_net6_mask(int prefix_len, struct in6_addr *ip6_m)
-{
-	int o, b;
-
-	/* Define network mask: full 0xff octets, then the partial octet.
-	 * Zero the tail explicitly - the caller's struct may be reused.
-	 */
-	memset(ip6_m->s6_addr, 0, sizeof(ip6_m->s6_addr));
-	o = prefix_len >> 3;
-	b = prefix_len & 0x7;
-	if (o >= (int)sizeof(ip6_m->s6_addr)) {
-		memset(ip6_m->s6_addr, 0xff, sizeof(ip6_m->s6_addr));
-		return;
-	}
-	memset(ip6_m->s6_addr, 0xff, o);
-	if (b)
-		ip6_m->s6_addr[o] = 0xff00 >> b;
 }
 
 /* Read a host route entry from the table using its index
@@ -1350,7 +1315,7 @@ static int rtl930x_route_lookup_hw(struct rtl83xx_route *rt)
 
 	sw_w32_mask(0x3 << 19, rt->attr.type, RTL930X_L3_HW_LU_KEY_CTRL);
 	if (rt->attr.type) { /* IPv6 */
-		rtl930x_net6_mask(rt->prefix_len, &ip6_m);
+		rtldsa_net6_mask(rt->prefix_len, &ip6_m);
 		for (int i = 0; i < 4; i++)
 			sw_w32(rt->dst_ip6.s6_addr32[i] & ip6_m.s6_addr32[i],
 			       RTL930X_L3_HW_LU_KEY_IP_CTRL + (i << 2));
@@ -1506,7 +1471,7 @@ static void rtl930x_route_write(int idx, struct rtl83xx_route *rt)
 
 		v |= rt->prefix_len == 128 ? BIT(21) : 0; /* set host-route bit */
 
-		rtl930x_net6_mask(rt->prefix_len, &ip6_m);
+		rtldsa_net6_mask(rt->prefix_len, &ip6_m);
 
 		sw_w32(ip6_m.s6_addr32[0], rtl_table_data(r, 6));
 		sw_w32(ip6_m.s6_addr32[1], rtl_table_data(r, 7));

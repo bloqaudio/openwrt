@@ -3200,16 +3200,6 @@ static void rtldsa_931x_qos_init(struct rtl838x_switch_priv *priv)
  * the entry.
  */
 
-/* Index of the catch-all prefix entry trapping IPv4 route-lookup misses
- * to the CPU. Mango has no unicast route-miss action: L3_IPUC_ROUTE_CTRL
- * carries only exception actions (swcore_rtl9310.h) and the ingress
- * interface table exposes LU_MIS acts only for IPMC/IP6MC
- * (rtk_mango_tableField_list.c, rtk_l3_intfCtrlType_t). The prefix TCAM
- * returns the lowest matching index, so the catch-all sits at the very
- * top where any specific route programmed later will shadow it.
- */
-#define RTL931X_L3_ROUTE_IDX_CATCHALL_IP4	12287
-
 /* Reads a router-MAC entry (an L3 termination endpoint: packets whose
  * DMAC matches are considered for routing) from the L3_ROUTER_MAC table.
  */
@@ -3308,12 +3298,11 @@ static void rtl931x_set_l3_egress_intf(int idx, struct rtl838x_l3_intf *intf)
 	 *         IPMC_ROUTE_EN 21, IP6MC_ROUTE_EN 20, MC lookup-miss and
 	 *         scope actions below
 	 * word 1: uRPF controls and MC key select
-	 * Only IPv4 unicast routing is enabled; IPv6, multicast and uRPF
-	 * stay off (IPv6 is additionally gated by the global
-	 * L3_IP6UC_ROUTE_CTRL enable, which is never written).
+	 * IPv4 and IPv6 unicast routing are enabled; multicast and uRPF
+	 * stay off.
 	 */
 	r = rtl_table_get(RTL9310_TBL_2, 7);
-	sw_w32(BIT(23), rtl_table_data(r, 0));
+	sw_w32(BIT(23) | BIT(22), rtl_table_data(r, 0));
 	sw_w32(0, rtl_table_data(r, 1));
 	rtl_table_write(r, idx);
 	rtl_table_release(r);
@@ -3409,6 +3398,58 @@ static void rtl931x_set_l3_egress_mac(u32 idx, u64 mac)
 	rtl_table_release(r);
 }
 
+/* The SDK addresses L3 entries logically; each hardware row has six
+ * usable addresses followed by two holes.
+ */
+static inline int rtl931x_l3_idx_to_addr(int idx)
+{
+	return ((idx / 6) * 8) + (idx % 6);
+}
+
+static inline int rtl931x_l3_addr_to_idx(int addr)
+{
+	return ((addr / 8) * 6) + (addr % 8);
+}
+
+static u32 rtl931x_ip6_word(const struct in6_addr *ip6, int offset)
+{
+	const u8 *d = ip6->s6_addr + offset;
+
+	return ((u32)d[0] << 24) | ((u32)d[1] << 16) |
+	       ((u32)d[2] << 8) | d[3];
+}
+
+static void rtl931x_ip6_word_set(struct in6_addr *ip6, int offset, u32 v)
+{
+	u8 *d = ip6->s6_addr + offset;
+
+	d[0] = v >> 24;
+	d[1] = v >> 16;
+	d[2] = v >> 8;
+	d[3] = v;
+}
+
+static u64 rtl931x_ip6_chunk48(const struct in6_addr *ip6, int offset)
+{
+	const u8 *d = ip6->s6_addr + offset;
+	u64 v = 0;
+
+	for (int i = 0; i < 6; i++)
+		v = (v << 8) | d[i];
+
+	return v;
+}
+
+static void rtl931x_ip6_chunk48_set(struct in6_addr *ip6, int offset, u64 v)
+{
+	u8 *d = ip6->s6_addr + offset;
+
+	for (int i = 5; i >= 0; i--) {
+		d[i] = v;
+		v >>= 8;
+	}
+}
+
 /* IPv4 host-route hash, translated from the Mango SDK
  * (_dal_mango_l3_hostHash0_ret/_hostHash1_ret). The 10-bit hash folds
  * the VRF ID into the key; for a unicast host the SDK hashes
@@ -3441,19 +3482,64 @@ static u32 rtl931x_l3_hash4(u32 vrf, u32 ip, int algorithm)
 	return h;
 }
 
+/* IPv6 host-route hash with VRF, SIP and VID fixed to zero, matching
+ * the unicast key posture used by rtl931x_l3_hash4().
+ */
+static u32 rtl931x_l3_hash6(const struct in6_addr *ip6, int algorithm)
+{
+	const u8 *d = ip6->s6_addr;
+	u32 h;
+
+	if (!algorithm) {
+		h = d[0];
+		h ^= ((u32)d[1] << 2) | (d[2] >> 6);
+		h ^= ((u32)(d[2] & 0x3f) << 4) | (d[3] >> 4);
+		h ^= ((u32)(d[3] & 0x0f) << 6) | (d[4] >> 2);
+		h ^= ((u32)(d[4] & 0x03) << 8) | d[5];
+		h ^= ((u32)d[6] << 2) | (d[7] >> 6);
+		h ^= ((u32)(d[7] & 0x3f) << 4) | (d[8] >> 4);
+		h ^= ((u32)(d[8] & 0x0f) << 6) | (d[9] >> 2);
+		h ^= ((u32)(d[9] & 0x03) << 8) | d[10];
+		h ^= ((u32)d[11] << 2) | (d[12] >> 6);
+		h ^= ((u32)(d[12] & 0x3f) << 4) | (d[13] >> 4);
+		h ^= ((u32)(d[13] & 0x0f) << 6) | (d[14] >> 2);
+		h ^= ((u32)(d[14] & 0x03) << 8) | d[15];
+		return h;
+	}
+
+	h = d[12] >> 6;
+	h += ((u32)(d[12] & 0x3f) << 4) | (d[13] >> 4);
+	h = (h & 0x3ff) + (h >> 10);
+	h += ((u32)(d[13] & 0x0f) << 6) | (d[14] >> 2);
+	h = (h & 0x3ff) + (h >> 10);
+	h += ((u32)(d[14] & 0x03) << 8) | d[15];
+	h = (h & 0x3ff) + (h >> 10);
+
+	h ^= ((u32)d[0] << 2) | (d[1] >> 6);
+	h ^= ((u32)(d[1] & 0x3f) << 4) | (d[2] >> 4);
+	h ^= ((u32)(d[2] & 0x0f) << 6) | (d[3] >> 2);
+	h ^= ((u32)(d[3] & 0x03) << 8) | d[4];
+	h ^= ((u32)d[5] << 2) | (d[6] >> 6);
+	h ^= ((u32)(d[6] & 0x3f) << 4) | (d[7] >> 4);
+	h ^= ((u32)(d[7] & 0x0f) << 6) | (d[8] >> 2);
+	h ^= ((u32)(d[8] & 0x03) << 8) | d[9];
+	h ^= ((u32)d[10] << 2) | (d[11] >> 6);
+	h ^= (u32)(d[11] & 0x3f) << 4;
+
+	return h;
+}
+
 /* Read a host route entry from the L3 host table using its logical
- * index. Only IPv4 unicast entries are decoded.
+ * index. IPv6 unicast entries occupy three consecutive logical slots.
  */
 static void rtl931x_host_route_read(int idx, struct rtl83xx_route *rt)
 {
-	u32 v, w;
+	u32 data[4], v, w;
+	u64 chunk;
 	/* Access the host table (L3_HOST_ROUTE_IPUC view) via access set 2 */
 	struct table_reg *r = rtl_table_get(RTL9310_TBL_2, 3);
 
-	/* Logical index to physical address: 6 usable slots per 8-slot row */
-	idx = ((idx / 6) * 8) + (idx % 6);
-
-	rtl_table_read(r, idx);
+	rtl_table_read(r, rtl931x_l3_idx_to_addr(idx));
 	/* L3_HOST_ROUTE_IPUC entry, 128 bits (MANGO_L3_HOST_ROUTE_IPUCt):
 	 * word 0: VALID 31, FMT 30, ENTRY_TYPE 29:28, VRF_ID 27:20,
 	 *         IP[31:12] 19:0
@@ -3463,52 +3549,91 @@ static void rtl931x_host_route_read(int idx, struct rtl83xx_route *rt)
 	 *         QOS_EN 22, QOS_PRI 21:19
 	 * word 3: HIT 15
 	 */
-	v = sw_r32(rtl_table_data(r, 0));
+	for (int i = 0; i < 4; i++)
+		data[i] = sw_r32(rtl_table_data(r, i));
+	v = data[0];
 	rt->attr.valid = !!(v & BIT(31));
 	if (!rt->attr.valid)
 		goto out;
 	rt->attr.type = (v >> 28) & 0x3;
-	if (rt->attr.type != 0) { /* Only IPv4 unicast routes */
+	w = data[1];
+	switch (rt->attr.type) {
+	case 0: /* IPv4 unicast */
+		rt->dst_ip = ((v & 0xfffff) << 12) | (w >> 20);
+		break;
+	case 2: /* IPv6 unicast */
+		/* Other type-2 slots are continuations, not IPv6 entry bases. */
+		if (idx % 6 != 0 && idx % 6 != 3) {
+			pr_warn_ratelimited("%s: IPv6 route at unaligned slot %d is not decodable\n",
+					    __func__, idx);
+			goto out;
+		}
+		rtl931x_ip6_word_set(&rt->dst_ip6, 0,
+				      ((v & 0xfffff) << 12) | (w >> 20));
+		for (int k = 1; k < 3; k++) {
+			rtl_table_read(r, rtl931x_l3_idx_to_addr(idx + k));
+			v = sw_r32(rtl_table_data(r, 0));
+			w = sw_r32(rtl_table_data(r, 1));
+			chunk = ((u64)(v & 0x0fffffff) << 20) | (w >> 12);
+			rtl931x_ip6_chunk48_set(&rt->dst_ip6, 4 + (k - 1) * 6,
+						     chunk);
+		}
+		break;
+	case 1: /* IPv4 multicast */
+	case 3: /* IPv6 multicast */
 		pr_warn("%s: route type %d not supported\n", __func__, rt->attr.type);
 		goto out;
 	}
-	w = sw_r32(rtl_table_data(r, 1));
-	rt->dst_ip = ((v & 0xfffff) << 12) | (w >> 20);
 
+	w = data[1];
 	rt->attr.dst_null = !!(w & BIT(10));
 	rt->attr.action = (w >> 7) & 0x7;
-	rt->nh.id = ((w & 0x3f) << 7) | (sw_r32(rtl_table_data(r, 2)) >> 25);
-	v = sw_r32(rtl_table_data(r, 2));
+	rt->nh.id = ((w & 0x3f) << 7) | (data[2] >> 25);
+	v = data[2];
 	rt->attr.ttl_dec = !!(v & BIT(24));
 	rt->attr.ttl_check = !!(v & BIT(23));
 	rt->attr.qos_as = !!(v & BIT(22));
 	rt->attr.qos_prio = (v >> 19) & 0x7;
-	rt->attr.hit = !!(sw_r32(rtl_table_data(r, 3)) & BIT(15));
+	rt->attr.hit = !!(data[3] & BIT(15));
 
 out:
 	rtl_table_release(r);
 }
 
-/* Write a host route entry using its logical index. Only IPv4 unicast
- * routes are supported; invalidation clears the entire entry so the
- * VALID bit really goes away.
+/* Write a host route entry using its logical index. Invalidation clears
+ * every slot in the entry so no valid continuation can survive.
  */
 static void rtl931x_host_route_write(int idx, struct rtl83xx_route *rt)
 {
 	struct table_reg *r = rtl_table_get(RTL9310_TBL_2, 3);
+	u64 chunk;
+	u32 ip;
+	int width;
 
-	if (rt->attr.valid && rt->attr.type != 0) {
+	if (rt->attr.type == 1 || rt->attr.type == 3) {
+		pr_warn("%s: multicast route type %d not supported\n",
+			__func__, rt->attr.type);
+		rtl_table_release(r);
+		return;
+	}
+	if (rt->attr.valid && rt->attr.type != 0 && rt->attr.type != 2) {
 		pr_warn("%s: route type %d not supported\n", __func__, rt->attr.type);
 		rtl_table_release(r);
 		return;
 	}
 
-	idx = ((idx / 6) * 8) + (idx % 6);
+	width = rt->attr.type == 2 ? 3 : 1;
 
 	if (!rt->attr.valid) {
-		for (int i = 0; i < 4; i++)
-			sw_w32(0, rtl_table_data(r, i));
-	} else {
+		for (int k = 0; k < width; k++) {
+			for (int i = 0; i < 4; i++)
+				sw_w32(0, rtl_table_data(r, i));
+			rtl_table_write(r, rtl931x_l3_idx_to_addr(idx + k));
+		}
+		goto out;
+	}
+
+	if (rt->attr.type == 0) {
 		sw_w32(BIT(31) | ((rt->dst_ip >> 12) & 0xfffff),
 		       rtl_table_data(r, 0));
 		sw_w32(((rt->dst_ip & 0xfff) << 20) |
@@ -3523,13 +3648,54 @@ static void rtl931x_host_route_write(int idx, struct rtl83xx_route *rt)
 		       ((rt->attr.qos_prio & 0x7) << 19),
 		       rtl_table_data(r, 2));
 		sw_w32(rt->attr.hit ? BIT(15) : 0, rtl_table_data(r, 3));
+		rtl_table_write(r, rtl931x_l3_idx_to_addr(idx));
+		goto out;
 	}
 
-	rtl_table_write(r, idx);
+	ip = rtl931x_ip6_word(&rt->dst_ip6, 0);
+	sw_w32(BIT(31) | (0x2 << 28) | ((ip >> 12) & 0xfffff),
+	       rtl_table_data(r, 0));
+	sw_w32(((ip & 0xfff) << 20) |
+	       (rt->attr.dst_null ? BIT(10) : 0) |
+	       ((rt->attr.action & 0x7) << 7) |
+	       ((rt->nh.id >> 7) & 0x3f),
+	       rtl_table_data(r, 1));
+	sw_w32(((rt->nh.id & 0x7f) << 25) |
+	       (rt->attr.ttl_dec ? BIT(24) : 0) |
+	       (rt->attr.ttl_check ? BIT(23) : 0) |
+	       (rt->attr.qos_as ? BIT(22) : 0) |
+	       ((rt->attr.qos_prio & 0x7) << 19),
+	       rtl_table_data(r, 2));
+	sw_w32(rt->attr.hit ? BIT(15) : 0, rtl_table_data(r, 3));
+	rtl_table_write(r, rtl931x_l3_idx_to_addr(idx));
+
+	for (int k = 1; k < 3; k++) {
+		chunk = rtl931x_ip6_chunk48(&rt->dst_ip6, 4 + (k - 1) * 6);
+		sw_w32(BIT(31) | (0x2 << 28) |
+		       ((u32)(chunk >> 20) & 0x0fffffff), rtl_table_data(r, 0));
+		sw_w32((u32)(chunk & 0xfffff) << 12, rtl_table_data(r, 1));
+		sw_w32(0, rtl_table_data(r, 2));
+		sw_w32(0, rtl_table_data(r, 3));
+		rtl_table_write(r, rtl931x_l3_idx_to_addr(idx + k));
+	}
+
+out:
 	rtl_table_release(r);
 }
 
-/* Find the logical host-table slot for an IPv4 route. With must_exist
+static bool rtl931x_host_route_valid(int idx)
+{
+	struct table_reg *r = rtl_table_get(RTL9310_TBL_2, 3);
+	bool valid;
+
+	rtl_table_read(r, rtl931x_l3_idx_to_addr(idx));
+	valid = !!(sw_r32(rtl_table_data(r, 0)) & BIT(31));
+	rtl_table_release(r);
+
+	return valid;
+}
+
+/* Find the logical host-table slot for a unicast route. With must_exist
  * the slot already holding this destination is located (for updates and
  * invalidation); otherwise the first free slot in the two hash rows is
  * returned. The scanned slot's own VALID bit decides, never the
@@ -3538,32 +3704,44 @@ static void rtl931x_host_route_write(int idx, struct rtl83xx_route *rt)
 static int rtl931x_find_l3_slot(struct rtl83xx_route *rt, bool must_exist)
 {
 	struct rtl83xx_route route_entry;
-	int algorithm, addr, idx;
+	int slot_width, algorithm, addr, idx;
 	u32 hash;
 
-	/* Only IPv4 host entries are supported */
-	if (rt->attr.type != 0)
+	if (rt->attr.type != 0 && rt->attr.type != 2)
 		return -1;
+	slot_width = rt->attr.type == 2 ? 3 : 1;
 
 	for (int t = 0; t < 2; t++) {
 		algorithm = (sw_r32(RTL931X_L3_HOST_TBL_CTRL) >> (2 + t)) & 0x1;
-		hash = rtl931x_l3_hash4(0, rt->dst_ip, algorithm);
+		hash = rt->attr.type == 2 ?
+		       rtl931x_l3_hash6(&rt->dst_ip6, algorithm) :
+		       rtl931x_l3_hash4(0, rt->dst_ip, algorithm);
 
-		for (int s = 0; s < 6; s++) {
+		for (int s = 0; s < 6; s += slot_width) {
 			addr = (t << 13) | ((hash & 0x3ff) << 3) | s;
-			idx = ((addr / 8) * 6) + (addr % 8);
-
-			memset(&route_entry, 0, sizeof(route_entry));
-			rtl931x_host_route_read(idx, &route_entry);
+			idx = rtl931x_l3_addr_to_idx(addr);
 
 			if (!must_exist) {
-				if (!route_entry.attr.valid)
+				bool free = true;
+
+				for (int k = 0; k < slot_width; k++) {
+					if (rtl931x_host_route_valid(idx + k)) {
+						free = false;
+						break;
+					}
+				}
+				if (free)
 					return idx;
 				continue;
 			}
+
+			memset(&route_entry, 0, sizeof(route_entry));
+			rtl931x_host_route_read(idx, &route_entry);
 			if (route_entry.attr.valid &&
 			    route_entry.attr.type == rt->attr.type &&
-			    route_entry.dst_ip == rt->dst_ip)
+			    (rt->attr.type == 2 ?
+			     ipv6_addr_equal(&route_entry.dst_ip6, &rt->dst_ip6) :
+			     route_entry.dst_ip == rt->dst_ip))
 				return idx;
 		}
 	}
@@ -3571,7 +3749,7 @@ static int rtl931x_find_l3_slot(struct rtl83xx_route *rt, bool must_exist)
 	return -1;
 }
 
-/* IPv4 prefix routes (L3_PREFIX_ROUTE_IPUC view, access set 2 type 4,
+/* Unicast prefix routes (L3_PREFIX_ROUTE_IPUC view, access set 2 type 4,
  * ternary, 6 words per entry). The prefix TCAM returns the LOWEST
  * matching address, so longest-prefix-first ordering is a software
  * discipline: entries are kept sorted by descending prefix length and
@@ -3586,13 +3764,13 @@ static int rtl931x_find_l3_slot(struct rtl83xx_route *rt, bool must_exist)
  * Region layout (SDK dal_mango_l3.c, L3_ROUTE_TBL_* macros):
  * - IPv4 grows UP from index 0, longest prefix at the lowest index,
  *   the default route at the highest used v4 index.
- * - IPv6 grows DOWN from the top in 3-entry strides (out of scope, not
- *   programmed; the counters exist so the free-space accounting and the
- *   region boundary are correct from the start). The v6 histogram
- *   counts in the OPPOSITE direction to the v4 one:
+ * - IPv6 grows DOWN from the top in 3-entry strides, longest prefix at
+ *   the lowest index. The v6 histogram counts in the OPPOSITE direction
+ *   to the v4 one:
  *   ip_pflen[i] counts entries with prefix_len <= i, the SDK's v6
  *   array entries_before_exclude_pfLen[i] counts prefix_len > i.
- * - The very top entry is the static catch-all programmed at setup.
+ * - The top six logical entries are reserved for the IPv4 and IPv6
+ *   catch-alls and the two alignment holes between them.
  *
  * The route pool is shared with OpenFlow (same physical TCAM, FMT != 0
  * entries via the FT_L3_TCAM_0 view, SDK RTK_DEFAULT_L3_OPENFLOW_CUTLINE
@@ -3615,30 +3793,16 @@ static int rtl931x_find_l3_slot(struct rtl83xx_route *rt, bool must_exist)
 #define RTL931X_L3_ROUTE_TBL_SIZE_9311E		768
 
 struct rtl931x_l3_prefix_tbl {
-	int size;		/* usable entries (9311E clamps) */
+	int size;		/* dynamic route pool entries (9311E clamps) */
 	int ip_cnt;		/* v4 entries in use, region [0, ip_cnt) */
 	u16 ip_pflen[32];	/* ip_pflen[i] = v4 entries with prefix_len <= i */
-	int ip6_cnt;		/* v6 entries in use (unused, region reserved) */
-	u16 ip6_pflen[128];	/* v6 entries with prefix_len > i (unused) */
+	int ip6_cnt;		/* v6 entries in use, region grows down from size */
+	u16 ip6_pflen[128];	/* ip6_pflen[i] = v6 entries with prefix_len > i */
 	s16 id2pos[MAX_ROUTES];	/* shared route id -> table position, -1 = none */
 	s16 pos2id[RTL931X_L3_ROUTE_TBL_SIZE];	/* position -> id, -1 = none */
 };
 
 static struct rtl931x_l3_prefix_tbl rtl931x_ptbl;
-
-/* The SDK addresses route entries logically (0..size-1); the hardware
- * row holds 8 addresses of which 6 are usable
- * (DAL_MANGO_L3_ENTRY_IDX_TO_ADDR/_ADDR_TO_IDX, dal_mango_l3.h).
- */
-static inline int rtl931x_l3_idx_to_addr(int idx)
-{
-	return ((idx / 6) * 8) + (idx % 6);
-}
-
-static inline int rtl931x_l3_addr_to_idx(int addr)
-{
-	return ((addr / 8) * 6) + (addr % 8);
-}
 
 /* Move len prefix-table entries from src to dst with the hardware move
  * engine (SDK __dal_mango_l3_routeEntry_move). MANGO_L3_ENTRY_MV_CTRLr
@@ -3725,8 +3889,10 @@ static int rtl931x_l3_route_clear(int base, int len)
 static void rtl931x_prefix_entry_read(int pos, struct rtl83xx_route *rt)
 {
 	struct table_reg *r = rtl_table_get(RTL9310_TBL_2, 4);
+	struct in6_addr ip6_m;
 	bool host_route, default_route;
-	u32 v, w;
+	u32 data[6], v, w;
+	u64 chunk;
 
 	rtl_table_read(r, rtl931x_l3_idx_to_addr(pos));
 
@@ -3743,35 +3909,70 @@ static void rtl931x_prefix_entry_read(int pos, struct rtl83xx_route *rt)
 	 * word 4: QOS_PRI 31:29
 	 * word 5: HIT 27
 	 */
-	v = sw_r32(rtl_table_data(r, 0));
+	for (int i = 0; i < 6; i++)
+		data[i] = sw_r32(rtl_table_data(r, i));
+	v = data[0];
 	rt->attr.valid = !!(v & BIT(31));
 	if (!rt->attr.valid)
 		goto out;
 	rt->attr.type = (v >> 28) & 0x3;
-	if (rt->attr.type != 0) { /* Only IPv4 unicast routes */
+	w = data[1];
+	v = data[3];
+	host_route = !!(v & BIT(22));
+	default_route = !!(v & BIT(21));
+
+	switch (rt->attr.type) {
+	case 0: /* IPv4 unicast */
+		rt->dst_ip = ((data[0] & 0xfffff) << 12) | (w >> 20);
+		rt->prefix_len = host_route ? 32 : -1;
+		if (rt->prefix_len < 0 && default_route)
+			rt->prefix_len = 0;
+		if (rt->prefix_len < 0)
+			rt->prefix_len = inet_mask_len(data[2]);
+		break;
+	case 2: /* IPv6 unicast */
+		/* Other type-2 slots are continuations, not IPv6 entry bases. */
+		if (pos % 6 != 0 && pos % 6 != 3) {
+			pr_warn_ratelimited("%s: IPv6 route at unaligned slot %d is not decodable\n",
+					    __func__, pos);
+			goto out;
+		}
+		rtl931x_ip6_word_set(&rt->dst_ip6, 0,
+				      ((data[0] & 0xfffff) << 12) | (w >> 20));
+		rtl931x_ip6_word_set(&ip6_m, 0, data[2]);
+		for (int k = 1; k < 3; k++) {
+			rtl_table_read(r, rtl931x_l3_idx_to_addr(pos + k));
+			v = sw_r32(rtl_table_data(r, 0));
+			w = sw_r32(rtl_table_data(r, 1));
+			chunk = ((u64)(v & 0x0fffffff) << 20) | (w >> 12);
+			rtl931x_ip6_chunk48_set(&rt->dst_ip6, 4 + (k - 1) * 6,
+						     chunk);
+			chunk = ((u64)(w & 0xff) << 40) |
+				((u64)sw_r32(rtl_table_data(r, 2)) << 8) |
+				(sw_r32(rtl_table_data(r, 3)) >> 24);
+			rtl931x_ip6_chunk48_set(&ip6_m, 4 + (k - 1) * 6, chunk);
+		}
+		rt->prefix_len = host_route ? 128 : -1;
+		if (rt->prefix_len < 0 && default_route)
+			rt->prefix_len = 0;
+		if (rt->prefix_len < 0)
+			rt->prefix_len = rtldsa_ip6_mask_len(&ip6_m);
+		break;
+	case 1: /* IPv4 multicast */
+	case 3: /* IPv6 multicast */
 		pr_warn("%s: route type %d not supported\n", __func__, rt->attr.type);
 		goto out;
 	}
-	w = sw_r32(rtl_table_data(r, 1));
-	rt->dst_ip = ((v & 0xfffff) << 12) | (w >> 20);
 
-	v = sw_r32(rtl_table_data(r, 3));
-	host_route = !!(v & BIT(22));
-	default_route = !!(v & BIT(21));
-	rt->prefix_len = host_route ? 32 : -1;
-	if (rt->prefix_len < 0 && default_route)
-		rt->prefix_len = 0;
-	if (rt->prefix_len < 0)
-		rt->prefix_len = inet_mask_len(sw_r32(rtl_table_data(r, 2)));
-
+	v = data[3];
 	rt->attr.dst_null = !!(v & BIT(20));
 	rt->attr.action = (v >> 17) & 0x7;
 	rt->nh.id = (v >> 3) & 0x1fff;
 	rt->attr.ttl_dec = !!(v & BIT(2));
 	rt->attr.ttl_check = !!(v & BIT(1));
 	rt->attr.qos_as = !!(v & BIT(0));
-	rt->attr.qos_prio = (sw_r32(rtl_table_data(r, 4)) >> 29) & 0x7;
-	rt->attr.hit = !!(sw_r32(rtl_table_data(r, 5)) & BIT(27));
+	rt->attr.qos_prio = (data[4] >> 29) & 0x7;
+	rt->attr.hit = !!(data[5] & BIT(27));
 
 out:
 	rtl_table_release(r);
@@ -3783,7 +3984,7 @@ out:
  * OpenFlow entry never matches as a route), ENTRY_TYPE and VRF_ID fully
  * cared, BMSK_IP the prefix mask.
  */
-static void rtl931x_prefix_entry_write(int pos, struct rtl83xx_route *rt)
+static void rtl931x_prefix_entry_write4(int pos, struct rtl83xx_route *rt)
 {
 	struct table_reg *r = rtl_table_get(RTL9310_TBL_2, 4);
 	u32 v;
@@ -3810,6 +4011,63 @@ static void rtl931x_prefix_entry_write(int pos, struct rtl83xx_route *rt)
 	rtl_table_release(r);
 }
 
+static void rtl931x_prefix_entry_write6(int pos, struct rtl83xx_route *rt)
+{
+	struct table_reg *r = rtl_table_get(RTL9310_TBL_2, 4);
+	struct in6_addr ip6_m;
+	u64 chunk, mask_chunk;
+	u32 ip, mask, v;
+
+	rtldsa_net6_mask(rt->prefix_len, &ip6_m);
+	ip = rtl931x_ip6_word(&rt->dst_ip6, 0);
+	mask = rtl931x_ip6_word(&ip6_m, 0);
+
+	sw_w32(BIT(31) | (0x2 << 28) | ((ip >> 12) & 0xfffff),
+	       rtl_table_data(r, 0));
+	sw_w32(((ip & 0xfff) << 20) | BIT(10) | (0x3 << 8) | 0xff,
+	       rtl_table_data(r, 1));
+	sw_w32(mask, rtl_table_data(r, 2));
+
+	v = rt->prefix_len >= 128 ? BIT(22) : 0;		/* HOST_ROUTE */
+	v |= rt->prefix_len == 0 ? BIT(21) : 0;		/* DFLT_ROUTE */
+	v |= rt->attr.dst_null ? BIT(20) : 0;
+	v |= (rt->attr.action & 0x7) << 17;
+	v |= (rt->nh.id & 0x1fff) << 3;			/* ECMP_EN stays 0 */
+	v |= rt->attr.ttl_dec ? BIT(2) : 0;
+	v |= rt->attr.ttl_check ? BIT(1) : 0;
+	v |= rt->attr.qos_as ? BIT(0) : 0;
+	sw_w32(v, rtl_table_data(r, 3));
+	sw_w32((rt->attr.qos_prio & 0x7) << 29, rtl_table_data(r, 4));
+	sw_w32(rt->attr.hit ? BIT(27) : 0, rtl_table_data(r, 5));
+	rtl_table_write(r, rtl931x_l3_idx_to_addr(pos));
+
+	for (int k = 1; k < 3; k++) {
+		chunk = rtl931x_ip6_chunk48(&rt->dst_ip6, 4 + (k - 1) * 6);
+		mask_chunk = rtl931x_ip6_chunk48(&ip6_m, 4 + (k - 1) * 6);
+		sw_w32(BIT(31) | (0x2 << 28) |
+		       ((u32)(chunk >> 20) & 0x0fffffff), rtl_table_data(r, 0));
+		sw_w32(((u32)chunk & 0xfffff) << 12 | BIT(10) | (0x3 << 8) |
+		       ((u32)(mask_chunk >> 40) & 0xff), rtl_table_data(r, 1));
+		sw_w32((u32)(mask_chunk >> 8), rtl_table_data(r, 2));
+		sw_w32((u32)mask_chunk << 24, rtl_table_data(r, 3));
+		sw_w32(0, rtl_table_data(r, 4));
+		sw_w32(0, rtl_table_data(r, 5));
+		rtl_table_write(r, rtl931x_l3_idx_to_addr(pos + k));
+	}
+
+	rtl_table_release(r);
+}
+
+static void rtl931x_prefix_entry_write(int pos, struct rtl83xx_route *rt)
+{
+	if (rt->attr.type == 0)
+		rtl931x_prefix_entry_write4(pos, rt);
+	else if (rt->attr.type == 2)
+		rtl931x_prefix_entry_write6(pos, rt);
+	else
+		pr_warn("%s: route type %d not supported\n", __func__, rt->attr.type);
+}
+
 /* Insert a route into the sorted v4 region
  * (SDK __dal_mango_l3_routeEntry_alloc, IPv4 half): the entries shorter
  * than the new prefix are shifted one position up, one boundary entry
@@ -3823,10 +4081,7 @@ static void rtl931x_prefix_route_insert(int id, struct rtl83xx_route *rt)
 	struct rtl931x_l3_prefix_tbl *t = &rtl931x_ptbl;
 	int dst, src, pos;
 
-	/* The top entry is the catch-all, the (future) v6 region grows
-	 * downward below it: v4 may use [0, size - 1 - 3 * ip6_cnt).
-	 */
-	if (t->ip_cnt + 1 > t->size - 1 - 3 * t->ip6_cnt) {
+	if (t->ip_cnt + 1 > t->size - 3 * t->ip6_cnt) {
 		pr_err("%s: prefix table full, route to %pI4/%d stays in software\n",
 		       __func__, &rt->dst_ip, rt->prefix_len);
 		return;
@@ -3856,6 +4111,54 @@ static void rtl931x_prefix_route_insert(int id, struct rtl83xx_route *rt)
 	for (int i = rt->prefix_len; i < 32; i++)
 		t->ip_pflen[i]++;
 	t->ip_cnt++;
+	t->pos2id[pos] = id;
+	t->id2pos[id] = pos;
+}
+
+/* Insert a route into the sorted v6 region. Triples grow downward from
+ * the top of the dynamic pool while the longest prefixes remain at the
+ * lowest indices.
+ */
+static void rtl931x_prefix_route_insert6(int id, struct rtl83xx_route *rt)
+{
+	struct rtl931x_l3_prefix_tbl *t = &rtl931x_ptbl;
+	int dst, src, pos;
+
+	if (3 * (t->ip6_cnt + 1) > t->size - t->ip_cnt) {
+		pr_err("%s: prefix table full, route to %pI6c/%d stays in software\n",
+		       __func__, &rt->dst_ip6, rt->prefix_len);
+		return;
+	}
+
+	dst = t->size - 3 * (t->ip6_cnt + 1);
+	/* A triple base must map to slot 0 or 3 of a packed row. */
+	if (WARN_ON_ONCE(dst % 6 != 0 && dst % 6 != 3))
+		return;
+	src = dst;
+	if (rt->prefix_len < 128) {
+		for (int pfl = 128; pfl > rt->prefix_len; pfl--) {
+			int mid;
+
+			src = t->size -
+			      3 * (t->ip6_cnt - t->ip6_pflen[pfl - 1] + 1);
+			if (src == dst)
+				continue;
+			if (rtl931x_l3_route_move(dst, src, 3))
+				return;
+			mid = t->pos2id[src];
+			t->pos2id[dst] = mid;
+			if (mid >= 0)
+				t->id2pos[mid] = dst;
+			dst = src;
+		}
+	}
+	pos = src;
+
+	rtl931x_prefix_entry_write(pos, rt);
+
+	for (int i = rt->prefix_len; i > 0; i--)
+		t->ip6_pflen[i - 1]++;
+	t->ip6_cnt++;
 	t->pos2id[pos] = id;
 	t->id2pos[id] = pos;
 }
@@ -3934,6 +4237,71 @@ static void rtl931x_prefix_route_remove(int id)
 	t->id2pos[id] = -1;
 }
 
+/* Remove a route from the sorted v6 region. The move engine handles a
+ * triple as one aligned command; only each triple's base is mapped.
+ */
+static void rtl931x_prefix_route_remove6(int id)
+{
+	struct rtl931x_l3_prefix_tbl *t = &rtl931x_ptbl;
+	struct rtl83xx_route cur;
+	int plen, top, dst, src;
+	int pos = t->id2pos[id];
+
+	if (pos < 0)
+		return;	/* never programmed (e.g. gateway never resolved) */
+
+	memset(&cur, 0, sizeof(cur));
+	rtl931x_prefix_entry_read(pos, &cur);
+	if (!cur.attr.valid) {
+		pr_warn("%s: id %d maps to invalid entry %d, bookkeeping lost\n",
+			__func__, id, pos);
+		t->pos2id[pos] = -1;
+		t->id2pos[id] = -1;
+		return;
+	}
+	plen = cur.prefix_len;
+	top = t->size - 3 * t->ip6_cnt;
+
+	if (pos > top) {
+		dst = pos;
+		for (int pfl = plen; pfl < 128; pfl++) {
+			int mid;
+
+			src = t->size - 3 * (t->ip6_cnt - t->ip6_pflen[pfl]);
+			if (src == dst)
+				continue;
+			if (rtl931x_l3_route_move(dst, src, 3))
+				return;
+			mid = t->pos2id[src];
+			t->pos2id[dst] = mid;
+			if (mid >= 0)
+				t->id2pos[mid] = dst;
+			dst = src;
+		}
+		if (dst != top) {
+			int mid;
+
+			if (rtl931x_l3_route_move(dst, top, 3))
+				return;
+			mid = t->pos2id[top];
+			t->pos2id[dst] = mid;
+			if (mid >= 0)
+				t->id2pos[mid] = dst;
+		}
+	}
+
+	/* A failed clear leaves only a stale higher-index duplicate, so
+	 * complete the bookkeeping as the v4 removal path does.
+	 */
+	rtl931x_l3_route_clear(top, 3);
+
+	for (int i = plen; i > 0; i--)
+		t->ip6_pflen[i - 1]--;
+	t->ip6_cnt--;
+	t->pos2id[top] = -1;
+	t->id2pos[id] = -1;
+}
+
 /* Read a prefix route by its software route id; see the region comment
  * above for the id/position split.
  */
@@ -3941,8 +4309,15 @@ static void rtl931x_route_read(int id, struct rtl83xx_route *rt)
 {
 	int pos;
 
+	if (rt->attr.type == 1 || rt->attr.type == 3) {
+		pr_warn("%s: multicast route type %d not supported\n",
+			__func__, rt->attr.type);
+		rt->attr.valid = false;
+		return;
+	}
+
 	if (id < 0 || id >= MAX_ROUTES) {
-		pr_warn("%s: route id %d out of range\n", __func__, id);
+		pr_warn_ratelimited("%s: route id %d out of range\n", __func__, id);
 		rt->attr.valid = false;
 		return;
 	}
@@ -3965,28 +4340,32 @@ static void rtl931x_route_write(int id, struct rtl83xx_route *rt)
 {
 	int pos;
 
-	if (rt->attr.type != 0) {
-		/* Only IPv4 unicast prefix routes are offloaded; anything
-		 * else keeps working in software via the catch-all trap.
-		 * Ratelimited: the shared code retries this on every v6
-		 * neighbour event.
-		 */
+	if (rt->attr.type == 1 || rt->attr.type == 3) {
+		pr_warn_ratelimited("%s: multicast route type %d not supported, stays in software\n",
+				    __func__, rt->attr.type);
+		return;
+	}
+	if (rt->attr.type != 0 && rt->attr.type != 2) {
 		pr_warn_ratelimited("%s: route type %d not supported, stays in software\n",
 				    __func__, rt->attr.type);
 		return;
 	}
 
 	if (id < 0 || id >= MAX_ROUTES) {
-		pr_warn("%s: route id %d out of range\n", __func__, id);
+		pr_warn_ratelimited("%s: route id %d out of range\n", __func__, id);
 		return;
 	}
 
 	if (!rt->attr.valid) {
-		rtl931x_prefix_route_remove(id);
+		if (rt->attr.type == 2)
+			rtl931x_prefix_route_remove6(id);
+		else
+			rtl931x_prefix_route_remove(id);
 		return;
 	}
 
-	if (rt->prefix_len < 0 || rt->prefix_len > 32) {
+	if (rt->prefix_len < 0 ||
+	    rt->prefix_len > (rt->attr.type == 2 ? 128 : 32)) {
 		pr_warn("%s: prefix_len %d out of range\n", __func__, rt->prefix_len);
 		return;
 	}
@@ -3997,14 +4376,18 @@ static void rtl931x_route_write(int id, struct rtl83xx_route *rt)
 		return;
 	}
 
-	rtl931x_prefix_route_insert(id, rt);
+	if (rt->attr.type == 2)
+		rtl931x_prefix_route_insert6(id, rt);
+	else
+		rtl931x_prefix_route_insert(id, rt);
 }
 
 /* Hardware longest-prefix-match lookup of a prefix route (SDK
  * __dal_mango_l3_routeEntry_hwLookup, MANGO_L3_ROUTE_HW_LU): the key is
- * {VRF 0, ENTRY_TYPE IPUC, DIP = masked destination}, all other key
- * fields 0. MANGO_L3_HW_LU_KEY_CTRLr @0xF29C, MANGO_L3_HW_LU_KEY_DIP_CTRLr
- * @0xF2B0 (IPv4 in the low word), MANGO_L3_HW_LU_CTRLr @0xF2C0:
+ * {VRF 0, unicast ENTRY_TYPE, DIP = masked destination}, all other key
+ * fields 0. MANGO_L3_HW_LU_KEY_CTRLr @0xF29C, the 128-bit
+ * MANGO_L3_HW_LU_KEY_DIP_CTRLr block @0xF2B0 (high word first, IPv4 in
+ * the low word at +0xc), MANGO_L3_HW_LU_CTRLr @0xF2C0:
  * EXEC_TCAM 15, RESULT_TCAM 14, ENTRY_IDX_TCAM 13:0 - the result is a
  * packed TCAM address. Being an LPM, a route that was never programmed
  * resolves to its covering entry (e.g. the catch-all); the catch-all is
@@ -4013,25 +4396,32 @@ static void rtl931x_route_write(int id, struct rtl83xx_route *rt)
  */
 static int rtl931x_route_lookup_hw(struct rtl83xx_route *rt)
 {
+	struct in6_addr ip6_m;
 	u32 v;
 	int i, pos;
 
-	if (rt->attr.type != 0)	/* Only IPv4 unicast routes */
+	if (rt->attr.type != 0 && rt->attr.type != 2)
 		return -1;
 
 	/* Key fields VID_INTF_ID 11:0, MC_KEY_SEL 12, VRF 20:13, IPMC_TYPE
-	 * 21, ENTRY_TYPE 23:22 and ROUND 24 all go to 0 (unicast, VRF 0);
-	 * TEST_MODE (25) and above keep their values.
+	 * 21 and ROUND 24 go to 0; ENTRY_TYPE 23:22 selects IPv4 or IPv6
+	 * unicast. TEST_MODE (25) and above keep their values.
 	 */
-	sw_w32_mask(0x1ffffff, 0, RTL931X_L3_HW_LU_KEY_CTRL);
-	/* The DIP key is a 128-bit register block; an IPv4 key goes in its
-	 * low word. Zero the high words so no previous key leaves residue.
-	 */
-	sw_w32(0, RTL931X_L3_HW_LU_KEY_DIP_CTRL);
-	sw_w32(0, RTL931X_L3_HW_LU_KEY_DIP_CTRL + 4);
-	sw_w32(0, RTL931X_L3_HW_LU_KEY_DIP_CTRL + 8);
-	sw_w32(rt->dst_ip & inet_make_mask(rt->prefix_len),
-	       RTL931X_L3_HW_LU_KEY_DIP_CTRL + 0xc);
+	sw_w32_mask(0x1ffffff, (rt->attr.type & 0x3) << 22,
+		    RTL931X_L3_HW_LU_KEY_CTRL);
+	if (rt->attr.type == 2) {
+		rtldsa_net6_mask(rt->prefix_len, &ip6_m);
+		for (int w = 0; w < 4; w++)
+			sw_w32(rtl931x_ip6_word(&rt->dst_ip6, w * 4) &
+			       rtl931x_ip6_word(&ip6_m, w * 4),
+			       RTL931X_L3_HW_LU_KEY_DIP_CTRL + w * 4);
+	} else {
+		sw_w32(0, RTL931X_L3_HW_LU_KEY_DIP_CTRL);
+		sw_w32(0, RTL931X_L3_HW_LU_KEY_DIP_CTRL + 4);
+		sw_w32(0, RTL931X_L3_HW_LU_KEY_DIP_CTRL + 8);
+		sw_w32(rt->dst_ip & inet_make_mask(rt->prefix_len),
+		       RTL931X_L3_HW_LU_KEY_DIP_CTRL + 0xc);
+	}
 
 	sw_w32_mask(BIT(15), BIT(15), RTL931X_L3_HW_LU_CTRL);
 	for (i = 0; i < 512; i++) {
@@ -4092,6 +4482,7 @@ static void rtl931x_set_l3_nexthop(int idx, u16 dmac_id, u16 interface)
 static int rtl931x_l3_setup(struct rtl838x_switch_priv *priv)
 {
 	struct table_reg *r;
+	int tbl_size, catchall4, catchall6_pos;
 
 	/* Prefix-route bookkeeping: empty sorted regions, no id mappings.
 	 * The RTL9311E clamps the table to 768 entries (dal_mango_l3_init,
@@ -4102,12 +4493,16 @@ static int rtl931x_l3_setup(struct rtl838x_switch_priv *priv)
 	memset(&rtl931x_ptbl, 0, sizeof(rtl931x_ptbl));
 	memset(rtl931x_ptbl.id2pos, 0xff, sizeof(rtl931x_ptbl.id2pos));
 	memset(rtl931x_ptbl.pos2id, 0xff, sizeof(rtl931x_ptbl.pos2id));
-	rtl931x_ptbl.size = RTL931X_L3_ROUTE_TBL_SIZE;
+	tbl_size = RTL931X_L3_ROUTE_TBL_SIZE;
 	if ((sw_r32(RTL93XX_MODEL_NAME_INFO) >> 16) == 0x9311) {
-		rtl931x_ptbl.size = RTL931X_L3_ROUTE_TBL_SIZE_9311E;
+		tbl_size = RTL931X_L3_ROUTE_TBL_SIZE_9311E;
 		pr_info("RTL9311E: prefix route table clamped to %d entries\n",
-			rtl931x_ptbl.size);
+			tbl_size);
 	}
+	/* The pool remains a multiple of six, keeping v6 bases at slot 0 or 3. */
+	rtl931x_ptbl.size = tbl_size - 6;
+	catchall4 = tbl_size - 1;
+	catchall6_pos = tbl_size - 6;
 
 	for (int i = 0; i < MAX_INTF_MTUS; i++)
 		priv->intf_mtu_count[i] = priv->intf_mtus[i] = 0;
@@ -4158,6 +4553,17 @@ static int rtl931x_l3_setup(struct rtl838x_switch_priv *priv)
 		    BIT(0) | (0x1 << 7) | (0x2 << 11) | (0x1 << 14) | (0x1 << 16),
 		    RTL931X_L3_IPUC_ROUTE_CTRL);
 
+	/* MANGO_L3_IP6UC_ROUTE_CTRLr @0xF00C:
+	 * - GLB_EN: enable IPv6 unicast routing.
+	 * - MTU_FAIL_ACT = TRAP2CPU: packet-too-big must reach the CPU for PMTUD.
+	 * - HL_FAIL_ACT = TRAP2CPU: expired hop limits must reach the CPU.
+	 * - HDR_ROUTE_ACT = FORWARD (2): route packets with extension headers.
+	 * Hop-by-hop actions and the other exception actions keep reset values.
+	 */
+	sw_w32_mask(BIT(0) | (0x7 << 15) | (0x3 << 18) | (0x3 << 20),
+		    BIT(0) | (0x2 << 15) | (0x1 << 18) | (0x1 << 20),
+		    RTL931X_L3_IP6UC_ROUTE_CTRL);
+
 	/* Enable the L3 TCAMs (MANGO_ALE_L3_MISC_CTRLr @0xF2E8): prefix
 	 * TCAM blocks 0-5 (L3_TCAM_BLK_EN = 0x3F) and the router-MAC TCAM
 	 * (ROUTER_MAC_TCAM_EN, bit 7). Without these nothing routes and no
@@ -4175,7 +4581,13 @@ static int rtl931x_l3_setup(struct rtl838x_switch_priv *priv)
 	rtl_table_write(r, 0);
 	rtl_table_release(r);
 
-	/* Catch-all IPv4 prefix entry (see the index comment above):
+	/* Mango has no unicast route-miss action: the unicast route controls
+	 * carry only exception actions, while L3_IGR_INTF exposes lookup-miss
+	 * actions only for multicast. The prefix TCAM returns the lowest
+	 * matching address, so both catch-alls sit at the top where every
+	 * specific route shadows them.
+	 *
+	 * Catch-all IPv4 prefix entry:
 	 * valid, entry type IPv4-UC with the type bits cared
 	 * (BMSK_ENTRY_TYPE = 3), all other masks 0, DFLT_ROUTE, action
 	 * TRAP2CPU. A router-MAC-matched packet missing the host table
@@ -4190,7 +4602,24 @@ static int rtl931x_l3_setup(struct rtl838x_switch_priv *priv)
 	       rtl_table_data(r, 3));
 	sw_w32(0, rtl_table_data(r, 4));
 	sw_w32(0, rtl_table_data(r, 5));
-	rtl_table_write(r, rtl931x_l3_idx_to_addr(RTL931X_L3_ROUTE_IDX_CATCHALL_IP4));
+	rtl_table_write(r, rtl931x_l3_idx_to_addr(catchall4));
+	rtl_table_release(r);
+
+	/* The IPv6 catch-all occupies an aligned triple below the IPv4
+	 * catch-all. The two intervening slots stay empty because a triple
+	 * starting there would overlap the IPv4 catch-all.
+	 */
+	r = rtl_table_get(RTL9310_TBL_2, 4);
+	for (int k = 0; k < 3; k++) {
+		sw_w32(BIT(31) | (0x2 << 28), rtl_table_data(r, 0));
+		sw_w32(0x3 << 8, rtl_table_data(r, 1));
+		sw_w32(0, rtl_table_data(r, 2));
+		sw_w32(k ? 0 : BIT(21) | (ROUTE_ACT_TRAP2CPU << 17),
+		       rtl_table_data(r, 3));
+		sw_w32(0, rtl_table_data(r, 4));
+		sw_w32(0, rtl_table_data(r, 5));
+		rtl_table_write(r, rtl931x_l3_idx_to_addr(catchall6_pos + k));
+	}
 	rtl_table_release(r);
 
 	return 0;

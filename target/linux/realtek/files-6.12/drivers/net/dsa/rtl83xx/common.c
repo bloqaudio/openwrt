@@ -1487,20 +1487,39 @@ static void rtl83xx_l3_neigh_route_del(struct rtl838x_switch_priv *priv, __be32 
 	rtl83xx_l2_nexthop_rm(priv, &nh);
 }
 
-static void rtldsa_ip6_mask(int prefix_len, struct in6_addr *mask)
+/* Length of a contiguous prefix mask stored as four big-endian words */
+int rtldsa_ip6_mask_len(struct in6_addr *ip6_m)
+{
+	int len = 0;
+
+	for (int i = 0; i < 4; i++) {
+		u32 v = be32_to_cpu(ip6_m->s6_addr32[i]);
+
+		len += 32 - fls(~v);
+		if (v != 0xffffffff)
+			break;
+	}
+
+	return len;
+}
+
+void rtldsa_net6_mask(int prefix_len, struct in6_addr *ip6_m)
 {
 	int o, b;
 
-	memset(mask->s6_addr, 0, sizeof(mask->s6_addr));
+	/* Define network mask: full 0xff octets, then the partial octet.
+	 * Zero the tail explicitly - the caller's struct may be reused.
+	 */
+	memset(ip6_m->s6_addr, 0, sizeof(ip6_m->s6_addr));
 	o = prefix_len >> 3;
 	b = prefix_len & 0x7;
-	if (o >= (int)sizeof(mask->s6_addr)) {
-		memset(mask->s6_addr, 0xff, sizeof(mask->s6_addr));
+	if (o >= (int)sizeof(ip6_m->s6_addr)) {
+		memset(ip6_m->s6_addr, 0xff, sizeof(ip6_m->s6_addr));
 		return;
 	}
-	memset(mask->s6_addr, 0xff, o);
+	memset(ip6_m->s6_addr, 0xff, o);
 	if (b)
-		mask->s6_addr[o] = 0xff00 >> b;
+		ip6_m->s6_addr[o] = 0xff00 >> b;
 }
 
 /* IPv6 prefix entries live in the shared 512-entry prefix table in a
@@ -1687,7 +1706,7 @@ static int rtl83xx_l3_nexthop6_update(struct rtl838x_switch_priv *priv,
 			 */
 			r->pr.is_ipv6 = true;
 			r->pr.dip6 = r->dst_ip6;
-			rtldsa_ip6_mask(r->prefix_len, &r->pr.dip6_m);
+			rtldsa_net6_mask(r->prefix_len, &r->pr.dip6_m);
 			r->pr.fwd_sel = true;
 			r->pr.fwd_data = r->nh.l2_id;
 			r->pr.fwd_act = PIE_ACT_ROUTE_UC;
