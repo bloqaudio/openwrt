@@ -4539,6 +4539,13 @@ static int rtl931x_l3_setup(struct rtl838x_switch_priv *priv)
 	catchall4 = tbl_size - 1;
 	catchall6_pos = tbl_size - 6;
 
+	/* Route ids are software handles here: the prefix pool is the table
+	 * minus its reserved top, and the host table is the same size as the
+	 * route table on both variants.
+	 */
+	priv->n_route_ids = rtl931x_ptbl.size;
+	priv->n_host_route_ids = tbl_size;
+
 	for (int i = 0; i < MAX_INTF_MTUS; i++)
 		priv->intf_mtu_count[i] = priv->intf_mtus[i] = 0;
 

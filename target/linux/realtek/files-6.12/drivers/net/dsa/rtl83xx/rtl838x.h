@@ -1026,8 +1026,14 @@ typedef enum {
 #define N_FIXED_FIELDS 12
 #define N_FIXED_FIELDS_RTL931X 14
 #define MAX_COUNTERS 2048
-#define MAX_ROUTES 512
-#define MAX_HOST_ROUTES 1536
+/* Software id spaces for offloaded routes, sized for the largest family:
+ * both RTL931x route tables hold 12288 entries. The usable range is
+ * clamped per family at L3 setup through priv->n_route_ids /
+ * priv->n_host_route_ids; host-route ids stay offset by MAX_ROUTES so
+ * the two spaces cannot collide.
+ */
+#define MAX_ROUTES 12288
+#define MAX_HOST_ROUTES 12288
 #define MAX_INTF_MTUS 8
 #define DEFAULT_MTU 1536
 #define MAX_INTERFACES 100
@@ -1721,6 +1727,8 @@ struct rtl838x_switch_priv {
 	struct rhltable routes;
 	unsigned long route_use_bm[MAX_ROUTES >> 5];
 	unsigned long host_route_use_bm[MAX_HOST_ROUTES >> 5];
+	int n_route_ids;	/* family clamp on the route id pools */
+	int n_host_route_ids;
 	int ip6_prefix_hw_cnt;	/* entries programmed in the IPv6 prefix region */
 	struct rtl838x_l3_intf *interfaces[MAX_INTERFACES];
 	u16 intf_mtus[MAX_INTF_MTUS];

@@ -997,20 +997,20 @@ static struct rtl83xx_route *rtl83xx_route_alloc(struct rtl838x_switch_priv *pri
 
 	mutex_lock(&priv->reg_mutex);
 
-	idx = find_first_zero_bit(priv->route_use_bm, MAX_ROUTES);
+	idx = find_first_zero_bit(priv->route_use_bm, priv->n_route_ids);
 	pr_debug("%s id: %d, gw %pI6c\n", __func__, idx, key);
 
 	/* find_first_zero_bit() returns the size it was given when every bit is
-	 * set, so a full bitmap yields MAX_ROUTES rather than an error. Without
+	 * set, so a full bitmap yields the limit rather than an error. Without
 	 * this check that out-of-range id is handed out repeatedly, the per-family
 	 * route_write() refuses it, and nothing propagates the refusal - the FIB
 	 * keeps reporting the route as offloaded while traffic silently falls back
 	 * to the catch-all and is routed in software.
 	 */
-	if (idx >= MAX_ROUTES) {
+	if (idx >= priv->n_route_ids) {
 		mutex_unlock(&priv->reg_mutex);
 		pr_warn_ratelimited("%s: all %d route ids in use, %pI6c stays in software\n",
-				    __func__, MAX_ROUTES, key);
+				    __func__, priv->n_route_ids, key);
 		return NULL;
 	}
 
@@ -1052,17 +1052,17 @@ static struct rtl83xx_route *rtl83xx_host_route_alloc(struct rtl838x_switch_priv
 
 	mutex_lock(&priv->reg_mutex);
 
-	idx = find_first_zero_bit(priv->host_route_use_bm, MAX_HOST_ROUTES);
+	idx = find_first_zero_bit(priv->host_route_use_bm, priv->n_host_route_ids);
 	pr_debug("%s id: %d, gw %pI6c\n", __func__, idx, key);
 
 	/* Same exhaustion trap as the prefix allocator above: a full bitmap returns
-	 * MAX_HOST_ROUTES, which would then be offset into the shared id space and
+	 * the limit, which would then be offset into the shared id space and
 	 * silently refused further down.
 	 */
-	if (idx >= MAX_HOST_ROUTES) {
+	if (idx >= priv->n_host_route_ids) {
 		mutex_unlock(&priv->reg_mutex);
 		pr_warn_ratelimited("%s: all %d host route ids in use, %pI6c stays in software\n",
-				    __func__, MAX_HOST_ROUTES, key);
+				    __func__, priv->n_host_route_ids, key);
 		return NULL;
 	}
 
@@ -1536,8 +1536,11 @@ void rtldsa_net6_mask(int prefix_len, struct in6_addr *ip6_m)
  * SDK moves entries on insert/delete, here the whole region is simply
  * rewritten on every change - v6 prefix routes are few and change rarely.
  */
-#define RTLDSA_IP6_ROUTE_IDX_TOP	(MAX_ROUTES - 8)	/* 504; 507 = v6 catch-all */
-#define RTLDSA_IP6_ROUTE_MAX		128	/* 2 entries per 8 slots */
+/* Only the RTL930x reaches this region walk (RTL931x places by id), so
+ * the geometry is anchored to that family's 512-entry table: the pool
+ * top is 504 and 507 holds the v6 catch-all.
+ */
+#define RTLDSA_IP6_ROUTE_IDX_TOP	(512 - 8)
 
 /* Table index of the n-th entry of the IPv6 prefix region, counting
  * downward from the top: 507, 504, 499, 496, 491, 488, ...
@@ -1568,11 +1571,16 @@ static int rtl83xx_l3_ip6_prefix_reprogram(struct rtl838x_switch_priv *priv)
 	struct rtl83xx_route **sorted, *r;
 	struct rtl83xx_route invalid = { };
 	int i, idx, n = 0;
+	/* A v6 entry occupies three slots, so a third of the id pool bounds
+	 * the collection on any family; the region claim below enforces the
+	 * tighter RTL930x packing.
+	 */
+	int cap = priv->n_route_ids / 3;
 
 	if (!priv->r->route_write)
 		return -EOPNOTSUPP;
 
-	sorted = kmalloc_array(RTLDSA_IP6_ROUTE_MAX, sizeof(*sorted), GFP_KERNEL);
+	sorted = kmalloc_array(cap, sizeof(*sorted), GFP_KERNEL);
 	if (!sorted)
 		return -ENOMEM;
 
@@ -1591,7 +1599,7 @@ static int rtl83xx_l3_ip6_prefix_reprogram(struct rtl838x_switch_priv *priv)
 		    r->prefix_len >= 128 || !r->attr.valid ||
 		    ipv6_addr_any(&r->gw_ip6))
 			continue;
-		if (n >= RTLDSA_IP6_ROUTE_MAX)
+		if (n >= cap)
 			break;
 		for (i = 0; i < n; i++) {
 			if (sorted[i]->prefix_len == r->prefix_len &&
@@ -3091,6 +3099,12 @@ static int rtl83xx_sw_probe(struct platform_device *pdev)
 
 	if (priv->r->qos_init)
 		priv->r->qos_init(priv);
+
+	/* Conservative id-pool defaults for families whose L3 setup does not
+	 * size them; the 93xx setups overwrite these with their table sizes.
+	 */
+	priv->n_route_ids = 512;
+	priv->n_host_route_ids = 1536;
 
 	if (priv->r->l3_setup)
 		priv->r->l3_setup(priv);
