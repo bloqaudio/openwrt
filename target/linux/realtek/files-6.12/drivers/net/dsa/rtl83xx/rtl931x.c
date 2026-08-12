@@ -149,12 +149,15 @@ static void rtl931x_vlan_profile_dump(int index)
 	if (index < 0 || index > 15)
 		return;
 
+	/* Each flood portmask is split upper-half-first: 25 bits for ports
+	 * 56..32 in the lower-offset word, then 32 bits for ports 31..0.
+	 */
 	profile[0] = sw_r32(RTL931X_VLAN_PROFILE_SET(index));
-	profile[1] = (sw_r32(RTL931X_VLAN_PROFILE_SET(index) + 4) & 0x1FFFFFFFULL) << 32 |
+	profile[1] = (sw_r32(RTL931X_VLAN_PROFILE_SET(index) + 4) & 0x1FFFFFFULL) << 32 |
 		     (sw_r32(RTL931X_VLAN_PROFILE_SET(index) + 8) & 0xFFFFFFFF);
-	profile[2] = (sw_r32(RTL931X_VLAN_PROFILE_SET(index) + 16) & 0x1FFFFFFFULL) << 32 |
-		     (sw_r32(RTL931X_VLAN_PROFILE_SET(index) + 12) & 0xFFFFFFFF);
-	profile[3] = (sw_r32(RTL931X_VLAN_PROFILE_SET(index) + 20) & 0x1FFFFFFFULL) << 32 |
+	profile[2] = (sw_r32(RTL931X_VLAN_PROFILE_SET(index) + 12) & 0x1FFFFFFULL) << 32 |
+		     (sw_r32(RTL931X_VLAN_PROFILE_SET(index) + 16) & 0xFFFFFFFF);
+	profile[3] = (sw_r32(RTL931X_VLAN_PROFILE_SET(index) + 20) & 0x1FFFFFFULL) << 32 |
 		     (sw_r32(RTL931X_VLAN_PROFILE_SET(index) + 24) & 0xFFFFFFFF);
 
 	pr_debug("VLAN %d: L2 learning: %d, L2 Unknown MultiCast Field %llx, IPv4 Unknown MultiCast Field %llx, IPv6 Unknown MultiCast Field: %llx\n",
