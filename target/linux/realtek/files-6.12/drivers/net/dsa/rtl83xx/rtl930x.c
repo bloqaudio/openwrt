@@ -3686,6 +3686,11 @@ int rtl930x_qos_swred_set(struct rtl838x_switch_priv *priv, int port, int queue,
 			sw_w32(val, RTL930X_SWRED_QUEUE_DROP_CTRL(q, dp));
 	}
 	sw_w32_mask(BIT(port), BIT(port), RTL930X_SWRED_PORT_CTRL);
+	/* See RTL930X_FC_EGR_DROP_REF_RXCNGST: SWRED only sees the egress
+	 * queue with the congestion reference cleared.
+	 */
+	sw_w32_mask(RTL930X_FC_EGR_DROP_REF_RXCNGST, 0,
+		    RTL930X_FC_PORT_EGR_DROP_CTRL(port));
 	mutex_unlock(&priv->reg_mutex);
 
 	return 0;
@@ -3695,6 +3700,9 @@ void rtl930x_qos_swred_disable(struct rtl838x_switch_priv *priv, int port)
 {
 	mutex_lock(&priv->reg_mutex);
 	sw_w32_mask(BIT(port), 0, RTL930X_SWRED_PORT_CTRL);
+	sw_w32_mask(RTL930X_FC_EGR_DROP_REF_RXCNGST,
+		    RTL930X_FC_EGR_DROP_REF_RXCNGST,
+		    RTL930X_FC_PORT_EGR_DROP_CTRL(port));
 	mutex_unlock(&priv->reg_mutex);
 }
 

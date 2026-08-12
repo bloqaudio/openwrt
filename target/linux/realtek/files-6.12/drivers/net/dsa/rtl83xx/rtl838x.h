@@ -785,6 +785,13 @@ typedef enum {
 #define RTL930X_SWRED_THR_MIN_M			GENMASK(11, 0)
 #define RTL930X_SWRED_PAGE_BYTES		256
 #define RTL930X_SWRED_THR_MAX_PAGES		4095
+/* REF_RXCNGST points the egress-drop stage at the source port's congestion
+ * state instead of the egress queue, and the SWRED thresholds are only
+ * consulted with it clear. It resets set, so enabling SWRED must clear it
+ * and disabling must put it back. The register itself is defined with the
+ * flow-control block in rtl930x.c.
+ */
+#define RTL930X_FC_EGR_DROP_REF_RXCNGST		BIT(1)
 #define RTL930X_SWRED_DROP_PRECEDENCES		3
 /* Egress remarking: per-port enables and global source selects
  * (SDK dal_longan_qos_port{1p,Out1p,Dscp,Dei}RemarkEnable_set and
@@ -878,6 +885,7 @@ typedef enum {
  */
 #define RTL931X_FC_PORT_EGR_DROP_CTRL(p)	(0xA800 + ((p) << 2))
 #define RTL931X_FC_EGR_DROP_ALGO_SWRED		BIT(2)
+#define RTL931X_FC_EGR_DROP_REF_RXCNGST		BIT(1)
 #define RTL931X_SWRED_Q_DROP_RATE(q)		(0x27C4 + ((q) << 2))
 #define RTL931X_SWRED_Q_THR(q, dp)		(0x27F4 + ((q) * 12) + ((dp) << 2))
 #define RTL931X_SWRED_THR_MAX_M			GENMASK(28, 16)
