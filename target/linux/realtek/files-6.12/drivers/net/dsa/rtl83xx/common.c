@@ -1245,8 +1245,6 @@ static int rtldsa_fib4_del(struct rtl838x_switch_priv *priv,
 
 	rtl83xx_route_rm(priv, route);
 
-	nh->fib_nh_flags &= ~RTNH_F_OFFLOAD;
-
 	return 0;
 }
 
@@ -2005,6 +2003,27 @@ void rtl83xx_l3_flush_neigh_routes(struct rtl838x_switch_priv *priv, int port)
 	queue_work(priv->wq, &fw->work);
 }
 
+/* Offload state must be reported per route alias: routes share nexthops,
+ * so a flag on the fib_nh marks every route through the same gateway as
+ * offloaded once any one of them is.
+ */
+static void rtldsa_fib4_hw_flags_set(struct fib_entry_notifier_info *info,
+				     bool offload, bool failed)
+{
+	struct fib_rt_info fri = {
+		.fi = info->fi,
+		.tb_id = info->tb_id,
+		.dst = cpu_to_be32(info->dst),
+		.dst_len = info->dst_len,
+		.dscp = info->dscp,
+		.type = info->type,
+	};
+
+	fri.offload = offload;
+	fri.offload_failed = failed;
+	fib_alias_hw_flags_set(&init_net, &fri);
+}
+
 static int rtldsa_fib4_add(struct rtl838x_switch_priv *priv,
 			   struct fib_entry_notifier_info *info)
 {
@@ -2048,6 +2067,7 @@ static int rtldsa_fib4_add(struct rtl838x_switch_priv *priv,
 		dev_info(priv->dev, "route hashtable extended for gw %pI4\n", &nh->fib_nh_gw4);
 	else {
 		dev_err(priv->dev, "could not extend route hashtable for gw %pI4\n", &nh->fib_nh_gw4);
+		rtldsa_fib4_hw_flags_set(info, false, true);
 		return -ENOSPC;
 	}
 
@@ -2089,7 +2109,7 @@ static int rtldsa_fib4_add(struct rtl838x_switch_priv *priv,
 	if (nh->fib_nh_gw4)
 		rtl83xx_port_ipv4_resolve(priv, ndev, nh->fib_nh_gw4);
 
-	nh->fib_nh_flags |= RTNH_F_OFFLOAD;
+	rtldsa_fib4_hw_flags_set(info, true, false);
 
 	return 0;
 
@@ -2108,6 +2128,8 @@ out_free_rt:
 		clear_bit(route->id, priv->route_use_bm);
 	mutex_unlock(&priv->reg_mutex);
 	kfree(route);
+
+	rtldsa_fib4_hw_flags_set(info, false, true);
 
 	return -ENOSPC;
 }
@@ -2220,6 +2242,7 @@ static int rtldsa_fib6_add(struct rtl838x_switch_priv *priv,
 		dev_info(priv->dev, "route hashtable extended for gw %pI6c\n", gw6);
 	else {
 		dev_err(priv->dev, "could not extend route hashtable for gw %pI6c\n", gw6);
+		fib6_info_hw_flags_set(&init_net, rt, false, false, true);
 		return -ENOSPC;
 	}
 
@@ -2285,6 +2308,8 @@ out_free_rt:
 		clear_bit(route->id, priv->route_use_bm);
 	mutex_unlock(&priv->reg_mutex);
 	kfree(route);
+
+	fib6_info_hw_flags_set(&init_net, rt, false, false, true);
 
 	return -ENOSPC;
 }
