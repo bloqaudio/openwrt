@@ -1000,6 +1000,20 @@ static struct rtl83xx_route *rtl83xx_route_alloc(struct rtl838x_switch_priv *pri
 	idx = find_first_zero_bit(priv->route_use_bm, MAX_ROUTES);
 	pr_debug("%s id: %d, gw %pI6c\n", __func__, idx, key);
 
+	/* find_first_zero_bit() returns the size it was given when every bit is
+	 * set, so a full bitmap yields MAX_ROUTES rather than an error. Without
+	 * this check that out-of-range id is handed out repeatedly, the per-family
+	 * route_write() refuses it, and nothing propagates the refusal - the FIB
+	 * keeps reporting the route as offloaded while traffic silently falls back
+	 * to the catch-all and is routed in software.
+	 */
+	if (idx >= MAX_ROUTES) {
+		mutex_unlock(&priv->reg_mutex);
+		pr_warn_ratelimited("%s: all %d route ids in use, %pI6c stays in software\n",
+				    __func__, MAX_ROUTES, key);
+		return NULL;
+	}
+
 	r = kzalloc(sizeof(*r), GFP_KERNEL);
 	if (!r) {
 		mutex_unlock(&priv->reg_mutex);
@@ -1040,6 +1054,17 @@ static struct rtl83xx_route *rtl83xx_host_route_alloc(struct rtl838x_switch_priv
 
 	idx = find_first_zero_bit(priv->host_route_use_bm, MAX_HOST_ROUTES);
 	pr_debug("%s id: %d, gw %pI6c\n", __func__, idx, key);
+
+	/* Same exhaustion trap as the prefix allocator above: a full bitmap returns
+	 * MAX_HOST_ROUTES, which would then be offset into the shared id space and
+	 * silently refused further down.
+	 */
+	if (idx >= MAX_HOST_ROUTES) {
+		mutex_unlock(&priv->reg_mutex);
+		pr_warn_ratelimited("%s: all %d host route ids in use, %pI6c stays in software\n",
+				    __func__, MAX_HOST_ROUTES, key);
+		return NULL;
+	}
 
 	r = kzalloc(sizeof(*r), GFP_KERNEL);
 	if (!r) {
