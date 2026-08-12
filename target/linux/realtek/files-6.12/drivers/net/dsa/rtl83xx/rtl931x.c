@@ -834,11 +834,10 @@ static void rtl931x_vlan_profile_setup(int profile)
 	if (profile > 15)
 		return;
 
+	/* Unicast routing is enabled per L3 ingress interface on this family,
+	 * not in the VLAN profile - there is nothing to set for it here.
+	 */
 	p[0] = sw_r32(RTL931X_VLAN_PROFILE_SET(profile));
-
-	/* Enable routing of Ipv4/6 Unicast and IPv4/6 Multicast traffic */
-	/* p[0] |= BIT(17) | BIT(16) | BIT(13) | BIT(12); */
-	p[0] |= 0x3 << 11; /* COPY2CPU */
 
 	p[1] = 0x1FFFFFF; /* L2 unknwon MC flooding portmask all ports, including the CPU-port */
 	p[2] = 0xFFFFFFFF;
