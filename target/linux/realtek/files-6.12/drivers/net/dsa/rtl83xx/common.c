@@ -1300,7 +1300,11 @@ static int rtl83xx_alloc_egress_intf(struct rtl838x_switch_priv *priv, u64 mac, 
 	u64 m;
 
 	mutex_lock(&priv->reg_mutex);
-	for (int i = 0; i < MAX_SMACS; i++) {
+	/* Index 0 doubles as the L3 ingress-interface index every unbound
+	 * VLAN selects, so allocating it would flip the routing enables of
+	 * every VLAN that has no interface of its own. Leave it reserved.
+	 */
+	for (int i = 1; i < MAX_SMACS; i++) {
 		m = priv->r->get_l3_egress_mac(L3_EGRESS_DMACS + i);
 		if (free_mac < 0 && !m) {
 			free_mac = i;
