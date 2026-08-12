@@ -1132,11 +1132,14 @@ static void rtl83xx_route_rm(struct rtl838x_switch_priv *priv, struct rtl83xx_ro
 		}
 		clear_bit(r->id, priv->route_use_bm);
 	} else if (r->attr.type == 2) {
-		/* An IPv6 gateway prefix route lives in the sorted IPv6
-		 * region of the prefix table, which is rewritten wholesale
-		 * by rtl83xx_l3_ip6_prefix_reprogram() after any change -
-		 * no individual invalidation here.
+		/* The shared IPv6 prefix region is rewritten wholesale after
+		 * any change. A family that owns placement instead must free
+		 * the individual entry by its software route id.
 		 */
+		if (priv->r->l3_ip6_prefix_by_id) {
+			r->attr.valid = false;
+			priv->r->route_write(r->id, r);
+		}
 		clear_bit(r->id, priv->route_use_bm);
 	} else {
 		/* If there is a HW representation of the route, delete it.
@@ -1584,6 +1587,13 @@ static int rtl83xx_l3_ip6_prefix_reprogram(struct rtl838x_switch_priv *priv)
 	}
 	rhashtable_walk_stop(&iter);
 	rhashtable_walk_exit(&iter);
+
+	if (priv->r->l3_ip6_prefix_by_id) {
+		for (i = 0; i < n; i++)
+			priv->r->route_write(sorted[i]->id, sorted[i]);
+		kfree(sorted);
+		return 0;
+	}
 
 	/* Claim the triples needed beyond the currently programmed region. */
 	for (i = priv->ip6_prefix_hw_cnt; i < n; i++) {

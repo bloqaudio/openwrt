@@ -1632,6 +1632,11 @@ struct rtl838x_reg {
 	void (*host_route_write)(int idx, struct rtl83xx_route *rt);
 	int (*l3_setup)(struct rtl838x_switch_priv *priv);
 	bool l3_ecmp_offload;
+	/* The family driver owns IPv6 prefix-route placement: route_write()
+	 * takes the software route id and allocates the table position
+	 * itself, instead of the shared code assigning table indices.
+	 */
+	bool l3_ip6_prefix_by_id;
 	void (*set_l3_nexthop)(int idx, u16 dmac_id, u16 interface);
 	void (*get_l3_nexthop)(int idx, u16 *dmac_id, u16 *interface);
 	u64 (*get_l3_egress_mac)(u32 idx);
