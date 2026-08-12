@@ -1503,6 +1503,7 @@ struct rtl83xx_route {
 	bool neigh_route;		/* Synthesized from a neighbour entry, not the FIB:
 					 * torn down on neighbour invalidation
 					 */
+	int ifindex;			/* netdev the gateway neighbour lives on; 0 = unknown */
 	int id;				/* ID number of this route */
 	struct rhlist_head linkage;
 	u16 switch_mac_id;		/* Index into switch's own MACs, RTL839X only */
@@ -1631,6 +1632,7 @@ struct rtl838x_reg {
 	void (*route_read)(int idx, struct rtl83xx_route *rt);
 	void (*route_write)(int idx, struct rtl83xx_route *rt);
 	void (*host_route_write)(int idx, struct rtl83xx_route *rt);
+	bool (*host_route_hit_get_clear)(int idx);
 	int (*l3_setup)(struct rtl838x_switch_priv *priv);
 	bool l3_ecmp_offload;
 	/* The family driver owns IPv6 prefix-route placement: route_write()
@@ -1730,6 +1732,7 @@ struct rtl838x_switch_priv {
 	 */
 	struct rtldsa_mst *msts;
 	struct delayed_work counters_work;
+	struct delayed_work l3_activity_work;
 
 	/**
 	 * @counters_lock: Protects the hardware reads happening from MIB

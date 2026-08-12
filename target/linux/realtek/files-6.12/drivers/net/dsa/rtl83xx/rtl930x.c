@@ -1247,6 +1247,39 @@ out:
 	rtl_table_release(r);
 }
 
+/* Read the activity bit of a host route and clear it. Hardware only ever
+ * sets it, so clearing is a read-modify-write through the table data
+ * registers - that preserves the entry fields this driver does not decode.
+ */
+static bool rtl930x_host_route_hit_get_clear(int idx)
+{
+	struct table_reg *r = rtl_table_get(RTL9300_TBL_1, 1);
+	bool hit = false;
+	u32 v;
+
+	if (!r)
+		return false;
+
+	idx = ((idx / 6) * 8) + (idx % 6);
+	if (rtl_table_read(r, idx))
+		goto out;
+
+	v = sw_r32(rtl_table_data(r, 0));
+	if (!(v & BIT(31)))	/* entry went away under us */
+		goto out;
+
+	hit = !!(v & BIT(20));
+	if (hit) {
+		sw_w32(v & ~BIT(20), rtl_table_data(r, 0));
+		rtl_table_write(r, idx);
+	}
+
+out:
+	rtl_table_release(r);
+
+	return hit;
+}
+
 /* Write a host route entry from the table using its index
  * We currently only support IPv4 and IPv6 unicast route
  */
@@ -3894,6 +3927,7 @@ const struct rtl838x_reg rtl930x_reg = {
 	.route_read = rtl930x_route_read,
 	.route_write = rtl930x_route_write,
 	.host_route_write = rtl930x_host_route_write,
+	.host_route_hit_get_clear = rtl930x_host_route_hit_get_clear,
 	.l3_setup = rtl930x_l3_setup,
 	.l3_ecmp_offload = false,
 	.l3_ip6_prefix_by_id = false,

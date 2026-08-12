@@ -1357,7 +1357,7 @@ static int rtl83xx_alloc_egress_intf(struct rtl838x_switch_priv *priv, u64 mac, 
  */
 static int rtl83xx_l3_neigh_route_add(struct rtl838x_switch_priv *priv,
 				      __be32 ip, u64 mac, u64 intf_mac,
-				      int vlan, int port)
+				      int vlan, int port, int ifindex)
 {
 	struct rtl83xx_route *r;
 	struct in6_addr key;
@@ -1389,6 +1389,7 @@ static int rtl83xx_l3_neigh_route_add(struct rtl838x_switch_priv *priv,
 	if (!r)
 		return -ENOSPC;
 
+	r->ifindex = ifindex;
 	r->neigh_route = true;
 	r->dst_ip = ip;
 	r->prefix_len = 32;
@@ -1793,7 +1794,7 @@ static int rtl83xx_port_ipv6_resolve(struct rtl838x_switch_priv *priv,
  */
 static int rtl83xx_l3_neigh6_route_add(struct rtl838x_switch_priv *priv,
 				       struct in6_addr *ip6, u64 mac, u64 intf_mac,
-				       int vlan, int port)
+				       int vlan, int port, int ifindex)
 {
 	struct rtl83xx_route *r;
 	int slot, if_id;
@@ -1819,6 +1820,7 @@ static int rtl83xx_l3_neigh6_route_add(struct rtl838x_switch_priv *priv,
 	if (!r)
 		return -ENOSPC;
 
+	r->ifindex = ifindex;
 	r->neigh_route = true;
 	r->dst_ip6 = *ip6;
 	r->prefix_len = 128;
@@ -2037,6 +2039,7 @@ static int rtldsa_fib4_add(struct rtl838x_switch_priv *priv,
 		return -ENOSPC;
 	}
 
+	route->ifindex = ndev->ifindex;
 	route->dst_ip = info->dst;
 	route->prefix_len = info->dst_len;
 	route->nh.rvid = vlan;
@@ -2208,6 +2211,7 @@ static int rtldsa_fib6_add(struct rtl838x_switch_priv *priv,
 		return -ENOSPC;
 	}
 
+	route->ifindex = ndev->ifindex;
 	route->dst_ip6 = rt->fib6_dst.addr;
 	route->prefix_len = rt->fib6_dst.plen;
 	route->attr.type = 2;
@@ -2337,6 +2341,116 @@ static int rtldsa_fib6_del(struct rtl838x_switch_priv *priv,
 
 #endif /* IS_BUILTIN(CONFIG_IPV6) */
 
+/* Hardware forwards offloaded traffic without the CPU seeing it, so ARP/ND
+ * would age an active neighbour out and the netevent handler would then drop
+ * its host route, pushing the flow back onto the software path. Poll the
+ * per-entry activity bit and mark the neighbour used, which keeps it in the
+ * kernel's refresh cycle instead of letting it go stale.
+ *
+ * The interval has to stay below the neighbour DELAY_PROBE_TIME (5 s by
+ * default): a REACHABLE entry only escapes NUD_STALE if it was used within
+ * that window.
+ */
+#define RTLDSA_L3_ACTIVITY_POLL_INTERVAL	(2 * HZ)
+
+struct rtldsa_l3_activity_probe {
+	struct in6_addr gw;
+	struct in6_addr dst6;
+	__be32 dst4;
+	int ifindex;
+	u8 type;
+};
+
+static void rtldsa_l3_neigh_confirm(const struct rtldsa_l3_activity_probe *p)
+{
+	struct net_device *dev;
+	struct neighbour *n;
+
+	dev = dev_get_by_index(&init_net, p->ifindex);
+	if (!dev)
+		return;
+
+	if (p->type == 2) {
+#if IS_BUILTIN(CONFIG_IPV6)
+		n = neigh_lookup(&nd_tbl, &p->gw, dev);
+#else
+		dev_put(dev);
+		return;
+#endif
+	} else {
+		n = neigh_lookup(&arp_tbl, &p->gw.s6_addr32[3], dev);
+	}
+
+	if (n) {
+		neigh_event_send(n, NULL);
+		neigh_release(n);
+	}
+
+	dev_put(dev);
+}
+
+static void rtldsa_l3_activity_work_do(struct work_struct *work)
+{
+	struct rtl838x_switch_priv *priv = container_of(to_delayed_work(work),
+							struct rtl838x_switch_priv,
+							l3_activity_work);
+	struct rtldsa_l3_activity_probe *probes;
+	struct rhashtable_iter iter;
+	struct rtl83xx_route *r;
+	int cnt, n = 0;
+
+	mutex_lock(&priv->reg_mutex);
+	cnt = bitmap_weight(priv->host_route_use_bm, MAX_HOST_ROUTES);
+	mutex_unlock(&priv->reg_mutex);
+	if (!cnt)
+		goto rearm;
+
+	probes = kmalloc_array(cnt, sizeof(*probes), GFP_KERNEL);
+	if (!probes)
+		goto rearm;
+
+	rhltable_walk_enter(&priv->routes, &iter);
+	rhashtable_walk_start(&iter);
+	while ((r = rhashtable_walk_next(&iter)) != NULL) {
+		if (IS_ERR(r))
+			continue;
+		if (!r->is_host_route || !r->attr.valid || !r->ifindex ||
+		    r->attr.action != ROUTE_ACT_FORWARD)
+			continue;
+		/* A route added after the bitmap count is picked up next time. */
+		if (n >= cnt)
+			break;
+		probes[n].gw = r->gw_ip6;
+		probes[n].dst6 = r->dst_ip6;
+		probes[n].dst4 = r->dst_ip;
+		probes[n].ifindex = r->ifindex;
+		probes[n].type = r->attr.type;
+		n++;
+	}
+	rhashtable_walk_stop(&iter);
+	rhashtable_walk_exit(&iter);
+
+	for (int i = 0; i < n; i++) {
+		struct rtl83xx_route probe_rt = { };
+		int slot;
+
+		probe_rt.attr.type = probes[i].type;
+		probe_rt.dst_ip = probes[i].dst4;
+		probe_rt.dst_ip6 = probes[i].dst6;
+		slot = priv->r->find_l3_slot(&probe_rt, true);
+		if (slot < 0)
+			continue;
+		if (priv->r->host_route_hit_get_clear(slot))
+			rtldsa_l3_neigh_confirm(&probes[i]);
+	}
+
+	kfree(probes);
+
+rearm:
+	queue_delayed_work(priv->wq, &priv->l3_activity_work,
+			   RTLDSA_L3_ACTIVITY_POLL_INTERVAL);
+}
+
 struct net_event_work {
 	struct work_struct work;
 	struct rtl838x_switch_priv *priv;
@@ -2346,6 +2460,7 @@ struct net_event_work {
 	struct in6_addr gw_addr6;
 	int vlan;
 	int port;	/* >= 0 only when the neighbour sits on a bare routed port */
+	int ifindex;
 	bool valid;
 	bool is_v6;
 	bool linklocal;	/* fe80::/10 neighbour: nexthop only, never a host route */
@@ -2372,7 +2487,8 @@ static void rtl83xx_net_event_work_do(struct work_struct *work)
 			 */
 			rtl83xx_l3_neigh6_route_add(priv, &net_work->gw_addr6,
 						    net_work->mac, net_work->intf_mac,
-						    net_work->vlan, net_work->port);
+						    net_work->vlan, net_work->port,
+						    net_work->ifindex);
 		}
 		kfree(net_work);
 		return;
@@ -2387,7 +2503,8 @@ static void rtl83xx_net_event_work_do(struct work_struct *work)
 		 */
 		rtl83xx_l3_neigh_route_add(priv, net_work->gw_addr,
 					   net_work->mac, net_work->intf_mac,
-					   net_work->vlan, net_work->port);
+					   net_work->vlan, net_work->port,
+					   net_work->ifindex);
 	}
 
 	kfree(net_work);
@@ -2441,6 +2558,7 @@ static int rtl83xx_ndisc_neigh_update(struct rtl838x_switch_priv *priv,
 	net_work->gw_addr6 = *key;
 	net_work->intf_mac = ether_addr_to_u64(dev->dev_addr);
 	net_work->vlan = is_vlan_dev(dev) ? vlan_dev_vlan_id(dev) : 0;
+	net_work->ifindex = n->dev->ifindex;
 	/* Distinguish a neighbour on a bare routed port from one behind a
 	 * bridge/SVI, where the walk-derived port is just the first member.
 	 */
@@ -2520,6 +2638,7 @@ static int rtl83xx_netevent_event(struct notifier_block *this,
 		net_work->gw_addr = *(__be32 *)n->primary_key;
 		net_work->intf_mac = ether_addr_to_u64(dev->dev_addr);
 		net_work->vlan = is_vlan_dev(dev) ? vlan_dev_vlan_id(dev) : 0;
+		net_work->ifindex = n->dev->ifindex;
 		/* Distinguish a neighbour on a bare routed port (dev IS one of
 		 * our user ports) from one behind a bridge/SVI, where the
 		 * walk-derived port is just the first bridge member.
@@ -2908,6 +3027,7 @@ static int rtl83xx_sw_probe(struct platform_device *pdev)
 		dev_err(dev, "Error creating workqueue: %d\n", err);
 		return -ENOMEM;
 	}
+	INIT_DELAYED_WORK(&priv->l3_activity_work, rtldsa_l3_activity_work_do);
 
 	err = dsa_register_switch(priv->ds);
 	if (err) {
@@ -2977,6 +3097,9 @@ static int rtl83xx_sw_probe(struct platform_device *pdev)
 
 	/* Initialize hash table for L3 routing */
 	rhltable_init(&priv->routes, &route_ht_params);
+	if (priv->r->host_route_hit_get_clear && priv->r->find_l3_slot)
+		queue_delayed_work(priv->wq, &priv->l3_activity_work,
+				   RTLDSA_L3_ACTIVITY_POLL_INTERVAL);
 
 	/* Register netevent notifier callback to catch notifications about neighboring
 	 * changes to update nexthop entries for L3 routing.
@@ -3024,6 +3147,7 @@ err_register_fib_nb:
 err_register_ne_nb:
 	dsa_switch_shutdown(priv->ds);
 err_register_switch:
+	cancel_delayed_work_sync(&priv->l3_activity_work);
 	destroy_workqueue(priv->wq);
 
 	return err;
@@ -3047,6 +3171,7 @@ static void rtl83xx_sw_remove(struct platform_device *pdev)
 	unregister_fib_notifier(&init_net, &priv->fib_nb);
 	unregister_netevent_notifier(&priv->ne_nb);
 	cancel_delayed_work_sync(&priv->counters_work);
+	cancel_delayed_work_sync(&priv->l3_activity_work);
 
 	dsa_switch_shutdown(priv->ds);
 

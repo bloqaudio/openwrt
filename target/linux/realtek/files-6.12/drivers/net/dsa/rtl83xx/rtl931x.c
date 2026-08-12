@@ -3600,6 +3600,39 @@ out:
 	rtl_table_release(r);
 }
 
+/* Read the activity bit of a host route and clear it. Hardware only ever
+ * sets it, so clearing is a read-modify-write through the table data
+ * registers - that preserves the entry fields this driver does not decode.
+ */
+static bool rtl931x_host_route_hit_get_clear(int idx)
+{
+	struct table_reg *r = rtl_table_get(RTL9310_TBL_2, 3);
+	bool hit = false;
+	u32 v;
+
+	if (!r)
+		return false;
+
+	if (rtl_table_read(r, rtl931x_l3_idx_to_addr(idx)))
+		goto out;
+
+	v = sw_r32(rtl_table_data(r, 0));
+	if (!(v & BIT(31)))	/* entry went away under us */
+		goto out;
+
+	v = sw_r32(rtl_table_data(r, 3));
+	hit = !!(v & BIT(15));
+	if (hit) {
+		sw_w32(v & ~BIT(15), rtl_table_data(r, 3));
+		rtl_table_write(r, rtl931x_l3_idx_to_addr(idx));
+	}
+
+out:
+	rtl_table_release(r);
+
+	return hit;
+}
+
 /* Write a host route entry using its logical index. Invalidation clears
  * every slot in the entry so no valid continuation can survive.
  */
@@ -4709,6 +4742,7 @@ const struct rtl838x_reg rtl931x_reg = {
 	.get_l3_egress_mac = rtl931x_get_l3_egress_mac,
 	.set_l3_egress_mac = rtl931x_set_l3_egress_mac,
 	.host_route_write = rtl931x_host_route_write,
+	.host_route_hit_get_clear = rtl931x_host_route_hit_get_clear,
 	.find_l3_slot = rtl931x_find_l3_slot,
 	.route_read = rtl931x_route_read,
 	.route_write = rtl931x_route_write,
