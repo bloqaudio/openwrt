@@ -4024,8 +4024,14 @@ static int rtl931x_route_lookup_hw(struct rtl83xx_route *rt)
 	 * TEST_MODE (25) and above keep their values.
 	 */
 	sw_w32_mask(0x1ffffff, 0, RTL931X_L3_HW_LU_KEY_CTRL);
+	/* The DIP key is a 128-bit register block; an IPv4 key goes in its
+	 * low word. Zero the high words so no previous key leaves residue.
+	 */
+	sw_w32(0, RTL931X_L3_HW_LU_KEY_DIP_CTRL);
+	sw_w32(0, RTL931X_L3_HW_LU_KEY_DIP_CTRL + 4);
+	sw_w32(0, RTL931X_L3_HW_LU_KEY_DIP_CTRL + 8);
 	sw_w32(rt->dst_ip & inet_make_mask(rt->prefix_len),
-	       RTL931X_L3_HW_LU_KEY_DIP_CTRL);
+	       RTL931X_L3_HW_LU_KEY_DIP_CTRL + 0xc);
 
 	sw_w32_mask(BIT(15), BIT(15), RTL931X_L3_HW_LU_CTRL);
 	for (i = 0; i < 512; i++) {
