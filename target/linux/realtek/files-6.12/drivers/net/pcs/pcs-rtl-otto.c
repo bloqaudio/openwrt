@@ -5001,9 +5001,20 @@ static int rtpcs_probe(struct platform_device *pdev)
 
 static int rtpcs_93xx_set_autoneg(struct rtpcs_serdes *sds, unsigned int neg_mode)
 {
-	u16 bmcr = neg_mode == PHYLINK_PCS_NEG_INBAND_ENABLED ? BMCR_ANENABLE : 0;
+	u16 bmcr;
 
-	return rtpcs_sds_modify(sds, 2, MII_BMCR, BMCR_ANENABLE, bmcr);
+	/* The vendor performs no AN-control write outside in-band capable
+	 * speeds. On RTL931x the AN control register lives on the digital
+	 * SerDes, so the analog window would hit a different backing device
+	 * on odd lanes.
+	 */
+	if (!(neg_mode & PHYLINK_PCS_NEG_INBAND) || !sds->ctrl->cfg->an_page)
+		return 0;
+
+	bmcr = neg_mode == PHYLINK_PCS_NEG_INBAND_ENABLED ? BMCR_ANENABLE : 0;
+
+	return rtpcs_sds_modify(sds, sds->ctrl->cfg->an_page, MII_BMCR,
+				BMCR_ANENABLE, bmcr);
 }
 
 static const struct phylink_pcs_ops rtpcs_838x_pcs_ops = {
