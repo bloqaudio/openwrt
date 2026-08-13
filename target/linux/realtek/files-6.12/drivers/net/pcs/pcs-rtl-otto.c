@@ -21,6 +21,8 @@
 #define RTPCS_SDS_PAGE_CNT			192
 #define RTPCS_SDS_REG_CNT			32
 #define RTPCS_PORT_CNT				57
+#define RTPCS_SDS_ADVERT_MASK (ADVERTISE_1000XFULL | ADVERTISE_1000XHALF | \
+			       ADVERTISE_1000XPAUSE | ADVERTISE_1000XPSE_ASYM)
 
 #define RTPCS_SPEED_10				0
 #define RTPCS_SPEED_100				1
@@ -215,6 +217,8 @@ struct rtpcs_link {
 	struct delayed_work retry_work;
 	phy_interface_t retry_mode;
 	unsigned int retry_neg_mode;
+	u16 adv_word;
+	bool adv_valid;
 	unsigned int retry_attempt;
 	unsigned int retry_bad_samples;
 	unsigned int retry_clean_linkless_samples;
@@ -244,6 +248,7 @@ struct rtpcs_config {
 	int mac_rx_pause_sts;
 	int mac_tx_pause_sts;
 	u8 serdes_count;
+	u16 an_page; /* 0 = family has no in-band AN register page */
 
 	const struct phylink_pcs_ops *pcs_ops;
 	int (*init_serdes_common)(struct rtpcs_ctrl *ctrl);
@@ -340,6 +345,63 @@ static int rtpcs_sds_modify(struct rtpcs_serdes *sds, int page, int regnum,
 
 	return mdiobus_c45_modify(sds->ctrl->bus, sds->id, MDIO_MMD_VEND1,
 				  mmd_regnum, mask, set);
+}
+
+static int rtpcs_sds_modify_changed(struct rtpcs_serdes *sds, int page,
+				    int regnum, u16 mask, u16 set)
+{
+	int mmd_regnum = rtpcs_sds_to_mmd(page, regnum);
+
+	lockdep_assert_held(&sds->ctrl->lock);
+
+	return mdiobus_c45_modify_changed(sds->ctrl->bus, sds->id, MDIO_MMD_VEND1,
+					  mmd_regnum, mask, set);
+}
+
+static int rtpcs_pcs_encode_advert(unsigned int neg_mode, phy_interface_t interface,
+				   const unsigned long *advertising)
+{
+	if (neg_mode != PHYLINK_PCS_NEG_INBAND_ENABLED)
+		return -EINVAL;
+
+	if (interface != PHY_INTERFACE_MODE_1000BASEX &&
+	    interface != PHY_INTERFACE_MODE_2500BASEX)
+		return -EINVAL;
+
+	return phylink_mii_c22_pcs_encode_advertisement(interface, advertising);
+}
+
+static int rtpcs_sds_write_advert(struct rtpcs_link *link)
+{
+	struct rtpcs_ctrl *ctrl = link->ctrl;
+
+	if (!ctrl->cfg->an_page || !link->adv_valid)
+		return 0;
+
+	return rtpcs_sds_modify_changed(link->sds, ctrl->cfg->an_page,
+					MII_ADVERTISE, RTPCS_SDS_ADVERT_MASK,
+					link->adv_word);
+}
+
+static int rtpcs_sds_apply_autoneg(struct rtpcs_link *link, unsigned int neg_mode)
+{
+	struct rtpcs_ctrl *ctrl = link->ctrl;
+	int changed, ret;
+
+	/* Re-assert in-band AN state after a (re-)setup. The advertisement
+	 * shares the AN state that setup can lose and must precede the enable.
+	 */
+	changed = rtpcs_sds_write_advert(link);
+	if (changed < 0)
+		return changed;
+
+	if (ctrl->cfg->set_autoneg) {
+		ret = ctrl->cfg->set_autoneg(link->sds, neg_mode);
+		if (ret < 0)
+			return ret;
+	}
+
+	return changed;
 }
 
 static struct rtpcs_serdes *rtpcs_sds_get_even(struct rtpcs_serdes *sds)
@@ -3862,8 +3924,16 @@ static void rtpcs_pcs_an_restart(struct phylink_pcs *pcs)
 	struct rtpcs_link *link = rtpcs_phylink_pcs_to_link(pcs);
 	struct rtpcs_ctrl *ctrl = link->ctrl;
 
-	dev_warn(ctrl->dev, "an_restart() for port %d and sds %d not yet implemented\n",
-		 link->port, link->sds->id);
+	if (!ctrl->cfg->an_page) {
+		dev_warn(ctrl->dev, "an_restart() for port %d and sds %d not yet implemented\n",
+			 link->port, link->sds->id);
+		return;
+	}
+
+	mutex_lock(&ctrl->lock);
+	rtpcs_sds_modify(link->sds, ctrl->cfg->an_page, MII_BMCR,
+			 BMCR_ANRESTART, BMCR_ANRESTART);
+	mutex_unlock(&ctrl->lock);
 }
 
 static bool rtpcs_mac_link_up(struct rtpcs_link *link)
@@ -4142,8 +4212,7 @@ static void rtpcs_sds_retry_completed(struct rtpcs_link *link)
 
 	lockdep_assert_held(&ctrl->lock);
 	rtpcs_sds_retry_reset(link);
-	if (ctrl->cfg->set_autoneg)
-		ctrl->cfg->set_autoneg(link->sds, link->retry_neg_mode);
+	rtpcs_sds_apply_autoneg(link, link->retry_neg_mode);
 
 	dev_info(ctrl->dev, "port %d, sds %d: RX recovery completed\n",
 		 link->port, link->sds->id);
@@ -4291,8 +4360,7 @@ static void rtpcs_sds_setup_retry(struct work_struct *work)
 			link->sds->first_start = false;
 			link->sds->configured_mode = link->retry_mode;
 
-			if (ctrl->cfg->set_autoneg)
-				ctrl->cfg->set_autoneg(link->sds, link->retry_neg_mode);
+			rtpcs_sds_apply_autoneg(link, link->retry_neg_mode);
 		}
 
 		mod_delayed_work(system_power_efficient_wq, &link->retry_work,
@@ -4351,8 +4419,7 @@ static void rtpcs_sds_setup_retry(struct work_struct *work)
 		if (!ret) {
 			link->sds->first_start = false;
 			link->sds->configured_mode = link->retry_mode;
-			if (ctrl->cfg->set_autoneg)
-				ctrl->cfg->set_autoneg(link->sds, link->retry_neg_mode);
+			rtpcs_sds_apply_autoneg(link, link->retry_neg_mode);
 		}
 		link->retry_force = false;
 		rtpcs_sds_retry_settle_start(link,
@@ -4415,8 +4482,7 @@ static void rtpcs_sds_setup_retry(struct work_struct *work)
 	if (!ret) {
 		link->sds->first_start = false;
 		link->sds->configured_mode = link->retry_mode;
-		if (ctrl->cfg->set_autoneg)
-			ctrl->cfg->set_autoneg(link->sds, link->retry_neg_mode);
+		rtpcs_sds_apply_autoneg(link, link->retry_neg_mode);
 	}
 
 	link->retry_force = false;
@@ -4472,6 +4538,7 @@ static int rtpcs_pcs_config(struct phylink_pcs *pcs, unsigned int neg_mode,
 {
 	struct rtpcs_link *link = rtpcs_phylink_pcs_to_link(pcs);
 	struct rtpcs_ctrl *ctrl = link->ctrl;
+	int adv;
 	int ret = 0;
 
 	/*
@@ -4486,6 +4553,9 @@ static int rtpcs_pcs_config(struct phylink_pcs *pcs, unsigned int neg_mode,
 	mutex_lock(&ctrl->lock);
 	link->retry_mode = interface;
 	link->retry_neg_mode = neg_mode;
+	adv = rtpcs_pcs_encode_advert(neg_mode, interface, advertising);
+	link->adv_valid = adv >= 0;
+	link->adv_word = link->adv_valid ? adv : 0;
 
 	if (ctrl->cfg->setup_serdes) {
 		if (interface == link->sds->configured_mode) {
@@ -4545,11 +4615,7 @@ static int rtpcs_pcs_config(struct phylink_pcs *pcs, unsigned int neg_mode,
 		}
 	}
 
-	if (ctrl->cfg->set_autoneg) {
-		ret = ctrl->cfg->set_autoneg(link->sds, neg_mode);
-		if (ret < 0)
-			goto out;
-	}
+	ret = rtpcs_sds_apply_autoneg(link, neg_mode);
 
 out:
 	mutex_unlock(&ctrl->lock);
@@ -4999,6 +5065,7 @@ static const struct rtpcs_config rtpcs_930x_cfg = {
 	.mac_rx_pause_sts	= RTPCS_930X_MAC_RX_PAUSE_STS,
 	.mac_tx_pause_sts	= RTPCS_930X_MAC_TX_PAUSE_STS,
 	.serdes_count		= RTPCS_930X_SERDES_CNT,
+	.an_page		= 2,
 	.pcs_ops		= &rtpcs_930x_pcs_ops,
 	.set_autoneg		= rtpcs_93xx_set_autoneg,
 	.setup_serdes		= rtpcs_930x_setup_serdes,
@@ -5023,6 +5090,8 @@ static const struct rtpcs_config rtpcs_931x_cfg = {
 	.mac_rx_pause_sts	= RTPCS_931X_MAC_RX_PAUSE_STS,
 	.mac_tx_pause_sts	= RTPCS_931X_MAC_TX_PAUSE_STS,
 	.serdes_count		= RTPCS_931X_SERDES_CNT,
+	/* Vendor AN uses the digital SerDes; 0x40 selects the digital-1 window. */
+	.an_page		= 0x42,
 	.pcs_ops		= &rtpcs_931x_pcs_ops,
 	.set_autoneg		= rtpcs_93xx_set_autoneg,
 	.setup_serdes		= rtpcs_931x_setup_serdes,
