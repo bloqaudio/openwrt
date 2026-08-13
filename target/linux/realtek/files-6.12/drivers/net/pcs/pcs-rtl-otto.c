@@ -3686,6 +3686,20 @@ static int rtpcs_931x_setup_serdes(struct rtpcs_link *link,
 		rtpcs_sds_write_bits(sds, 0x42, 0x0, 12, 12, 1);
 		rtpcs_sds_write_bits(sds, 0x42, 0x0, 6, 6, 1);
 		rtpcs_sds_write_bits(sds, 0x42, 0x0, 13, 13, 0);
+
+		/*
+		 * _phy_rtl9310_10gMedia_set() PORT_10GMEDIA_FIBER_1G: the lane
+		 * comes up with the LC PLL selected (the ana baseline leaves
+		 * 0x2A/0x07 = 0x800E), which cannot clock a 1.25G link. Wrap the
+		 * PLL switch in the vendor's CMU power-down/up on 0x20/0x0
+		 * [11:10], select the ring PLL, then the fiber media. All of
+		 * these are per-lane (aSds) writes in the vendor sequence.
+		 */
+		rtpcs_sds_write_bits(sds, 0x20, 0x0, 11, 10, 0x0);
+		rtpcs_sds_write_bits(sds, 0x2a, 0x7, 15, 15, 0x0);
+		rtpcs_sds_write_bits(sds, 0x20, 0x0, 11, 10, 0x3);
+
+		rtpcs_sds_write_bits(sds, 0x6, 0xd, 6, 6, 1);
 		break;
 
 	case PHY_INTERFACE_MODE_SGMII:
@@ -3752,6 +3766,24 @@ static int rtpcs_931x_setup_serdes(struct rtpcs_link *link,
 			rtpcs_931x_sds_mii_mode_set(sds, mode);
 		else
 			rtpcs_931x_sds_fiber_mode_set(sds, mode);
+	}
+
+	/*
+	 * 1000BASE-X also needs the analog mode field set to FIBER1G; the mode
+	 * list above does not cover it. The vendor runtime path
+	 * (_phy_rtl9310_10gMedia_set() PORT_10GMEDIA_FIBER_1G) follows the mode
+	 * set with a CMU re-lock tail and a deep SerDes reset so the lane
+	 * re-takes the new clocking.
+	 */
+	if (mode == PHY_INTERFACE_MODE_1000BASEX) {
+		rtpcs_931x_sds_fiber_mode_set(sds, mode);
+
+		rtpcs_sds_write(sds, 0x20, 0x0, 0xc30);
+		rtpcs_sds_write_bits(sds, 0x2a, 0x12, 7, 6, 0x3);
+		rtpcs_sds_write_bits(sds, 0x20, 0x0, 11, 10, 0x1);
+		rtpcs_sds_write_bits(sds, 0x20, 0x0, 11, 10, 0x3);
+
+		rtpcs_931x_sds_reset(sds);
 	}
 
 	/*
