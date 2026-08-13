@@ -1473,13 +1473,15 @@ static void rtl93xx_phylink_mac_link_up(struct dsa_switch *ds, int port,
 	mcr = sw_r32(priv->r->mac_force_mode_ctrl(port));
 
 	if (priv->family_id == RTL9300_FAMILY_ID) {
-		mcr &= ~RTL930X_RX_PAUSE_EN;
-		mcr &= ~RTL930X_TX_PAUSE_EN;
+		mcr &= ~(RTL930X_MAC_FORCE_FC_EN | RTL930X_RX_PAUSE_EN |
+			 RTL930X_TX_PAUSE_EN);
 		mcr &= ~RTL930X_DUPLEX_MODE;
 		mcr &= ~RTL930X_SPEED_MASK;
 		mcr |= RTL930X_FORCE_LINK_EN;
 		mcr |= spdsel << RTL930X_SPEED_SHIFT;
 
+		if (tx_pause || rx_pause)
+			mcr |= RTL930X_MAC_FORCE_FC_EN;
 		if (tx_pause)
 			mcr |= RTL930X_TX_PAUSE_EN;
 		if (rx_pause)
@@ -1495,13 +1497,16 @@ static void rtl93xx_phylink_mac_link_up(struct dsa_switch *ds, int port,
 		 * 1G and the port receives nothing.
 		 */
 		mcr &= ~(RTL931X_SPEED_MASK | RTL931X_DUP_SEL |
-			 RTL931X_TX_PAUSE_EN | RTL931X_RX_PAUSE_EN);
+			 RTL931X_MAC_FORCE_FC_EN | RTL931X_TX_PAUSE_EN |
+			 RTL931X_RX_PAUSE_EN);
 		mcr |= spdsel << RTL931X_SPEED_SHIFT;
 		mcr |= RTL931X_FORCE_SPD_EN | RTL931X_FORCE_DUP_EN |
 		       RTL931X_FORCE_LINK_EN | RTL931X_FORCE_LINK;
 
 		if (duplex == DUPLEX_FULL || priv->lagmembers & BIT_ULL(port))
 			mcr |= RTL931X_DUP_SEL;
+		if (tx_pause || rx_pause)
+			mcr |= RTL931X_MAC_FORCE_FC_EN;
 		if (tx_pause)
 			mcr |= RTL931X_TX_PAUSE_EN;
 		if (rx_pause)
