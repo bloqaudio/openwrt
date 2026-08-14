@@ -215,12 +215,14 @@ struct rtpcs_link {
 	struct device_node *sfp_node;
 	bool sds_setup_done;
 	struct delayed_work retry_work;
+	struct delayed_work c37_poll_work;
 	phy_interface_t retry_mode;
 	unsigned int retry_neg_mode;
 	u16 adv_word;
 	u16 lp_adv_word;
 	bool adv_valid;
 	bool lp_adv_valid;
+	bool c37_poll_enabled;
 	unsigned int retry_attempt;
 	unsigned int retry_bad_samples;
 	unsigned int retry_clean_linkless_samples;
@@ -4617,10 +4619,50 @@ static bool rtpcs_sds_arm_linkless_retry(struct rtpcs_link *link)
 	return true;
 }
 
+static void rtpcs_pcs_c37_poll(struct work_struct *work)
+{
+	struct rtpcs_link *link = container_of(to_delayed_work(work),
+					       struct rtpcs_link, c37_poll_work);
+
+	if (!READ_ONCE(link->c37_poll_enabled))
+		return;
+
+	/* MAC link IRQs do not report changed in-band AN results. A positive
+	 * notification asks phylink to sample the PCS without forcing link down;
+	 * pcs_get_state() emits the one invalidation needed when the completed
+	 * partner advertisement actually changes.
+	 */
+	phylink_pcs_change(&link->pcs, true);
+
+	if (READ_ONCE(link->c37_poll_enabled))
+		mod_delayed_work(system_power_efficient_wq,
+				 &link->c37_poll_work, HZ);
+}
+
+static void rtpcs_pcs_set_c37_poll(struct rtpcs_link *link, bool enable)
+{
+	WRITE_ONCE(link->c37_poll_enabled, enable);
+	if (enable)
+		mod_delayed_work(system_power_efficient_wq,
+				 &link->c37_poll_work, HZ);
+	else
+		cancel_delayed_work_sync(&link->c37_poll_work);
+}
+
+static void rtpcs_pcs_pre_config(struct phylink_pcs *pcs,
+				  phy_interface_t interface)
+{
+	struct rtpcs_link *link = rtpcs_phylink_pcs_to_link(pcs);
+
+	/* Stop the old mode's worker before MAC/PCS reconfiguration begins. */
+	rtpcs_pcs_set_c37_poll(link, false);
+}
+
 static void rtpcs_pcs_disable(struct phylink_pcs *pcs)
 {
 	struct rtpcs_link *link = rtpcs_phylink_pcs_to_link(pcs);
 
+	rtpcs_pcs_set_c37_poll(link, false);
 	cancel_delayed_work_sync(&link->retry_work);
 }
 
@@ -4643,6 +4685,7 @@ static int rtpcs_pcs_config(struct phylink_pcs *pcs, unsigned int neg_mode,
 {
 	struct rtpcs_link *link = rtpcs_phylink_pcs_to_link(pcs);
 	struct rtpcs_ctrl *ctrl = link->ctrl;
+	bool c37_poll;
 	int adv;
 	int ret = 0;
 
@@ -4655,6 +4698,9 @@ static int rtpcs_pcs_config(struct phylink_pcs *pcs, unsigned int neg_mode,
 	dev_warn(ctrl->dev, "pcs_config(%s) for port %d and sds %d not yet fully implemented\n",
 		 phy_modes(interface), link->port, link->sds->id);
 
+	/* Advertisement-only changes do not pass through pcs_pre_config(). */
+	rtpcs_pcs_set_c37_poll(link, false);
+
 	mutex_lock(&ctrl->lock);
 	if (link->retry_mode != interface)
 		link->lp_adv_valid = false;
@@ -4665,6 +4711,7 @@ static int rtpcs_pcs_config(struct phylink_pcs *pcs, unsigned int neg_mode,
 	link->adv_word = link->adv_valid ? adv : 0;
 	if (!link->adv_valid)
 		link->lp_adv_valid = false;
+	c37_poll = ctrl->cfg->an_page && link->adv_valid;
 
 	if (ctrl->cfg->setup_serdes) {
 		if (interface == link->sds->configured_mode) {
@@ -4727,7 +4774,10 @@ static int rtpcs_pcs_config(struct phylink_pcs *pcs, unsigned int neg_mode,
 	ret = rtpcs_sds_apply_autoneg(link, neg_mode);
 
 out:
+	if (ret < 0)
+		c37_poll = false;
 	mutex_unlock(&ctrl->lock);
+	rtpcs_pcs_set_c37_poll(link, c37_poll);
 
 	return ret;
 }
@@ -4797,9 +4847,8 @@ struct phylink_pcs *rtpcs_create(struct device *dev, struct device_node *np, int
 	link->sds = &ctrl->serdes[sds_id];
 	link->pcs.ops = ctrl->cfg->pcs_ops;
 	link->pcs.neg_mode = true;
-	/* MAC link IRQs do not report changed in-band AN results. */
-	link->pcs.poll = !!ctrl->cfg->an_page;
 	INIT_DELAYED_WORK(&link->retry_work, rtpcs_sds_setup_retry);
+	INIT_DELAYED_WORK(&link->c37_poll_work, rtpcs_pcs_c37_poll);
 
 	ctrl->link[port] = link;
 
@@ -5132,6 +5181,7 @@ static const struct phylink_pcs_ops rtpcs_838x_pcs_ops = {
 	.pcs_an_restart		= rtpcs_pcs_an_restart,
 	.pcs_disable		= rtpcs_pcs_disable,
 	.pcs_enable		= rtpcs_pcs_enable,
+	.pcs_pre_config		= rtpcs_pcs_pre_config,
 	.pcs_config		= rtpcs_pcs_config,
 	.pcs_get_state		= rtpcs_pcs_get_state,
 };
@@ -5154,6 +5204,7 @@ static const struct phylink_pcs_ops rtpcs_839x_pcs_ops = {
 	.pcs_an_restart		= rtpcs_pcs_an_restart,
 	.pcs_disable		= rtpcs_pcs_disable,
 	.pcs_enable		= rtpcs_pcs_enable,
+	.pcs_pre_config		= rtpcs_pcs_pre_config,
 	.pcs_config		= rtpcs_pcs_config,
 	.pcs_get_state		= rtpcs_pcs_get_state,
 };
@@ -5174,6 +5225,7 @@ static const struct phylink_pcs_ops rtpcs_930x_pcs_ops = {
 	.pcs_an_restart		= rtpcs_pcs_an_restart,
 	.pcs_disable		= rtpcs_pcs_disable,
 	.pcs_enable		= rtpcs_pcs_enable,
+	.pcs_pre_config		= rtpcs_pcs_pre_config,
 	.pcs_config		= rtpcs_pcs_config,
 	.pcs_get_state		= rtpcs_pcs_get_state,
 };
@@ -5199,6 +5251,7 @@ static const struct phylink_pcs_ops rtpcs_931x_pcs_ops = {
 	.pcs_an_restart		= rtpcs_pcs_an_restart,
 	.pcs_disable		= rtpcs_pcs_disable,
 	.pcs_enable		= rtpcs_pcs_enable,
+	.pcs_pre_config		= rtpcs_pcs_pre_config,
 	.pcs_config		= rtpcs_pcs_config,
 	.pcs_get_state		= rtpcs_pcs_get_state,
 };
