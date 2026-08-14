@@ -218,7 +218,9 @@ struct rtpcs_link {
 	phy_interface_t retry_mode;
 	unsigned int retry_neg_mode;
 	u16 adv_word;
+	u16 lp_adv_word;
 	bool adv_valid;
+	bool lp_adv_valid;
 	unsigned int retry_attempt;
 	unsigned int retry_bad_samples;
 	unsigned int retry_clean_linkless_samples;
@@ -3868,6 +3870,71 @@ static int rtpcs_931x_recover_serdes(struct rtpcs_serdes *sds,
 
 /* Common functions */
 
+static bool rtpcs_pcs_get_c37_state(struct rtpcs_link *link,
+				     struct phylink_link_state *state)
+{
+	struct rtpcs_ctrl *ctrl = link->ctrl;
+	u16 lp_adv_word;
+	bool lp_adv_changed = false;
+	int bmsr, lpa;
+
+	if (!ctrl->cfg->an_page ||
+	    (state->interface != PHY_INTERFACE_MODE_1000BASEX &&
+	     state->interface != PHY_INTERFACE_MODE_2500BASEX) ||
+	    !linkmode_test_bit(ETHTOOL_LINK_MODE_Autoneg_BIT,
+			       state->advertising))
+		return false;
+
+	mutex_lock(&ctrl->lock);
+	if (!link->adv_valid) {
+		mutex_unlock(&ctrl->lock);
+		return false;
+	}
+
+	/* Keep the latched-low BMSR value for phylink to observe. */
+	bmsr = rtpcs_sds_read(link->sds, ctrl->cfg->an_page, MII_BMSR);
+	lpa = rtpcs_sds_read(link->sds, ctrl->cfg->an_page, MII_LPA);
+	if (bmsr >= 0 && lpa >= 0) {
+		if (!(bmsr & BMSR_LSTATUS)) {
+			link->lp_adv_valid = false;
+		} else if (bmsr & BMSR_ANEGCOMPLETE) {
+			lp_adv_word = lpa & RTPCS_SDS_ADVERT_MASK;
+			lp_adv_changed = link->lp_adv_valid &&
+					 link->lp_adv_word != lp_adv_word;
+			link->lp_adv_word = lp_adv_word;
+			link->lp_adv_valid = true;
+		}
+	}
+	mutex_unlock(&ctrl->lock);
+
+	if (bmsr < 0 || lpa < 0) {
+		state->link = false;
+		return true;
+	}
+
+	phylink_mii_c22_pcs_decode_state(state, bmsr, lpa);
+
+	/* A changed completed result is a PCS state event even when link
+	 * status remains up.
+	 */
+	if (lp_adv_changed)
+		phylink_pcs_change(&link->pcs, false);
+
+	return true;
+}
+
+static void rtpcs_pcs_note_link_seen(struct rtpcs_link *link)
+{
+	/* pcs_get_state() is also the event path behind phylink's Link is Up
+	 * report. Latch a link seen while the retry worker is settling so a
+	 * short-lived result cannot be lost between worker samples. The retry
+	 * worker owns the state under ctrl->lock; this callback only sets the
+	 * monotonic observation bit, so READ_ONCE/WRITE_ONCE is sufficient.
+	 */
+	if (READ_ONCE(link->retry_settling))
+		WRITE_ONCE(link->retry_link_seen, true);
+}
+
 static void rtpcs_pcs_get_state(struct phylink_pcs *pcs, struct phylink_link_state *state)
 {
 	struct rtpcs_link *link = rtpcs_phylink_pcs_to_link(pcs);
@@ -3880,6 +3947,12 @@ static void rtpcs_pcs_get_state(struct phylink_pcs *pcs, struct phylink_link_sta
 	state->duplex = DUPLEX_UNKNOWN;
 	state->pause &= ~(MLO_PAUSE_RX | MLO_PAUSE_TX);
 
+	if (rtpcs_pcs_get_c37_state(link, state)) {
+		if (state->link)
+			rtpcs_pcs_note_link_seen(link);
+		return;
+	}
+
 	/* Read MAC side link twice */
 	for (int i = 0; i < 2; i++)
 		linkup = rtpcs_regmap_read_bits(ctrl, ctrl->cfg->mac_link_sts, port, port);
@@ -3888,14 +3961,7 @@ static void rtpcs_pcs_get_state(struct phylink_pcs *pcs, struct phylink_link_sta
 		return;
 
 	state->link = 1;
-	/* pcs_get_state() is also the event path behind phylink's Link is Up
-	 * report. Latch a link seen while the retry worker is settling so a
-	 * short-lived result cannot be lost between worker samples. The retry
-	 * worker owns the state under ctrl->lock; this callback only sets the
-	 * monotonic observation bit, so READ_ONCE/WRITE_ONCE is sufficient.
-	 */
-	if (READ_ONCE(link->retry_settling))
-		WRITE_ONCE(link->retry_link_seen, true);
+	rtpcs_pcs_note_link_seen(link);
 
 	/*
 	 * Fixed-speed SerDes modes: the MAC speed status only reflects the
@@ -3955,6 +4021,7 @@ static void rtpcs_pcs_an_restart(struct phylink_pcs *pcs)
 {
 	struct rtpcs_link *link = rtpcs_phylink_pcs_to_link(pcs);
 	struct rtpcs_ctrl *ctrl = link->ctrl;
+	int ret;
 
 	if (!ctrl->cfg->an_page) {
 		dev_warn(ctrl->dev, "an_restart() for port %d and sds %d not yet implemented\n",
@@ -3963,9 +4030,15 @@ static void rtpcs_pcs_an_restart(struct phylink_pcs *pcs)
 	}
 
 	mutex_lock(&ctrl->lock);
-	rtpcs_sds_modify(link->sds, ctrl->cfg->an_page, MII_BMCR,
-			 BMCR_ANRESTART, BMCR_ANRESTART);
+	ret = rtpcs_sds_modify(link->sds, ctrl->cfg->an_page, MII_BMCR,
+			       BMCR_ANRESTART, BMCR_ANRESTART);
 	mutex_unlock(&ctrl->lock);
+
+	/* The PCS keeps link status up across AN restart, so invalidate the
+	 * previous resolution and let phylink program the new result.
+	 */
+	if (!ret)
+		phylink_pcs_change(pcs, false);
 }
 
 static bool rtpcs_mac_link_up(struct rtpcs_link *link)
@@ -4583,11 +4656,15 @@ static int rtpcs_pcs_config(struct phylink_pcs *pcs, unsigned int neg_mode,
 		 phy_modes(interface), link->port, link->sds->id);
 
 	mutex_lock(&ctrl->lock);
+	if (link->retry_mode != interface)
+		link->lp_adv_valid = false;
 	link->retry_mode = interface;
 	link->retry_neg_mode = neg_mode;
 	adv = rtpcs_pcs_encode_advert(neg_mode, interface, advertising);
 	link->adv_valid = adv >= 0;
 	link->adv_word = link->adv_valid ? adv : 0;
+	if (!link->adv_valid)
+		link->lp_adv_valid = false;
 
 	if (ctrl->cfg->setup_serdes) {
 		if (interface == link->sds->configured_mode) {
@@ -4720,6 +4797,8 @@ struct phylink_pcs *rtpcs_create(struct device *dev, struct device_node *np, int
 	link->sds = &ctrl->serdes[sds_id];
 	link->pcs.ops = ctrl->cfg->pcs_ops;
 	link->pcs.neg_mode = true;
+	/* MAC link IRQs do not report changed in-band AN results. */
+	link->pcs.poll = !!ctrl->cfg->an_page;
 	INIT_DELAYED_WORK(&link->retry_work, rtpcs_sds_setup_retry);
 
 	ctrl->link[port] = link;
