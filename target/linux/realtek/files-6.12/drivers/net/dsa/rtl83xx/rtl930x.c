@@ -3618,7 +3618,7 @@ static int rtl930x_qos_shaper_set(struct rtl838x_switch_priv *priv, int port,
 		min_burst = 3 * tkn;
 		ret = rtl83xx_qos_shaper_validate(priv, port, queue,
 						 rate_bytes_ps, min_burst,
-						 RTL930X_EGBW_Q_BURST_M, &rate,
+						 RTL930X_EGBW_Q_BURST_MAX, &rate,
 						 &burst);
 		if (ret)
 			return ret;

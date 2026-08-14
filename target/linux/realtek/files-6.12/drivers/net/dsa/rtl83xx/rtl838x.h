@@ -771,6 +771,11 @@ typedef enum {
 #define RTL930X_EGBW_Q_RATE_M			GENMASK(19, 0)
 #define RTL930X_EGBW_Q_EN			BIT(20)
 #define RTL930X_EGBW_Q_BURST_M			GENMASK(15, 0)
+/* The bucket stops limiting as the burst nears the field maximum: 64000 shapes
+ * exactly, 64512 leaks, and at 65535 the shaper passes line rate. Clamp to the
+ * largest burst that shapes rather than to the field width.
+ */
+#define RTL930X_EGBW_Q_BURST_MAX		(64 * 1000)
 /* SWRED (simple WRED): per-port congestion avoidance algorithm select,
  * one bit per port (0 = tail drop, 1 = SWRED). Thresholds and drop
  * probability are per queue and drop precedence in units of 256-byte
