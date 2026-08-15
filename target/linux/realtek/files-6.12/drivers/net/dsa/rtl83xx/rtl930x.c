@@ -424,15 +424,8 @@ static void rtldsa_930x_enable_learning(int port, bool enable)
 
 static void rtldsa_930x_enable_flood(int port, bool enable)
 {
-	/* 0: forward
-	 * 1: drop
-	 * 2: trap to local CPU
-	 * 3: copy to local CPU
-	 * 4: trap to master CPU
-	 * 5: copy to master CPU
-	 */
-	sw_w32_mask(GENMASK(2, 0), enable ? 0 : 1,
-		    RTL930X_L2_LRN_PORT_CONSTRT_CTRL + port * 4);
+	sw_w32_mask(BIT(port), enable ? BIT(port) : 0,
+		    RTL930X_L2_UNKN_UC_FLD_PMSK);
 }
 
 static void rtldsa_930x_enable_mcast_flood(int port, bool enable)
