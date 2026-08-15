@@ -889,11 +889,15 @@ static const struct file_operations swred_fops = {
 	.read = swred_read,
 };
 
-/* Egress remarking state (read-only). There is no kernel API for egress
- * 1p/DSCP/DEI remarking on DSA ports (the DCBNL app table covers ingress
- * classification only), so the remark engine state is exposed here for
- * inspection. The driver leaves the engine untouched: all per-port
- * enables are clear, which keeps the original header fields on egress.
+/* Egress remarking state (read-only). DCB does define an egress rewrite
+ * table (dcbnl_setrewr/delrewr, priority to PCP and priority to DSCP), but
+ * DSA does not plumb it: dsa_user_dcbnl_* implements only apptrust,
+ * default_prio and dscp_prio, all ingress classification. Wiring the remark
+ * engine therefore needs rewrite support in the DSA core first, not just a
+ * driver change. DEI has no rewrite entry in any case. State is exposed here
+ * for inspection meanwhile. The driver leaves the engine untouched: all
+ * per-port enables are clear, which keeps the original header fields on
+ * egress.
  */
 static ssize_t remark_read(struct file *filp, char __user *buffer,
 			   size_t count, loff_t *ppos)
