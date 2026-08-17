@@ -3593,7 +3593,9 @@ static void rtl931x_host_route_read(int idx, struct rtl83xx_route *rt)
 		break;
 	case 1: /* IPv4 multicast */
 	case 3: /* IPv6 multicast */
-		pr_warn("%s: route type %d not supported\n", __func__, rt->attr.type);
+		/* Multicast entries share this table; the unicast decoder
+		 * only needs the type so a bucket scan can skip them.
+		 */
 		goto out;
 	}
 
@@ -4524,6 +4526,580 @@ static void rtl931x_set_l3_nexthop(int idx, u16 dmac_id, u16 interface)
 	rtl_table_release(r);
 }
 
+/* Multicast routing.
+ *
+ * Multicast host routes share the unicast host table (access set 2 type
+ * 3) and are told apart by ENTRY_TYPE, but an entry is wider: an IPv4
+ * group spans 2 consecutive logical slots (L3_HOST_ROUTE_IPMC_0/_1), an
+ * IPv6 group 6 (L3_HOST_ROUTE_IP6MC_0..5, the last four 64 bits wide).
+ * VALID, FMT, ENTRY_TYPE and IPMC_TYPE are replicated into every slot.
+ * The entry carries no portmask: OIL_IDX names the head element of a
+ * singly-linked list in L3_EGR_INTF_LIST (type 9), each element pairing
+ * one egress L3 interface with a multicast portmask group.
+ * IPMC_TYPE must be 1 because L3_HOST_TBL_CTRL.LU_MODE_SEL selects
+ * forced lookup mode; a 0 there yields an entry that is valid and never
+ * matches.
+ */
+#define RTL931X_L3_EGR_INTF_LIST_SIZE		16384
+/* Field maximum of the multicast route entry's MTU_MAX */
+#define RTL931X_MC_MTU_MAX			0x3fff
+
+/* Extract len bits starting at bit lsb, so the hash rows below can be
+ * compared field by field against the SDK row builders.
+ */
+#define RTL931X_HASH_BITS(v, lsb, len)	(((u32)(v) >> (lsb)) & ((1U << (len)) - 1))
+
+/* (*,G) is not a mask bit: an all-ones source is the wildcard sentinel in
+ * the key, and the hash consumes the same all-ones value, so both the
+ * key write and the hash have to see the translated source.
+ */
+static u32 rtl931x_mc_key_sip(u32 src_ip)
+{
+	return src_ip ? src_ip : ~0U;
+}
+
+static void rtl931x_mc_key_sip6(struct in6_addr *key, const struct in6_addr *src)
+{
+	if (ipv6_addr_any(src))
+		memset(key, 0xff, sizeof(*key));
+	else
+		*key = *src;
+}
+
+static bool rtl931x_mc_key_sip6_wildcard(const struct in6_addr *key)
+{
+	for (int i = 0; i < 16; i++)
+		if (key->s6_addr[i] != 0xff)
+			return false;
+
+	return true;
+}
+
+/* RPF_FAIL_ACT does not use the ROUTE_ACT_* encoding: hardware means
+ * 0 TRAP, 1 DROP, 2 COPY, 3 ASSERT_CHK. A zeroed field therefore traps
+ * rather than drops, and there is no forward-on-failure encoding, so
+ * anything the shared code cannot express traps and the kernel decides.
+ */
+static u32 rtl931x_mc_rpf_act_to_hw(u8 action)
+{
+	switch (action) {
+	case ROUTE_ACT_DROP:
+		return 1;
+	case ROUTE_ACT_COPY2CPU:
+		return 2;
+	default:
+		return 0;
+	}
+}
+
+static u8 rtl931x_mc_rpf_act_from_hw(u32 v)
+{
+	switch (v) {
+	case 1:
+		return ROUTE_ACT_DROP;
+	case 2:
+		return ROUTE_ACT_COPY2CPU;
+	default:
+		return ROUTE_ACT_TRAP2CPU;
+	}
+}
+
+/* IPv4 multicast host-route hash. The key is {VRF, SIP, GIP, VLAN/INTF};
+ * hash-key mode VRF_SIP_GIP masks the VLAN/interface component to zero,
+ * so it contributes nothing and is not passed in. Algorithm 0 XORs every
+ * row, algorithm 1 sums the source and group rows with end-around carry
+ * into 10 bits and XORs the VRF row into the result.
+ */
+static u32 rtl931x_mc_hash4(u32 vrf, u32 sip, u32 gip, int algorithm)
+{
+	u32 h;
+
+	if (!algorithm) {
+		h  = (RTL931X_HASH_BITS(vrf, 0, 5) << 5) | RTL931X_HASH_BITS(vrf, 5, 3);
+		h ^= RTL931X_HASH_BITS(sip, 27, 5);
+		h ^= RTL931X_HASH_BITS(sip, 17, 10);
+		h ^= RTL931X_HASH_BITS(sip, 7, 10);
+		h ^= RTL931X_HASH_BITS(sip, 0, 7) << 3;
+		h ^= RTL931X_HASH_BITS(gip, 30, 2);
+		h ^= RTL931X_HASH_BITS(gip, 20, 10);
+		h ^= RTL931X_HASH_BITS(gip, 10, 10);
+		h ^= RTL931X_HASH_BITS(gip, 0, 10);
+
+		return h;
+	}
+
+	h  = RTL931X_HASH_BITS(sip, 30, 2);
+	h += RTL931X_HASH_BITS(sip, 20, 10);
+	h  = (h & 0x3ff) + (h >> 10);
+	h += RTL931X_HASH_BITS(sip, 10, 10);
+	h  = (h & 0x3ff) + (h >> 10);
+	h += RTL931X_HASH_BITS(sip, 0, 10);
+	h  = (h & 0x3ff) + (h >> 10);
+	h += RTL931X_HASH_BITS(gip, 30, 2);
+	h  = (h & 0x3ff) + (h >> 10);
+	h += RTL931X_HASH_BITS(gip, 20, 10);
+	h  = (h & 0x3ff) + (h >> 10);
+	h += RTL931X_HASH_BITS(gip, 10, 10);
+	h  = (h & 0x3ff) + (h >> 10);
+	h += RTL931X_HASH_BITS(gip, 0, 10);
+	h  = (h & 0x3ff) + (h >> 10);
+	h ^= (RTL931X_HASH_BITS(vrf, 0, 4) << 6) | RTL931X_HASH_BITS(vrf, 4, 4);
+
+	return h;
+}
+
+/* IPv6 multicast host-route hash; see rtl931x_mc_hash4() for the key
+ * posture. The source and the group are folded with different octet
+ * groupings, so neither share nor reorder the rows.
+ */
+static u32 rtl931x_mc_hash6(const struct in6_addr *sip6,
+			    const struct in6_addr *gip6, int algorithm)
+{
+	const u8 *s = sip6->s6_addr;
+	const u8 *g = gip6->s6_addr;
+	u32 h;
+
+	if (!algorithm) {
+		h  = (RTL931X_HASH_BITS(s[0], 0, 7) << 3) | RTL931X_HASH_BITS(s[1], 5, 3);
+		h ^= (RTL931X_HASH_BITS(s[1], 0, 5) << 5) | RTL931X_HASH_BITS(s[2], 3, 5);
+		h ^= (RTL931X_HASH_BITS(s[2], 0, 3) << 7) | RTL931X_HASH_BITS(s[3], 1, 7);
+		h ^= (RTL931X_HASH_BITS(s[3], 0, 1) << 9) |
+		     (RTL931X_HASH_BITS(s[4], 0, 8) << 1) | RTL931X_HASH_BITS(s[5], 7, 1);
+		h ^= (RTL931X_HASH_BITS(s[5], 0, 7) << 3) | RTL931X_HASH_BITS(s[6], 5, 3);
+		h ^= (RTL931X_HASH_BITS(s[6], 0, 5) << 5) | RTL931X_HASH_BITS(s[7], 3, 5);
+		h ^= (RTL931X_HASH_BITS(s[7], 0, 3) << 7) | RTL931X_HASH_BITS(s[8], 1, 7);
+		h ^= (RTL931X_HASH_BITS(s[8], 0, 1) << 9) |
+		     (RTL931X_HASH_BITS(s[9], 0, 8) << 1) | RTL931X_HASH_BITS(s[10], 7, 1);
+		h ^= (RTL931X_HASH_BITS(s[10], 0, 7) << 3) | RTL931X_HASH_BITS(s[11], 5, 3);
+		h ^= (RTL931X_HASH_BITS(s[11], 0, 5) << 5) | RTL931X_HASH_BITS(s[12], 3, 5);
+		h ^= (RTL931X_HASH_BITS(s[12], 0, 3) << 7) | RTL931X_HASH_BITS(s[13], 1, 7);
+		h ^= (RTL931X_HASH_BITS(s[13], 0, 1) << 9) |
+		     (RTL931X_HASH_BITS(s[14], 0, 8) << 1) | RTL931X_HASH_BITS(s[15], 7, 1);
+		h ^= (RTL931X_HASH_BITS(s[15], 0, 7) << 3) | RTL931X_HASH_BITS(s[0], 7, 1);
+
+		h ^= g[0];
+		h ^= ((u32)g[1] << 2) | RTL931X_HASH_BITS(g[2], 6, 2);
+		h ^= (RTL931X_HASH_BITS(g[2], 0, 6) << 4) | RTL931X_HASH_BITS(g[3], 4, 4);
+		h ^= (RTL931X_HASH_BITS(g[3], 0, 4) << 6) | RTL931X_HASH_BITS(g[4], 2, 6);
+		h ^= (RTL931X_HASH_BITS(g[4], 0, 2) << 8) | g[5];
+		h ^= ((u32)g[6] << 2) | RTL931X_HASH_BITS(g[7], 6, 2);
+		h ^= (RTL931X_HASH_BITS(g[7], 0, 6) << 4) | RTL931X_HASH_BITS(g[8], 4, 4);
+		h ^= (RTL931X_HASH_BITS(g[8], 0, 4) << 6) | RTL931X_HASH_BITS(g[9], 2, 6);
+		h ^= (RTL931X_HASH_BITS(g[9], 0, 2) << 8) | g[10];
+		h ^= ((u32)g[11] << 2) | RTL931X_HASH_BITS(g[12], 6, 2);
+		h ^= (RTL931X_HASH_BITS(g[12], 0, 6) << 4) | RTL931X_HASH_BITS(g[13], 4, 4);
+		h ^= (RTL931X_HASH_BITS(g[13], 0, 4) << 6) | RTL931X_HASH_BITS(g[14], 2, 6);
+		h ^= (RTL931X_HASH_BITS(g[14], 0, 2) << 8) | g[15];
+
+		return h;
+	}
+
+	/* Only the low four octets of each address are summed; the upper
+	 * twelve are XORed in afterwards.
+	 */
+	h  = RTL931X_HASH_BITS(s[12], 6, 2);
+	h += (RTL931X_HASH_BITS(s[12], 0, 6) << 4) | RTL931X_HASH_BITS(s[13], 4, 4);
+	h  = (h & 0x3ff) + (h >> 10);
+	h += (RTL931X_HASH_BITS(s[13], 0, 4) << 6) | RTL931X_HASH_BITS(s[14], 2, 6);
+	h  = (h & 0x3ff) + (h >> 10);
+	h += (RTL931X_HASH_BITS(s[14], 0, 2) << 8) | s[15];
+	h  = (h & 0x3ff) + (h >> 10);
+	h += RTL931X_HASH_BITS(g[12], 6, 2);
+	h  = (h & 0x3ff) + (h >> 10);
+	h += (RTL931X_HASH_BITS(g[12], 0, 6) << 4) | RTL931X_HASH_BITS(g[13], 4, 4);
+	h  = (h & 0x3ff) + (h >> 10);
+	h += (RTL931X_HASH_BITS(g[13], 0, 4) << 6) | RTL931X_HASH_BITS(g[14], 2, 6);
+	h  = (h & 0x3ff) + (h >> 10);
+	h += (RTL931X_HASH_BITS(g[14], 0, 2) << 8) | g[15];
+	h  = (h & 0x3ff) + (h >> 10);
+
+	h ^= RTL931X_HASH_BITS(s[0], 2, 6);
+	h ^= (RTL931X_HASH_BITS(s[0], 0, 2) << 8) | s[1];
+	h ^= ((u32)s[2] << 2) | RTL931X_HASH_BITS(s[3], 6, 2);
+	h ^= (RTL931X_HASH_BITS(s[3], 0, 6) << 4) | RTL931X_HASH_BITS(s[4], 4, 4);
+	h ^= (RTL931X_HASH_BITS(s[4], 0, 4) << 6) | RTL931X_HASH_BITS(s[5], 2, 6);
+	h ^= (RTL931X_HASH_BITS(s[5], 0, 2) << 8) | s[6];
+	h ^= ((u32)s[7] << 2) | RTL931X_HASH_BITS(s[8], 6, 2);
+	h ^= (RTL931X_HASH_BITS(s[8], 0, 6) << 4) | RTL931X_HASH_BITS(s[9], 4, 4);
+	h ^= (RTL931X_HASH_BITS(s[9], 0, 4) << 6) | RTL931X_HASH_BITS(s[10], 2, 6);
+	h ^= (RTL931X_HASH_BITS(s[10], 0, 2) << 8) | s[11];
+
+	h ^= ((u32)g[0] << 2) | RTL931X_HASH_BITS(g[1], 6, 2);
+	h ^= (RTL931X_HASH_BITS(g[1], 0, 6) << 4) | RTL931X_HASH_BITS(g[2], 4, 4);
+	h ^= (RTL931X_HASH_BITS(g[2], 0, 4) << 6) | RTL931X_HASH_BITS(g[3], 2, 6);
+	h ^= (RTL931X_HASH_BITS(g[3], 0, 2) << 8) | g[4];
+	h ^= ((u32)g[5] << 2) | RTL931X_HASH_BITS(g[6], 6, 2);
+	h ^= (RTL931X_HASH_BITS(g[6], 0, 6) << 4) | RTL931X_HASH_BITS(g[7], 4, 4);
+	h ^= (RTL931X_HASH_BITS(g[7], 0, 4) << 6) | RTL931X_HASH_BITS(g[8], 2, 6);
+	h ^= (RTL931X_HASH_BITS(g[8], 0, 2) << 8) | g[9];
+	h ^= ((u32)g[10] << 2) | RTL931X_HASH_BITS(g[11], 6, 2);
+	h ^= RTL931X_HASH_BITS(g[11], 0, 6) << 4;
+
+	return h;
+}
+
+/* VALID, FMT = 0 (host entry), ENTRY_TYPE and IPMC_TYPE = 1, replicated
+ * into every slot of an entry. The four fields sit at the same word-0
+ * positions in the 128-bit and the 64-bit slot formats.
+ */
+static u32 rtl931x_mc_slot_hdr(u8 type)
+{
+	return BIT(31) | ((u32)(type & 0x3) << 28) | BIT(27);
+}
+
+/* A 32-bit key field split 27/5 across the first two words: the IPv4
+ * group in slot 1 and the leading IPv6 group octets in slot 3.
+ */
+static void rtl931x_mc_pack32(u32 *d, u32 v)
+{
+	d[0] |= v >> 5;
+	d[1] |= (v & 0x1f) << 27;
+}
+
+static u32 rtl931x_mc_unpack32(const u32 *d)
+{
+	return ((d[0] & 0x7ffffff) << 5) | (d[1] >> 27);
+}
+
+/* A 48-bit key field split 27/21, used by every IPv6 continuation slot. */
+static void rtl931x_mc_pack48(u32 *d, u64 v)
+{
+	d[0] |= (u32)(v >> 21);
+	d[1] |= ((u32)v & 0x1fffff) << 11;
+}
+
+static u64 rtl931x_mc_unpack48(const u32 *d)
+{
+	return ((u64)(d[0] & 0x7ffffff) << 21) | (d[1] >> 11);
+}
+
+/* The 64-bit slot formats live in the first two data words; the rest of
+ * the physical slot is unused and written as zero, as for the IPv6
+ * unicast continuations.
+ */
+static void rtl931x_mc_slot_write(struct table_reg *r, int idx, const u32 *d)
+{
+	for (int i = 0; i < 4; i++)
+		sw_w32(d[i], rtl_table_data(r, i));
+	rtl_table_write(r, rtl931x_l3_idx_to_addr(idx));
+}
+
+static void rtl931x_mc_slot_read(struct table_reg *r, int idx, u32 *d)
+{
+	rtl_table_read(r, rtl931x_l3_idx_to_addr(idx));
+	for (int i = 0; i < 4; i++)
+		d[i] = sw_r32(rtl_table_data(r, i));
+}
+
+/* Read a multicast host route by logical index. A unicast entry at idx
+ * is reported as invalid so a bucket scan can walk over it.
+ */
+static void rtl931x_mc_route_read(int idx, struct rtl83xx_route *rt)
+{
+	struct table_reg *r = rtl_table_get(RTL9310_TBL_2, 3);
+	u32 d[4], sip;
+
+	rtl931x_mc_slot_read(r, idx, d);
+
+	rt->attr.valid = !!(d[0] & BIT(31));
+	if (!rt->attr.valid)
+		goto out;
+	rt->attr.type = (d[0] >> 28) & 0x3;
+	if (rt->attr.type != 1 && rt->attr.type != 3) {
+		rt->attr.valid = false;
+		goto out;
+	}
+
+	rt->attr.action = (d[2] >> 10) & 0x3;
+	rt->attr.hit = !!(d[3] & BIT(15));
+	rt->mc.rpf_check = !!(d[2] & BIT(9));
+	rt->mc.rpf_fail_action = rtl931x_mc_rpf_act_from_hw((d[2] >> 7) & 0x3);
+	rt->mc.oif_idx = ((d[2] & 0x7f) << 7) | (d[3] >> 25);
+	rt->mc.oif_valid = !!(d[3] & BIT(24));
+	rt->mc.ttl_min = (d[3] >> 16) & 0xff;
+	sip = ((d[0] & 0x7ffff) << 13) | (d[1] >> 19);
+
+	rtl931x_mc_slot_read(r, idx + 1, d);
+	rt->mc.rpf_vid = ((d[2] & 0x7ff) << 1) | (d[3] >> 31);
+
+	if (rt->attr.type == 1) {
+		rt->dst_ip = rtl931x_mc_unpack32(d);
+		rt->src_ip = sip == ~0U ? 0 : sip;
+		goto out;
+	}
+
+	rtl931x_ip6_word_set(&rt->src_ip6, 0, sip);
+	rtl931x_ip6_chunk48_set(&rt->src_ip6, 4, rtl931x_mc_unpack48(d));
+	rtl931x_mc_slot_read(r, idx + 2, d);
+	rtl931x_ip6_chunk48_set(&rt->src_ip6, 10, rtl931x_mc_unpack48(d));
+	rtl931x_mc_slot_read(r, idx + 3, d);
+	rtl931x_ip6_word_set(&rt->dst_ip6, 0, rtl931x_mc_unpack32(d));
+	rtl931x_mc_slot_read(r, idx + 4, d);
+	rtl931x_ip6_chunk48_set(&rt->dst_ip6, 4, rtl931x_mc_unpack48(d));
+	rtl931x_mc_slot_read(r, idx + 5, d);
+	rtl931x_ip6_chunk48_set(&rt->dst_ip6, 10, rtl931x_mc_unpack48(d));
+
+	if (rtl931x_mc_key_sip6_wildcard(&rt->src_ip6))
+		memset(&rt->src_ip6, 0, sizeof(rt->src_ip6));
+
+out:
+	rtl_table_release(r);
+}
+
+/* Write a multicast host route by logical index.
+ *
+ * Slot 0 carries the VALID the lookup keys on, so the continuation slots
+ * holding the rest of the key are written first on create and cleared
+ * last on teardown. The reverse order would leave a valid entry whose
+ * key or output list is half updated, which mis-forwards traffic.
+ */
+static void rtl931x_mc_route_write(int idx, struct rtl83xx_route *rt)
+{
+	struct table_reg *r = rtl_table_get(RTL9310_TBL_2, 3);
+	struct in6_addr sip6;
+	u32 d[4], hdr, sip;
+	int width;
+
+	if (rt->attr.type != 1 && rt->attr.type != 3) {
+		pr_warn("%s: route type %d is not multicast\n", __func__, rt->attr.type);
+		rtl_table_release(r);
+		return;
+	}
+
+	width = rt->attr.type == 3 ? 6 : 2;
+	hdr = rtl931x_mc_slot_hdr(rt->attr.type);
+	memset(d, 0, sizeof(d));
+
+	if (!rt->attr.valid) {
+		for (int k = 0; k < width; k++)
+			rtl931x_mc_slot_write(r, idx + k, d);
+		goto out;
+	}
+
+	/* L3_RPF_ID holds a VLAN because MC_KEY_SEL below selects VLAN mode; in
+	 * interface-id mode the same field would have to carry an L3 interface
+	 * index instead. The two must always be changed together.
+	 *
+	 * MTU_MAX is a per-route byte limit, not an index into an MTU table as
+	 * on Longan, and exceeding it copies the packet to the CPU. Leaving it
+	 * at zero would punt every routed multicast frame, so the check is
+	 * parked at the field maximum and the egress interface MTU governs.
+	 */
+	d[0] = hdr;
+	d[2] = (rt->mc.rpf_vid >> 1) & 0x7ff;
+	d[3] = ((u32)(rt->mc.rpf_vid & 0x1) << 31) | (RTL931X_MC_MTU_MAX << 17);
+	if (rt->attr.type == 1) {
+		sip = rtl931x_mc_key_sip(rt->src_ip);
+		rtl931x_mc_pack32(d, rt->dst_ip);
+		rtl931x_mc_slot_write(r, idx + 1, d);
+	} else {
+		rtl931x_mc_key_sip6(&sip6, &rt->src_ip6);
+		sip = rtl931x_ip6_word(&sip6, 0);
+		rtl931x_mc_pack48(d, rtl931x_ip6_chunk48(&sip6, 4));
+		rtl931x_mc_slot_write(r, idx + 1, d);
+
+		memset(d, 0, sizeof(d));
+		d[0] = hdr;
+		rtl931x_mc_pack48(d, rtl931x_ip6_chunk48(&sip6, 10));
+		rtl931x_mc_slot_write(r, idx + 2, d);
+
+		memset(d, 0, sizeof(d));
+		d[0] = hdr;
+		rtl931x_mc_pack32(d, rtl931x_ip6_word(&rt->dst_ip6, 0));
+		rtl931x_mc_slot_write(r, idx + 3, d);
+
+		memset(d, 0, sizeof(d));
+		d[0] = hdr;
+		rtl931x_mc_pack48(d, rtl931x_ip6_chunk48(&rt->dst_ip6, 4));
+		rtl931x_mc_slot_write(r, idx + 4, d);
+
+		memset(d, 0, sizeof(d));
+		d[0] = hdr;
+		rtl931x_mc_pack48(d, rtl931x_ip6_chunk48(&rt->dst_ip6, 10));
+		rtl931x_mc_slot_write(r, idx + 5, d);
+	}
+
+	/* VRF_ID, MC_KEY_SEL, VID_CMP and the L2 tunnel list stay zero. L2_EN
+	 * stays clear too: a routed multicast frame keeps whatever bridging
+	 * decides for it, and the L2 multicast table is where that is steered.
+	 */
+	d[0] = hdr | (sip >> 13);
+	d[1] = (sip & 0x1fff) << 19;
+	d[2] = BIT(12) |					/* L3_EN */
+	       ((u32)(rt->attr.action & 0x3) << 10) |
+	       (rt->mc.rpf_check ? BIT(9) : 0) |
+	       (rtl931x_mc_rpf_act_to_hw(rt->mc.rpf_fail_action) << 7) |
+	       ((rt->mc.oif_idx >> 7) & 0x7f);
+	d[3] = ((u32)(rt->mc.oif_idx & 0x7f) << 25) |
+	       (rt->mc.oif_valid ? BIT(24) : 0) |
+	       ((u32)rt->mc.ttl_min << 16) |
+	       (rt->attr.hit ? BIT(15) : 0);
+	rtl931x_mc_slot_write(r, idx, d);
+
+out:
+	rtl_table_release(r);
+}
+
+/* Print an entry's raw table words, one line per slot. An IPv4 multicast entry
+ * covers two consecutive slots and an IPv6 one six.
+ */
+static void rtl931x_mc_route_dump(int idx, u8 type, struct seq_file *m)
+{
+	struct table_reg *r = rtl_table_get(RTL9310_TBL_2, 3);
+	int width = type == 3 ? 6 : 2;
+
+	for (int s = 0; s < width; s++) {
+		rtl_table_read(r, rtl931x_l3_idx_to_addr(idx + s));
+		seq_printf(m, "              raw slot %d (log %d, phys %d):",
+			   s, idx + s, rtl931x_l3_idx_to_addr(idx + s));
+		for (int i = 0; i < 4; i++)
+			seq_printf(m, " %08x", sw_r32(rtl_table_data(r, i)));
+		seq_puts(m, "\n");
+	}
+	rtl_table_release(r);
+}
+
+/* Find the logical host-table slot for a multicast route; see
+ * rtl931x_find_l3_slot() for the bucket walk. A free span needs every
+ * slot of the entry width invalid, and a match needs the group and the
+ * source to agree, so (S,G) and (*,G) of one group can coexist.
+ */
+static int rtl931x_mc_find_slot(struct rtl83xx_route *rt, bool must_exist)
+{
+	struct rtl83xx_route route_entry;
+	int slot_width, algorithm, addr, idx;
+	struct in6_addr sip6;
+	u32 hash;
+
+	if (rt->attr.type != 1 && rt->attr.type != 3)
+		return -1;
+	slot_width = rt->attr.type == 3 ? 6 : 2;
+
+	if (rt->attr.type == 3)
+		rtl931x_mc_key_sip6(&sip6, &rt->src_ip6);
+
+	for (int t = 0; t < 2; t++) {
+		/* MC_HASH_ALG_SEL_<t>; the unicast selects sit at bits 2/3 */
+		algorithm = (sw_r32(RTL931X_L3_HOST_TBL_CTRL) >> (4 + t)) & 0x1;
+		hash = rt->attr.type == 3 ?
+		       rtl931x_mc_hash6(&sip6, &rt->dst_ip6, algorithm) :
+		       rtl931x_mc_hash4(0, rtl931x_mc_key_sip(rt->src_ip),
+					rt->dst_ip, algorithm);
+
+		for (int s = 0; s < 6; s += slot_width) {
+			addr = (t << 13) | ((hash & 0x3ff) << 3) | s;
+			idx = rtl931x_l3_addr_to_idx(addr);
+
+			if (!must_exist) {
+				bool free = true;
+
+				for (int k = 0; k < slot_width; k++) {
+					if (rtl931x_host_route_valid(idx + k)) {
+						free = false;
+						break;
+					}
+				}
+				if (free)
+					return idx;
+				continue;
+			}
+
+			memset(&route_entry, 0, sizeof(route_entry));
+			rtl931x_mc_route_read(idx, &route_entry);
+			if (route_entry.attr.valid &&
+			    route_entry.attr.type == rt->attr.type &&
+			    (rt->attr.type == 3 ?
+			     ipv6_addr_equal(&route_entry.dst_ip6, &rt->dst_ip6) &&
+			     ipv6_addr_equal(&route_entry.src_ip6, &rt->src_ip6) :
+			     route_entry.dst_ip == rt->dst_ip &&
+			     route_entry.src_ip == rt->src_ip))
+				return idx;
+		}
+	}
+
+	return -1;
+}
+
+/* Write one element of an output-interface list (L3_EGR_INTF_LIST):
+ * 64 bits, OIL_NEXT 63:50, TTL_DEC 49, TTL_CHK 48, SA_REPLACE 47,
+ * L3_EGR_INTF_IDX 46:37, L2_TNL_VALID 36, MC_PMSK_L2_TNL_IDX 35:24,
+ * DST_PORT_TYPE 23, ECID 22:1.
+ * Mango has no end-of-list bit: element 0 is the "no successor"
+ * encoding, so a zero OIL_NEXT terminates the chain. SA_REPLACE is set
+ * because a routed replica leaves with the egress interface's MAC.
+ */
+static void rtl931x_mc_oif_write(int idx, const struct rtl83xx_mc_oif *oif)
+{
+	struct table_reg *r = rtl_table_get(RTL9310_TBL_2, 9);
+	u16 next = oif->last ? 0 : oif->next;
+
+	sw_w32(((u32)(next & 0x3fff) << 18) |
+	       (oif->ttl_dec ? BIT(17) : 0) |
+	       (oif->ttl_check ? BIT(16) : 0) |
+	       BIT(15) |				/* SA_REPLACE */
+	       ((u32)(oif->intf_id & 0x3ff) << 5) |
+	       ((oif->pmask_idx >> 8) & 0xf),
+	       rtl_table_data(r, 0));
+	sw_w32((u32)(oif->pmask_idx & 0xff) << 24, rtl_table_data(r, 1));
+	rtl_table_write(r, idx);
+	rtl_table_release(r);
+}
+
+static void rtl931x_mc_oif_read(int idx, struct rtl83xx_mc_oif *oif)
+{
+	struct table_reg *r = rtl_table_get(RTL9310_TBL_2, 9);
+	u32 w0, w1;
+
+	rtl_table_read(r, idx);
+	w0 = sw_r32(rtl_table_data(r, 0));
+	w1 = sw_r32(rtl_table_data(r, 1));
+	rtl_table_release(r);
+
+	oif->next = (w0 >> 18) & 0x3fff;
+	oif->last = !oif->next;
+	oif->ttl_dec = !!(w0 & BIT(17));
+	oif->ttl_check = !!(w0 & BIT(16));
+	oif->intf_id = (w0 >> 5) & 0x3ff;
+	oif->pmask_idx = ((w0 & 0xf) << 8) | (w1 >> 24);
+}
+
+
+/* Report both multicast gates: the global enables and the ingress interface
+ * word. A matched route that replicates nothing, a lookup miss trapped to the
+ * CPU, and a lookup that never happens all present the same way from outside,
+ * and these bits are what tell them apart.
+ */
+static void rtl931x_l3_mc_dump(struct rtl838x_switch_priv *priv, int intf_id,
+			       struct seq_file *m)
+{
+	struct table_reg *r = rtl_table_get(RTL9310_TBL_2, 7);
+	u32 h = sw_r32(RTL931X_L3_HOST_TBL_CTRL);
+	u32 g4 = sw_r32(RTL931X_L3_IPMC_ROUTE_CTRL);
+	u32 g6 = sw_r32(RTL931X_L3_IP6MC_ROUTE_CTRL);
+	u32 w0, w1;
+
+	rtl_table_read(r, intf_id);
+	w0 = sw_r32(rtl_table_data(r, 0));
+	w1 = sw_r32(rtl_table_data(r, 1));
+	rtl_table_release(r);
+
+	seq_printf(m, "    HOST_TBL_CTRL %08x: LU_MODE_SEL %d HASH_KEY_SEL %d MC_ALG t0 %d t1 %d\n",
+		   h, h & 1, (h >> 1) & 1, (h >> 4) & 1, (h >> 5) & 1);
+	seq_printf(m, "    global: IPMC_ROUTE_CTRL %08x (GLB_EN %d) IP6MC_ROUTE_CTRL %08x (GLB_EN %d)\n",
+		   g4, g4 & 1, g6, g6 & 1);
+	seq_printf(m, "    IGR_INTF[%d] %08x %08x: IPUC_EN %d IP6UC_EN %d IPMC_EN %d IP6MC_EN %d\n",
+		   intf_id, w0, w1, !!(w0 & BIT(23)), !!(w0 & BIT(22)),
+		   !!(w0 & BIT(21)), !!(w0 & BIT(20)));
+	seq_printf(m, "                 IPMC_LU_MIS_ACT %d IP6MC_LU_MIS_ACT %d MC_KEY_SEL %d VRF %d\n",
+		   (w0 >> 18) & 3, (w0 >> 16) & 3, !!(w1 & BIT(14)), w0 >> 24);
+	/* Scope actions default to 0 = follow the bridging decision, or flood in
+	 * the VLAN when nothing matches. For a range that is being routed that
+	 * flood is a second delivery of the same frame.
+	 */
+	seq_printf(m, "                 IPMC_ACT 224.0.0/x %d 224.0.1/x %d 239/8 %d IP6MC_ACT ff00::/xx %d\n",
+		   (w0 >> 13) & 7, (w0 >> 10) & 7, (w0 >> 7) & 7, (w0 >> 4) & 7);
+}
+
 static int rtl931x_l3_setup(struct rtl838x_switch_priv *priv)
 {
 	struct table_reg *r;
@@ -4556,6 +5132,12 @@ static int rtl931x_l3_setup(struct rtl838x_switch_priv *priv)
 	priv->n_route_ids = rtl931x_ptbl.size;
 	priv->n_host_route_ids = tbl_size;
 
+	/* Output-interface list pool: element 0 encodes "no successor" in
+	 * OIL_NEXT, so it can never be handed out.
+	 */
+	priv->n_mc_oifs = RTL931X_L3_EGR_INTF_LIST_SIZE;
+	set_bit(0, priv->mc_oif_use_bm);
+
 	for (int i = 0; i < MAX_INTF_MTUS; i++)
 		priv->intf_mtu_count[i] = priv->intf_mtus[i] = 0;
 
@@ -4571,12 +5153,23 @@ static int rtl931x_l3_setup(struct rtl838x_switch_priv *priv)
 		sw_w32_mask(0x3fff, DEFAULT_MTU, RTL931X_L3_INTF_IP6_MTU(i));
 	}
 
-	/* Host table hash algorithms (MANGO_L3_HOST_TBL_CTRLr @0xF004):
-	 * table 0 -> algorithm 0 (XOR), table 1 -> algorithm 1 (carry-fold
-	 * sum), as in dal_mango_l3_init(). Masked write: the MC algorithm
-	 * selects and the lookup-mode bits keep their reset values.
+	/* Host table lookup control (MANGO_L3_HOST_TBL_CTRLr @0xF004):
+	 * LU_MODE_SEL 0, LU_FORCE_MODE_HASH_KEY_SEL 1, UC_HASH_ALG_SEL_0 2,
+	 * UC_HASH_ALG_SEL_1 3, MC_HASH_ALG_SEL_0 4, MC_HASH_ALG_SEL_1 5.
+	 *
+	 * Unicast keeps algorithm 0 for table 0 and algorithm 1 for table 1, as
+	 * in dal_mango_l3_init().
+	 *
+	 * The multicast bits cannot be left at reset. LU_MODE_SEL selects forced
+	 * lookup mode, which is what makes IPMC_TYPE = 1 in a multicast entry
+	 * the matching value. LU_FORCE_MODE_HASH_KEY_SEL selects whether the
+	 * ingress VLAN joins the multicast hash key; the slot search hashes VRF,
+	 * source and group only, so a set bit would place every multicast entry
+	 * in a bucket the hardware never searches and no entry would ever match.
+	 * Both multicast tables use algorithm 0, as the vendor multicast init
+	 * does. Unicast hashing has no VLAN term, so none of this affects it.
 	 */
-	sw_w32_mask(0x3 << 2, BIT(3), RTL931X_L3_HOST_TBL_CTRL);
+	sw_w32_mask(0x3f, BIT(3), RTL931X_L3_HOST_TBL_CTRL);
 
 	/* MANGO_L3_IP_ROUTE_CTRLr @0xF000:
 	 * - NON_IP_ACT = TRAP2CPU: non-IP traffic to a router MAC (e.g.
@@ -4768,6 +5361,14 @@ const struct rtl838x_reg rtl931x_reg = {
 	.route_lookup_hw = rtl931x_route_lookup_hw,
 	.set_l3_nexthop = rtl931x_set_l3_nexthop,
 	.get_l3_nexthop = rtl931x_get_l3_nexthop,
+	.mc_route_read = rtl931x_mc_route_read,
+	.mc_route_write = rtl931x_mc_route_write,
+	.mc_find_slot = rtl931x_mc_find_slot,
+	.mc_oif_write = rtl931x_mc_oif_write,
+	.mc_oif_read = rtl931x_mc_oif_read,
+	.mc_route_dump = rtl931x_mc_route_dump,
+	.l3_mc_dump = rtl931x_l3_mc_dump,
+	.l3_mc_offload = true,
 #endif
 	.l2_learning_setup = rtl931x_l2_learning_setup,
 	.led_init = rtldsa_931x_led_init,
