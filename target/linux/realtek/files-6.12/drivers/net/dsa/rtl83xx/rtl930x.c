@@ -2871,8 +2871,16 @@ static int rtl930x_l3_setup(struct rtl838x_switch_priv *priv)
 	 * ICMPv6 time-exceeded / packet-too-big (traceroute6, PMTUD).
 	 */
 	sw_w32(0x00294581, RTL930X_L3_IP6UC_ROUTE_CTRL);
-	sw_w32(0x00000501, RTL930X_L3_IPMC_ROUTE_CTRL);
-	sw_w32(0x00012881, RTL930X_L3_IP6MC_ROUTE_CTRL);
+	/* GLB_EN (bit 0) is what makes the multicast route lookup happen at all;
+	 * without it an entry stays valid with every field correct and its hit
+	 * bit never sets. LU_MIS_ACT=TRAP2CPU (IPMC bits 16:15, IP6MC bits
+	 * 22:21): a group with no hardware route has to reach the CPU so the
+	 * kernel's multicast routing cache raises its cache-miss upcall and
+	 * userspace can install the route. Dropping the first packet in
+	 * hardware - the reset default - keeps that upcall from ever firing.
+	 */
+	sw_w32(0x00008501, RTL930X_L3_IPMC_ROUTE_CTRL);
+	sw_w32(0x00212881, RTL930X_L3_IP6MC_ROUTE_CTRL);
 
 	pr_debug("L3_IPUC_ROUTE_CTRL %08x, IPMC_ROUTE %08x, IP6UC_ROUTE %08x, IP6MC_ROUTE %08x\n",
 		 sw_r32(RTL930X_L3_IPUC_ROUTE_CTRL), sw_r32(RTL930X_L3_IPMC_ROUTE_CTRL),

@@ -5063,6 +5063,33 @@ static void rtl931x_mc_oif_read(int idx, struct rtl83xx_mc_oif *oif)
 	oif->pmask_idx = ((w0 & 0xf) << 8) | (w1 >> 24);
 }
 
+/* Arm multicast routing on an ingress L3 interface (L3_IGR_INTF word 0:
+ * IPMC_ROUTE_EN 21, IP6MC_ROUTE_EN 20, IPMC_ROUTE_LU_MIS_ACT 19:18,
+ * IP6MC_ROUTE_LU_MIS_ACT 17:16). Read-modify-write: the unicast route
+ * enables in the same word are owned by rtl931x_set_l3_egress_intf().
+ *
+ * This alone does not make a lookup happen. GLB_EN in L3_IPMC_ROUTE_CTRL /
+ * L3_IP6MC_ROUTE_CTRL gates it as well and is set at L3 setup.
+ */
+static void rtl931x_l3_mc_intf_enable(int idx, bool enable)
+{
+	struct table_reg *r = rtl_table_get(RTL9310_TBL_2, 7);
+	u32 v;
+
+	rtl_table_read(r, idx);
+	v = sw_r32(rtl_table_data(r, 0));
+	v &= ~(BIT(21) | BIT(20) | (0x3 << 18) | (0x3 << 16));
+	/* Lookup-miss action 1 = TRAP2CPU, 0 = DROP: the first packet of an
+	 * unresolved group has to reach the CPU, otherwise the kernel's
+	 * multicast-routing cache-miss upcall never fires and no daemon can
+	 * install a route.
+	 */
+	if (enable)
+		v |= BIT(21) | BIT(20) | (0x1 << 18) | (0x1 << 16);
+	sw_w32(v, rtl_table_data(r, 0));
+	rtl_table_write(r, idx);
+	rtl_table_release(r);
+}
 
 /* Report both multicast gates: the global enables and the ingress interface
  * word. A matched route that replicates nothing, a lookup miss trapped to the
@@ -5208,6 +5235,23 @@ static int rtl931x_l3_setup(struct rtl838x_switch_priv *priv)
 	sw_w32_mask(BIT(0) | (0x7 << 15) | (0x3 << 18) | (0x3 << 20),
 		    BIT(0) | (0x2 << 15) | (0x1 << 18) | (0x1 << 20),
 		    RTL931X_L3_IP6UC_ROUTE_CTRL);
+
+	/* MANGO_L3_IPMC_ROUTE_CTRLr @0xF010 and MANGO_L3_IP6MC_ROUTE_CTRLr
+	 * @0xF014: enable multicast routing globally. This is a second gate on
+	 * top of IPMC_ROUTE_EN in the ingress interface entry, and both are
+	 * required - with GLB_EN clear the route lookup is never performed, so a
+	 * multicast entry stays valid with every field correct and its hit bit
+	 * never sets, while the lookup-miss action delivers the traffic to the
+	 * CPU instead.
+	 *
+	 * Only the enable is touched. The exception actions come up with usable
+	 * values (source-address and DMAC-mismatch handling, and the source
+	 * interface filter, are all already set) and overwriting them with a
+	 * policy word chosen for the other family would be a behavioural change
+	 * with no evidence behind it.
+	 */
+	sw_w32_mask(0, BIT(0), RTL931X_L3_IPMC_ROUTE_CTRL);
+	sw_w32_mask(0, BIT(0), RTL931X_L3_IP6MC_ROUTE_CTRL);
 
 	/* Enable the L3 TCAMs (MANGO_ALE_L3_MISC_CTRLr @0xF2E8): prefix
 	 * TCAM blocks 0-5 (L3_TCAM_BLK_EN = 0x3F) and the router-MAC TCAM
@@ -5368,6 +5412,7 @@ const struct rtl838x_reg rtl931x_reg = {
 	.mc_oif_read = rtl931x_mc_oif_read,
 	.mc_route_dump = rtl931x_mc_route_dump,
 	.l3_mc_dump = rtl931x_l3_mc_dump,
+	.l3_mc_intf_enable = rtl931x_l3_mc_intf_enable,
 	.l3_mc_offload = true,
 #endif
 	.l2_learning_setup = rtl931x_l2_learning_setup,
