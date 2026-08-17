@@ -11,6 +11,8 @@
 #include <linux/etherdevice.h>
 #include <linux/if_vlan.h>
 #include <linux/inetdevice.h>
+#include <linux/mroute.h>
+#include <linux/mroute6.h>
 #include <linux/platform_device.h>
 #include <linux/rhashtable.h>
 #include <linux/of_net.h>
@@ -2693,13 +2695,631 @@ static int rtl83xx_netevent_event(struct notifier_block *this,
 	return NOTIFY_DONE;
 }
 
+/* IPv4/IPv6 multicast route offload.
+ *
+ * A multicast route is programmed into the same host-route memory as a unicast
+ * one and told apart by the entry type. Instead of a nexthop it points at a
+ * chain of output-interface list elements, one per egress interface, each
+ * naming an L3 egress interface and the port set inside it.
+ *
+ * Only the default multicast routing table is offloaded. Both families build
+ * with multiple multicast tables enabled, so a route in any other table has to
+ * stay in software or it would be forwarded twice.
+ */
+
+static_assert(RTLDSA_MC_MAX_VIFS == MAXVIFS,
+	      "the vif table must match the kernel's MAXVIFS");
+
+#define RTLDSA_MC_FAM_IPV4	0
+#define RTLDSA_MC_FAM_IPV6	1
+
+static const struct rhashtable_params rtldsa_mc_ht_params = {
+	.key_len     = sizeof(struct rtl83xx_mc_key),
+	.key_offset  = offsetof(struct rtl83xx_mc_route, key),
+	.head_offset = offsetof(struct rtl83xx_mc_route, node),
+};
+
+static int rtldsa_mc_fam_idx(u32 family)
+{
+	return family == RTNL_FAMILY_IP6MR ? RTLDSA_MC_FAM_IPV6 : RTLDSA_MC_FAM_IPV4;
+}
+
+struct rtldsa_mc_port_walk {
+	struct rtl838x_switch_priv *priv;
+	u64 mask;
+};
+
+static int rtldsa_mc_port_walk_cb(struct net_device *lower,
+				  struct netdev_nested_priv *_priv)
+{
+	struct rtldsa_mc_port_walk *data = _priv->data;
+	int port = rtl83xx_port_is_under(lower, data->priv);
+
+	if (port >= 0)
+		data->mask |= BIT_ULL(port);
+
+	return 0;
+}
+
+/* Ports a vif replicates onto: a bare routed user port is itself, an SVI is
+ * every user port enslaved below it. An empty mask means the vif is not on
+ * this switch and cannot be replicated in hardware.
+ */
+static u64 rtldsa_mc_vif_ports(struct rtl838x_switch_priv *priv,
+			       struct net_device *dev)
+{
+	struct rtldsa_mc_port_walk data = { .priv = priv };
+	struct netdev_nested_priv _priv = { .data = &data };
+	int port;
+
+	port = rtl83xx_port_is_under(dev, priv);
+	if (port >= 0)
+		return BIT_ULL(port);
+
+	netdev_walk_all_lower_dev(dev, rtldsa_mc_port_walk_cb, &_priv);
+
+	return data.mask;
+}
+
+static int rtldsa_mc_oif_alloc(struct rtl838x_switch_priv *priv)
+{
+	int idx;
+
+	idx = find_first_zero_bit(priv->mc_oif_use_bm, priv->n_mc_oifs);
+	if (idx >= priv->n_mc_oifs)
+		return -ENOSPC;
+	set_bit(idx, priv->mc_oif_use_bm);
+
+	return idx;
+}
+
+/* Bind a vif to an L3 egress interface and a portmask group. A vif that
+ * resolves to no switch port stays invalid: routes using it are then trapped
+ * instead of being programmed with an egress set the hardware cannot reach.
+ */
+static void rtldsa_mc_vif_resolve(struct rtl838x_switch_priv *priv,
+				  struct rtl83xx_mc_vif *vif,
+				  struct net_device *dev)
+{
+	int vlan = is_vlan_dev(dev) ? vlan_dev_vlan_id(dev) : 0;
+	int group, if_id, port;
+	u64 ports, mac;
+
+	ports = rtldsa_mc_vif_ports(priv, dev);
+	if (!ports)
+		return;
+
+	port = rtl83xx_port_is_under(dev, priv);
+	if (port >= 0 && !vlan)
+		vlan = RTLDSA_L3_PORT_VID(port); /* bare routed port */
+	if (!vlan)
+		return;
+
+	mac = ether_addr_to_u64(dev->dev_addr);
+	if_id = rtl83xx_alloc_egress_intf(priv, mac, vlan);
+	if (if_id < 0)
+		return;
+
+	group = rtl83xx_mc_group_alloc_mask(priv, ports);
+	if (group < 0)
+		return;
+
+	vif->intf_id = if_id;
+	vif->vid = vlan;
+	vif->pmask_idx = group;
+	vif->valid = true;
+
+	if (priv->r->l3_mc_intf_enable)
+		priv->r->l3_mc_intf_enable(if_id, true);
+}
+
+/* Is any other vif still using this L3 interface? Interface ids are shared
+ * whenever two vifs carry the same MAC and VLAN, so the per-interface
+ * multicast enable can only be withdrawn once the last user is gone.
+ */
+static bool rtldsa_mc_intf_in_use(struct rtl838x_switch_priv *priv,
+				  const struct rtl83xx_mc_vif *self, u16 intf_id)
+{
+	int fam, i;
+
+	for (fam = 0; fam < 2; fam++)
+		for (i = 0; i < MAXVIFS; i++) {
+			const struct rtl83xx_mc_vif *vif = &priv->mc_vifs[fam][i];
+
+			if (vif != self && vif->valid && vif->intf_id == intf_id)
+				return true;
+		}
+
+	return false;
+}
+
+static void rtldsa_mc_vif_release(struct rtl838x_switch_priv *priv,
+				  struct rtl83xx_mc_vif *vif)
+{
+	if (vif->valid) {
+		priv->r->write_mcast_pmask(vif->pmask_idx, 0);
+		clear_bit(vif->pmask_idx, priv->mc_group_bm);
+
+		if (priv->r->l3_mc_intf_enable &&
+		    !rtldsa_mc_intf_in_use(priv, vif, vif->intf_id))
+			priv->r->l3_mc_intf_enable(vif->intf_id, false);
+	}
+	memset(vif, 0, sizeof(*vif));
+}
+
+/* Kernel (*,G) routes carry an all-zero source; the shared code keeps that
+ * convention and the family writers translate it to the hardware wildcard.
+ */
+static void rtldsa_mc_key_build(struct rtl83xx_mc_key *key, u32 family,
+				struct mr_mfc *mfc)
+{
+	memset(key, 0, sizeof(*key));
+	key->family = family;
+
+	if (family == RTNL_FAMILY_IP6MR) {
+#if IS_BUILTIN(CONFIG_IPV6)
+		struct mfc6_cache *c = container_of(mfc, struct mfc6_cache, _c);
+
+		key->grp = c->mf6c_mcastgrp;
+		key->src = c->mf6c_origin;
+#endif
+	} else {
+		struct mfc_cache *c = container_of(mfc, struct mfc_cache, _c);
+
+		ipv6_addr_set_v4mapped(c->mfc_mcastgrp, &key->grp);
+		if (c->mfc_origin)
+			ipv6_addr_set_v4mapped(c->mfc_origin, &key->src);
+	}
+}
+
+static bool rtldsa_mc_is_starg(const struct rtl83xx_mc_key *key)
+{
+	return ipv6_addr_any(&key->src);
+}
+
+/* Forwarding action for a route, following the same three-way split the
+ * multicast-capable switchdev drivers use:
+ *
+ *  - the ingress vif must resolve to a switch interface, or the hardware
+ *    cannot check the reverse path and the route has to be trapped;
+ *  - the kernel does not accept a (*,G) route whose ingress interface is not
+ *    also one of its egress interfaces, so those are trapped as well;
+ *  - a route with no reachable egress interface is trapped;
+ *  - if any egress vif is off this switch, the packet is copied to the CPU as
+ *    well as replicated, because software still has replication to do.
+ */
+static u8 rtldsa_mc_route_action(struct rtl838x_switch_priv *priv,
+				 const struct rtl83xx_mc_route *mc)
+{
+	const struct rtl83xx_mc_vif *vifs = priv->mc_vifs[rtldsa_mc_fam_idx(mc->key.family)];
+	struct mr_mfc *mfc = mc->mfc;
+	bool software_egress = false;
+	int i;
+
+	if (mfc->mfc_parent >= MAXVIFS || !vifs[mfc->mfc_parent].valid)
+		return ROUTE_ACT_TRAP2CPU;
+
+	if (rtldsa_mc_is_starg(&mc->key) &&
+	    mfc->mfc_un.res.ttls[mfc->mfc_parent] == 255)
+		return ROUTE_ACT_TRAP2CPU;
+
+	if (!mc->n_oifs)
+		return ROUTE_ACT_TRAP2CPU;
+
+	for (i = 0; i < MAXVIFS; i++) {
+		if (mfc->mfc_un.res.ttls[i] == 255)
+			continue;
+		if (!vifs[i].valid)
+			software_egress = true;
+	}
+
+	return software_egress ? ROUTE_ACT_COPY2CPU : ROUTE_ACT_FORWARD;
+}
+
+/* The kernel has no offload-reporting helper for multicast routes the way it
+ * does for unicast ones; the flag in the cache entry is what RTM_GETROUTE
+ * turns into RTNH_F_OFFLOAD. Callers hold RTNL.
+ */
+static void rtldsa_mc_offload_set(struct rtl83xx_mc_route *mc, bool offload)
+{
+	if (offload)
+		mc->mfc->mfc_flags |= MFC_OFFLOAD;
+	else
+		mc->mfc->mfc_flags &= ~MFC_OFFLOAD;
+
+	mc->offloaded = offload;
+}
+
+/* Blank output-interface list elements and return them to the shared pool. A
+ * stale element still names an egress interface and a port set, so it is
+ * cleared before the index becomes available again.
+ */
+static void rtldsa_mc_oifs_free(struct rtl838x_switch_priv *priv,
+				const u16 *idx, int n)
+{
+	struct rtl83xx_mc_oif blank = { .last = true };
+
+	while (n--) {
+		priv->r->mc_oif_write(idx[n], &blank);
+		clear_bit(idx[n], priv->mc_oif_use_bm);
+	}
+}
+
+/* Retire the list a route currently owns. Only safe once the route entry has
+ * stopped pointing at it: the elements go straight back into the shared pool.
+ */
+static void rtldsa_mc_oifs_release(struct rtl838x_switch_priv *priv,
+				   struct rtl83xx_mc_route *mc)
+{
+	u16 idx[RTLDSA_MC_MAX_VIFS];
+
+	for (int i = 0; i < mc->n_oifs; i++)
+		idx[i] = mc->oifs[i].oif_idx;
+
+	rtldsa_mc_oifs_free(priv, idx, mc->n_oifs);
+	mc->n_oifs = 0;
+}
+
+/* Build the hardware output-interface list for a route into freshly allocated
+ * elements. Elements are written back to front so an element is always valid
+ * before anything links to it, and the route entry is only pointed at the head
+ * once the whole chain exists.
+ *
+ * The list is built from empty, so this never extends a list the route already
+ * owns: appending would leave the head at an element from the previous build
+ * and grow mc->oifs[] until it overran.
+ */
+static int rtldsa_mc_oifs_build(struct rtl838x_switch_priv *priv,
+				struct rtl83xx_mc_route *mc)
+{
+	const struct rtl83xx_mc_vif *vifs = priv->mc_vifs[rtldsa_mc_fam_idx(mc->key.family)];
+	struct mr_mfc *mfc = mc->mfc;
+	int i, idx;
+
+	mc->n_oifs = 0;
+	for (i = 0; i < MAXVIFS; i++) {
+		if (mfc->mfc_un.res.ttls[i] == 255)
+			continue;
+		if (!vifs[i].valid)
+			continue;
+
+		idx = rtldsa_mc_oif_alloc(priv);
+		if (idx < 0)
+			goto err_release;
+
+		mc->oifs[mc->n_oifs].oif_idx = idx;
+		mc->oifs[mc->n_oifs].pmask_idx = vifs[i].pmask_idx;
+		mc->oifs[mc->n_oifs].intf_id = vifs[i].intf_id;
+		mc->oifs[mc->n_oifs].vif = i;
+		mc->n_oifs++;
+	}
+
+	for (i = mc->n_oifs - 1; i >= 0; i--) {
+		struct rtl83xx_mc_oif oif = {
+			.intf_id = mc->oifs[i].intf_id,
+			.pmask_idx = mc->oifs[i].pmask_idx,
+			.next = i + 1 < mc->n_oifs ? mc->oifs[i + 1].oif_idx : 0,
+			.last = i + 1 == mc->n_oifs,
+			.ttl_dec = true,
+			.ttl_check = true,
+		};
+
+		priv->r->mc_oif_write(mc->oifs[i].oif_idx, &oif);
+	}
+
+	return 0;
+
+err_release:
+	rtldsa_mc_oifs_release(priv, mc);
+
+	return idx;
+}
+
+/* Program the hardware entry for a route whose output-interface list is
+ * already built. Also used to reprogram one after a vif change.
+ */
+static int rtldsa_mc_route_program(struct rtl838x_switch_priv *priv,
+				   struct rtl83xx_mc_route *mc)
+{
+	const struct rtl83xx_mc_vif *vifs = priv->mc_vifs[rtldsa_mc_fam_idx(mc->key.family)];
+	struct rtl83xx_route *rt = &mc->rt;
+	struct mr_mfc *mfc = mc->mfc;
+	u8 action;
+	int slot;
+
+	action = rtldsa_mc_route_action(priv, mc);
+
+	memset(rt, 0, sizeof(*rt));
+	rt->id = mc->id;
+	rt->is_host_route = true;
+	rt->attr.valid = true;
+	rt->attr.action = action;
+
+	if (mc->key.family == RTNL_FAMILY_IP6MR) {
+		rt->attr.type = 3;
+		rt->dst_ip6 = mc->key.grp;
+		rt->src_ip6 = mc->key.src;
+	} else {
+		rt->attr.type = 1;
+		rt->dst_ip = mc->key.grp.s6_addr32[3];
+		rt->src_ip = mc->key.src.s6_addr32[3];
+	}
+
+	/* Reverse-path check only makes sense once the ingress interface is
+	 * known; without it the entry would drop or trap everything.
+	 */
+	if (mfc->mfc_parent < MAXVIFS && vifs[mfc->mfc_parent].valid) {
+		rt->mc.rpf_check = true;
+		rt->mc.rpf_vid = vifs[mfc->mfc_parent].vid;
+		rt->mc.rpf_fail_action = ROUTE_ACT_DROP;
+	}
+
+	if (mc->n_oifs) {
+		rt->mc.oif_valid = true;
+		rt->mc.oif_idx = mc->oifs[0].oif_idx;
+	}
+
+	slot = mc->slot;
+	if (slot < 0) {
+		slot = priv->r->mc_find_slot(rt, false);
+		if (slot < 0) {
+			dev_err(priv->dev, "no multicast route slot for %pI6c\n",
+				&mc->key.grp);
+			return -ENOSPC;
+		}
+		mc->slot = slot;
+	}
+
+	priv->r->mc_route_write(slot, rt);
+	rtldsa_mc_offload_set(mc, action != ROUTE_ACT_TRAP2CPU);
+
+	return 0;
+}
+
+static void rtldsa_mc_route_unprogram(struct rtl838x_switch_priv *priv,
+				      struct rtl83xx_mc_route *mc)
+{
+	if (mc->slot >= 0) {
+		mc->rt.attr.valid = false;
+		priv->r->mc_route_write(mc->slot, &mc->rt);
+		mc->slot = -1;
+	}
+	rtldsa_mc_oifs_release(priv, mc);
+	rtldsa_mc_offload_set(mc, false);
+}
+
+static void rtldsa_mc_route_destroy(struct rtl838x_switch_priv *priv,
+				    struct rtl83xx_mc_route *mc)
+{
+	rtldsa_mc_route_unprogram(priv, mc);
+	rhashtable_remove_fast(&priv->mc_routes, &mc->node, rtldsa_mc_ht_params);
+	list_del(&mc->list);
+	clear_bit(mc->id - MAX_ROUTES, priv->host_route_use_bm);
+	mr_cache_put(mc->mfc);
+	kfree(mc);
+}
+
+/* Rebuild a route after the vif table changed. The list is replaced rather than
+ * patched: elements come from a shared pool and a membership change can add as
+ * well as remove interfaces.
+ *
+ * The replacement is built and the route entry repointed before the previous
+ * elements are retired. Retiring them first leaves the live entry pointing into
+ * the pool at an element that has been blanked and may already have been handed
+ * to another route, which forwards nothing while the entry still reads as a
+ * correctly programmed offload. Cost of the ordering is that a rebuild holds
+ * both lists at once.
+ */
+static void rtldsa_mc_route_rebuild(struct rtl838x_switch_priv *priv,
+				    struct rtl83xx_mc_route *mc)
+{
+	u16 old_idx[RTLDSA_MC_MAX_VIFS];
+	int old_n = mc->n_oifs;
+
+	for (int i = 0; i < old_n; i++)
+		old_idx[i] = mc->oifs[i].oif_idx;
+
+	if (rtldsa_mc_oifs_build(priv, mc))
+		dev_warn(priv->dev, "multicast output list exhausted, trapping %pI6c\n",
+			 &mc->key.grp);
+
+	if (rtldsa_mc_route_program(priv, mc))
+		rtldsa_mc_route_unprogram(priv, mc);
+
+	rtldsa_mc_oifs_free(priv, old_idx, old_n);
+}
+
+static void rtldsa_mc_routes_rebuild(struct rtl838x_switch_priv *priv, u32 family)
+{
+	struct rtl83xx_mc_route *mc;
+
+	if (!priv->mc_routes_initialized)
+		return;
+
+	list_for_each_entry(mc, &priv->mc_route_list, list)
+		if (mc->key.family == family)
+			rtldsa_mc_route_rebuild(priv, mc);
+}
+
+/* Only the default multicast routing table is offloaded, and the two families do
+ * not give it the same id: ipmr's default table is RT_TABLE_DEFAULT, ip6mr's is
+ * the main table. A family-blind comparison discards every IPv6 event as if it
+ * belonged to a table this driver does not program.
+ */
+static bool rtldsa_mc_tb_is_default(u32 family, u32 tb_id)
+{
+	if (family == RTNL_FAMILY_IP6MR)
+		return tb_id == RT_TABLE_MAIN;
+
+	return tb_id == RT_TABLE_DEFAULT;
+}
+
+static int rtldsa_mc_vif_add(struct rtl838x_switch_priv *priv,
+			     struct vif_entry_notifier_info *ven)
+{
+	struct rtl83xx_mc_vif *vif;
+
+	if (!rtldsa_mc_tb_is_default(ven->info.family, ven->tb_id))
+		return 0;
+	if (ven->vif_index >= MAXVIFS)
+		return -EINVAL;
+
+	vif = &priv->mc_vifs[rtldsa_mc_fam_idx(ven->info.family)][ven->vif_index];
+	if (vif->dev)
+		rtldsa_mc_vif_release(priv, vif);
+
+	/* The netdev pointer is kept for identity only and never dereferenced
+	 * after this point: everything the hardware needs is resolved now, so
+	 * no reference has to outlive the notifier.
+	 */
+	vif->dev = ven->dev;
+	rtldsa_mc_vif_resolve(priv, vif, ven->dev);
+
+	rtldsa_mc_routes_rebuild(priv, ven->info.family);
+
+	return 0;
+}
+
+static void rtldsa_mc_vif_del(struct rtl838x_switch_priv *priv,
+			      struct vif_entry_notifier_info *ven)
+{
+	struct rtl83xx_mc_vif *vif;
+
+	if (!rtldsa_mc_tb_is_default(ven->info.family, ven->tb_id) ||
+	    ven->vif_index >= MAXVIFS)
+		return;
+
+	vif = &priv->mc_vifs[rtldsa_mc_fam_idx(ven->info.family)][ven->vif_index];
+	if (!vif->dev)
+		return;
+
+	rtldsa_mc_vif_release(priv, vif);
+	rtldsa_mc_routes_rebuild(priv, ven->info.family);
+}
+
+static int rtldsa_mc_route_add(struct rtl838x_switch_priv *priv,
+			       struct mfc_entry_notifier_info *men)
+{
+	struct rtl83xx_mc_route *mc;
+	struct rtl83xx_mc_key key;
+	int idx, err;
+
+	if (!rtldsa_mc_tb_is_default(men->info.family, men->tb_id))
+		return 0;
+
+	/* An unresolved cache entry has no output list and no usable ingress
+	 * interface; it is the upcall placeholder, not a route.
+	 */
+	if (men->mfc->mfc_parent >= MAXVIFS)
+		return 0;
+
+	rtldsa_mc_key_build(&key, men->info.family, men->mfc);
+
+	mc = rhashtable_lookup_fast(&priv->mc_routes, &key, rtldsa_mc_ht_params);
+	if (mc) {
+		/* A replace keeps the key and the table slot; only the ingress
+		 * interface and the output set can have changed.
+		 */
+		rtldsa_mc_route_rebuild(priv, mc);
+		return 0;
+	}
+
+	idx = find_first_zero_bit(priv->host_route_use_bm, priv->n_host_route_ids);
+	if (idx >= priv->n_host_route_ids)
+		return -ENOSPC;
+
+	mc = kzalloc(sizeof(*mc), GFP_KERNEL);
+	if (!mc)
+		return -ENOMEM;
+
+	set_bit(idx, priv->host_route_use_bm);
+	mc->id = idx + MAX_ROUTES;
+	mc->slot = -1;
+	mc->key = key;
+	mc->mfc = men->mfc;
+	mr_cache_hold(mc->mfc);
+
+	err = rhashtable_insert_fast(&priv->mc_routes, &mc->node, rtldsa_mc_ht_params);
+	if (err)
+		goto err_free;
+	list_add_tail(&mc->list, &priv->mc_route_list);
+
+	if (rtldsa_mc_oifs_build(priv, mc))
+		dev_warn(priv->dev, "multicast output list exhausted, trapping %pI6c\n",
+			 &mc->key.grp);
+
+	err = rtldsa_mc_route_program(priv, mc);
+	if (err)
+		goto err_destroy;
+
+	return 0;
+
+err_destroy:
+	rtldsa_mc_route_destroy(priv, mc);
+
+	return err;
+
+err_free:
+	mr_cache_put(mc->mfc);
+	clear_bit(idx, priv->host_route_use_bm);
+	kfree(mc);
+
+	return err;
+}
+
+static void rtldsa_mc_route_del(struct rtl838x_switch_priv *priv,
+				struct mfc_entry_notifier_info *men)
+{
+	struct rtl83xx_mc_route *mc;
+	struct rtl83xx_mc_key key;
+
+	if (!rtldsa_mc_tb_is_default(men->info.family, men->tb_id))
+		return;
+
+	rtldsa_mc_key_build(&key, men->info.family, men->mfc);
+
+	mc = rhashtable_lookup_fast(&priv->mc_routes, &key, rtldsa_mc_ht_params);
+	if (!mc)
+		return;
+
+	rtldsa_mc_route_destroy(priv, mc);
+}
+
+static void rtldsa_mc_teardown(struct rtl838x_switch_priv *priv)
+{
+	struct rtl83xx_mc_route *mc, *tmp;
+	int fam, i;
+
+	if (!priv->mc_routes_initialized)
+		return;
+
+	list_for_each_entry_safe(mc, tmp, &priv->mc_route_list, list)
+		rtldsa_mc_route_destroy(priv, mc);
+
+	for (fam = 0; fam < 2; fam++)
+		for (i = 0; i < MAXVIFS; i++)
+			if (priv->mc_vifs[fam][i].dev)
+				rtldsa_mc_vif_release(priv, &priv->mc_vifs[fam][i]);
+
+	rhashtable_destroy(&priv->mc_routes);
+	priv->mc_routes_initialized = false;
+}
+
+/* One deferred FIB event. Which union member is live is decided by the work
+ * handler the notifier installs, never by inspecting the event alone: the
+ * unicast and multicast handlers are separate functions and each one only ever
+ * touches the members its own family filled in.
+ */
 struct rtl83xx_fib_event_work {
 	struct work_struct work;
 	union {
 		struct fib_entry_notifier_info fen_info;
 		struct fib6_entry_notifier_info fen6_info;
 		struct fib_rule_notifier_info fr_info;
+		struct mfc_entry_notifier_info men_info;
+		struct vif_entry_notifier_info ven_info;
 	};
+	netdevice_tracker dev_tracker;
 	struct rtl838x_switch_priv *priv;
 	bool is_fib6;
 	unsigned long event;
@@ -2765,6 +3385,48 @@ static void rtl83xx_fib_event_work_do(struct work_struct *work)
 	kfree(fib_work);
 }
 
+/* Multicast events run here and nowhere else. Keeping them on their own work
+ * handler is what stops a multicast notifier payload from ever reaching the
+ * fib4/fib6 handlers: the family that selected this function also filled in
+ * the union members it reads, so the two can never disagree. The case labels
+ * mirror the ones the notifier copies for, so an event the notifier declined
+ * to describe has no branch to run and no reference to drop.
+ */
+static void rtl83xx_fibmr_event_work_do(struct work_struct *work)
+{
+	struct rtl83xx_fib_event_work *fib_work =
+		container_of(work, struct rtl83xx_fib_event_work, work);
+	struct rtl838x_switch_priv *priv = fib_work->priv;
+	int err;
+
+	rtnl_lock();
+	switch (fib_work->event) {
+	case FIB_EVENT_ENTRY_ADD:
+	case FIB_EVENT_ENTRY_REPLACE:
+		err = rtldsa_mc_route_add(priv, &fib_work->men_info);
+		if (err)
+			dev_err(priv->dev, "multicast route add failed: %d\n", err);
+		mr_cache_put(fib_work->men_info.mfc);
+		break;
+	case FIB_EVENT_ENTRY_DEL:
+		rtldsa_mc_route_del(priv, &fib_work->men_info);
+		mr_cache_put(fib_work->men_info.mfc);
+		break;
+	case FIB_EVENT_VIF_ADD:
+		err = rtldsa_mc_vif_add(priv, &fib_work->ven_info);
+		if (err)
+			dev_err(priv->dev, "multicast vif add failed: %d\n", err);
+		netdev_put(fib_work->ven_info.dev, &fib_work->dev_tracker);
+		break;
+	case FIB_EVENT_VIF_DEL:
+		rtldsa_mc_vif_del(priv, &fib_work->ven_info);
+		netdev_put(fib_work->ven_info.dev, &fib_work->dev_tracker);
+		break;
+	}
+	rtnl_unlock();
+	kfree(fib_work);
+}
+
 static bool rtldsa_fib_multipath(struct fib_notifier_info *info)
 {
 	if (info->family == AF_INET) {
@@ -2784,6 +3446,53 @@ static bool rtldsa_fib_multipath(struct fib_notifier_info *info)
 	return false;
 }
 
+/* Queue a multicast routing event. Split out from rtl83xx_fib_event() so the
+ * multicast payload never passes through the unicast preamble, which reads
+ * union members only a fib4/fib6 notifier fills in.
+ */
+static int rtl83xx_fibmr_event(struct rtl838x_switch_priv *priv,
+			       unsigned long event,
+			       struct fib_notifier_info *info)
+{
+	struct rtl83xx_fib_event_work *fib_work;
+
+	if (!priv->r->l3_mc_offload || !priv->mc_routes_initialized)
+		return NOTIFY_DONE;
+
+	fib_work = kzalloc(sizeof(*fib_work), GFP_ATOMIC);
+	if (!fib_work)
+		return NOTIFY_BAD;
+
+	INIT_WORK(&fib_work->work, rtl83xx_fibmr_event_work_do);
+	fib_work->priv = priv;
+	fib_work->event = event;
+
+	switch (event) {
+	case FIB_EVENT_ENTRY_ADD:
+	case FIB_EVENT_ENTRY_REPLACE:
+	case FIB_EVENT_ENTRY_DEL:
+		memcpy(&fib_work->men_info, info, sizeof(fib_work->men_info));
+		/* Every multicast entry the kernel notifies about is a resolved
+		 * one, so its reference count is live.
+		 */
+		mr_cache_hold(fib_work->men_info.mfc);
+		break;
+	case FIB_EVENT_VIF_ADD:
+	case FIB_EVENT_VIF_DEL:
+		memcpy(&fib_work->ven_info, info, sizeof(fib_work->ven_info));
+		netdev_hold(fib_work->ven_info.dev, &fib_work->dev_tracker,
+			    GFP_ATOMIC);
+		break;
+	default:
+		kfree(fib_work);
+		return NOTIFY_DONE;
+	}
+
+	queue_work(priv->wq, &fib_work->work);
+
+	return NOTIFY_DONE;
+}
+
 /* Called with rcu_read_lock() */
 static int rtl83xx_fib_event(struct notifier_block *this, unsigned long event, void *ptr)
 {
@@ -2791,20 +3500,46 @@ static int rtl83xx_fib_event(struct notifier_block *this, unsigned long event, v
 	struct rtl838x_switch_priv *priv;
 	struct rtl83xx_fib_event_work *fib_work;
 
-	/* Only admit IPv4/IPv6 unicast FIB events. Multicast routing events
-	 * (RTNL_FAMILY_IPMR/IP6MR) carry a different notifier info layout;
-	 * letting them through would run the fib4/fib6 paths on zeroed or
-	 * mismatched data (NULL fib_info deref) until real IPMR support
-	 * exists.
+	/* Unicast and multicast FIB events carry different notifier info
+	 * layouts behind the same struct fib_notifier_info head, so the family
+	 * decides both which member of the work union is filled in and which
+	 * work handler runs. Dispatch has to be on the family, never on the
+	 * event: a multicast payload reaching the fib4/fib6 paths reads an
+	 * fen_info that was never filled in.
 	 */
-	if (info->family != AF_INET && info->family != AF_INET6)
+	switch (info->family) {
+	case AF_INET:
+	case AF_INET6:
+		break;
+	case RTNL_FAMILY_IP6MR:
+		/* IPv6 offload is builtin-only across this driver, and the route
+		 * key is populated under the same condition. Admitting these
+		 * events without it would leave every group sharing one all-zero
+		 * key.
+		 */
+		if (!IS_BUILTIN(CONFIG_IPV6))
+			return NOTIFY_DONE;
+		fallthrough;
+	case RTNL_FAMILY_IPMR:
+		/* Rules are not offloaded for either multicast family: only the
+		 * default table is programmed, and the per-route table check is
+		 * what enforces that.
+		 */
+		if (event == FIB_EVENT_RULE_ADD || event == FIB_EVENT_RULE_DEL)
+			return NOTIFY_DONE;
+		break;
+	default:
 		return NOTIFY_DONE;
+	}
 
 	priv = container_of(this, struct rtl838x_switch_priv, fib_nb);
 
 	/* ignore FIB events for HW with missing L3 offloading implementation */
 	if (!priv->r->l3_setup)
 		return NOTIFY_DONE;
+
+	if (info->family == RTNL_FAMILY_IPMR || info->family == RTNL_FAMILY_IP6MR)
+		return rtl83xx_fibmr_event(priv, event, info);
 
 	if ((event == FIB_EVENT_ENTRY_ADD || event == FIB_EVENT_ENTRY_REPLACE ||
 	     event == FIB_EVENT_ENTRY_APPEND) && !priv->r->l3_ecmp_offload &&
@@ -2822,10 +3557,11 @@ static int rtl83xx_fib_event(struct notifier_block *this, unsigned long event, v
 	if (!fib_work)
 		return NOTIFY_BAD;
 
-	INIT_WORK(&fib_work->work, rtl83xx_fib_event_work_do);
 	fib_work->priv = priv;
 	fib_work->event = event;
 	fib_work->is_fib6 = false;
+
+	INIT_WORK(&fib_work->work, rtl83xx_fib_event_work_do);
 
 	switch (event) {
 	case FIB_EVENT_ENTRY_ADD:
@@ -3144,6 +3880,14 @@ static int rtl83xx_sw_probe(struct platform_device *pdev)
 		queue_delayed_work(priv->wq, &priv->l3_activity_work,
 				   RTLDSA_L3_ACTIVITY_POLL_INTERVAL);
 
+	/* Multicast routes are only accepted once this table exists; the
+	 * notifier checks it before queueing anything.
+	 */
+	INIT_LIST_HEAD(&priv->mc_route_list);
+	if (priv->r->l3_mc_offload &&
+	    !rhashtable_init(&priv->mc_routes, &rtldsa_mc_ht_params))
+		priv->mc_routes_initialized = true;
+
 	/* Register netevent notifier callback to catch notifications about neighboring
 	 * changes to update nexthop entries for L3 routing.
 	 */
@@ -3215,6 +3959,14 @@ static void rtl83xx_sw_remove(struct platform_device *pdev)
 	unregister_netevent_notifier(&priv->ne_nb);
 	cancel_delayed_work_sync(&priv->counters_work);
 	cancel_delayed_work_sync(&priv->l3_activity_work);
+	/* FIB events are plain work items, so they outlive the notifier and are
+	 * only drained when the queue is destroyed further down. Multicast
+	 * teardown frees the routes and the table those items walk, and it runs
+	 * off the single work thread that otherwise serialises every access to
+	 * them, so the queue has to be empty before it starts.
+	 */
+	flush_workqueue(priv->wq);
+	rtldsa_mc_teardown(priv);
 
 	dsa_switch_shutdown(priv->ds);
 
