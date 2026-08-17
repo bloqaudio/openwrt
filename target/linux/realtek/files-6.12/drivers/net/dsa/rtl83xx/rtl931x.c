@@ -3319,11 +3319,11 @@ static void rtl931x_set_l3_egress_intf(int idx, struct rtl838x_l3_intf *intf)
 	/* L3_EGR_INTF entry, 128 bits (MANGO_L3_EGR_INTFt fields):
 	 * word 0: DST_VID 31:20, SMAC_ADDR[47:28] 19:0
 	 * word 1: SMAC_ADDR[27:0] 31:4, IP_MTU_IDX 3:0
-	 * word 1 (high): IP6_MTU_IDX 31:28, IPMC_TTL_SCOPE 27:20,
+	 * word 2: IP6_MTU_IDX 31:28, IPMC_TTL_SCOPE 27:20,
 	 *         IP6MC_HL_SCOPE 19:12, IP_ICMP_REDIRECT_ACT 11:9,
 	 *         IP6_ICMP_REDIRECT_ACT 8:6, IP_PBR_ICMP_REDIRECT_ACT 5:3,
 	 *         IP6_PBR_ICMP_REDIRECT_ACT 2:0
-	 * words 2/3: tunnel interface fields, unused
+	 * word 3: TUNNEL_IF 31, TUNNEL_IDX 30:22, unused
 	 * The redirect actions take the shared struct's values verbatim:
 	 * 2 = FORWARD on both families (SDK _actEgrIntfIpIcmpRedirect),
 	 * so one-armed hairpin traffic (ingress == egress interface, the
@@ -3339,12 +3339,15 @@ static void rtl931x_set_l3_egress_intf(int idx, struct rtl838x_l3_intf *intf)
 	v |= (intf->ip6_icmp_redirect & 0x7) << 6;
 	v |= (intf->ip4_pbr_icmp_redirect & 0x7) << 3;
 	v |= (intf->ip6_pbr_icmp_redirect & 0x7);
-	v |= (intf->ip4_mtu_id & 0xf);
 
 	r = rtl_table_get(RTL9310_TBL_2, 8);
 	sw_w32((intf->vid & 0xfff) << 20, rtl_table_data(r, 0));
-	sw_w32(v, rtl_table_data(r, 1));
-	sw_w32(0, rtl_table_data(r, 2));
+	/* The SMAC shares word 1, so only IP_MTU_IDX is written here;
+	 * rtl931x_set_l3_egress_mac() fills the SMAC in afterwards with a
+	 * read-modify-write that keeps this nibble.
+	 */
+	sw_w32(intf->ip4_mtu_id & 0xf, rtl_table_data(r, 1));
+	sw_w32(v, rtl_table_data(r, 2));
 	sw_w32(0, rtl_table_data(r, 3));
 	rtl_table_write(r, idx);
 	rtl_table_release(r);
