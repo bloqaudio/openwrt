@@ -3242,6 +3242,81 @@ static bool rtl83xx_mac_is_unsnoop(const unsigned char *addr)
 	return false;
 }
 
+/* Claim the L2 multicast entry for a group an L3 route offloads.
+ *
+ * A routed multicast frame is subject to the bridging decision as well as the
+ * route: the ingress interface's scope action for the group's range resolves to
+ * "follow the bridging decision if a match entry exists, or flood in the VLAN".
+ * With no entry the frame floods within the routed port's internal VLAN, whose
+ * only other member is the CPU port, so the CPU receives a copy and forwards it
+ * again in software. Installing an entry makes the match true and the portmask
+ * governs instead.
+ *
+ * The portmask names the ingress port only: the route's output-interface list
+ * does the replication, and the same-port filter discards the bridged copy. An
+ * empty portmask is avoided because the group allocator treats that as free.
+ *
+ * An entry that already exists is left alone. It belongs to the MDB path, which
+ * has bridged members expecting it, and a route must not take it over.
+ */
+int rtl83xx_mc_l2_claim(struct rtl838x_switch_priv *priv, int vid, u64 mac,
+			int port)
+{
+	u64 seed = priv->r->l2_hash_seed(mac, vid);
+	struct rtl838x_l2_entry e;
+	int mc_group, idx, err = 0;
+
+	mutex_lock(&priv->reg_mutex);
+
+	idx = rtl83xx_find_l2_hash_entry(priv, seed, false, &e);
+	if (idx < 0 || e.valid)
+		goto out;
+
+	mc_group = rtl83xx_mc_group_alloc(priv, port);
+	if (mc_group < 0) {
+		err = -ENOSPC;
+		goto out;
+	}
+
+	rtl83xx_setup_l2_mc_entry(&e, vid, mac, mc_group);
+	priv->r->write_l2_entry_using_hash(idx >> 2, idx & 0x3, &e);
+
+out:
+	mutex_unlock(&priv->reg_mutex);
+
+	return err;
+}
+
+/* Release an entry claimed by rtl83xx_mc_l2_claim(). Only an entry whose
+ * portmask is still the single ingress port is removed: anything else has been
+ * joined by the MDB path since, and its bridged members still need it.
+ */
+void rtl83xx_mc_l2_release(struct rtl838x_switch_priv *priv, int vid, u64 mac,
+			   int port)
+{
+	u64 seed = priv->r->l2_hash_seed(mac, vid);
+	struct rtl838x_l2_entry e;
+	int idx;
+
+	mutex_lock(&priv->reg_mutex);
+
+	idx = rtl83xx_find_l2_hash_entry(priv, seed, true, &e);
+	if (idx < 0 || !e.valid)
+		goto out;
+
+	if (priv->r->read_mcast_pmask(e.mc_portmask_index) != BIT_ULL(port))
+		goto out;
+
+	priv->r->write_mcast_pmask(e.mc_portmask_index, 0);
+	clear_bit(e.mc_portmask_index, priv->mc_group_bm);
+
+	e.valid = false;
+	priv->r->write_l2_entry_using_hash(idx >> 2, idx & 0x3, &e);
+
+out:
+	mutex_unlock(&priv->reg_mutex);
+}
+
 static int rtl83xx_port_mdb_add(struct dsa_switch *ds, int port,
 				const struct switchdev_obj_port_mdb *mdb,
 				const struct dsa_db db)

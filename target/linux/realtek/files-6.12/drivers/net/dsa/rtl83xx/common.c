@@ -3015,6 +3015,61 @@ err_release:
 	return idx;
 }
 
+/* The link-layer group address a routed multicast frame carries. */
+static u64 rtldsa_mc_group_mac(const struct rtl83xx_mc_route *mc)
+{
+	u32 low = be32_to_cpu(mc->key.grp.s6_addr32[3]);
+
+	if (mc->key.family == RTNL_FAMILY_IP6MR)
+		return 0x333300000000ULL | low;
+
+	return 0x01005e000000ULL | (low & 0x7fffff);
+}
+
+/* Stop the bridging decision from flooding an offloaded group into the ingress
+ * port's VLAN, which on a bare routed port means straight to the CPU.
+ *
+ * Only bare routed ports qualify. Their reserved VLAN holds the port and the CPU
+ * and nothing else, so a bridged copy has no legitimate destination. A bridged
+ * ingress interface has real members that are entitled to the flood.
+ */
+static void rtldsa_mc_l2_claim(struct rtl838x_switch_priv *priv,
+			       struct rtl83xx_mc_route *mc)
+{
+	const struct rtl83xx_mc_vif *vifs = priv->mc_vifs[rtldsa_mc_fam_idx(mc->key.family)];
+	struct mr_mfc *mfc = mc->mfc;
+	u64 mac;
+	u16 vid;
+	int port;
+
+	if (mc->l2_vid || mfc->mfc_parent >= MAXVIFS || !vifs[mfc->mfc_parent].valid)
+		return;
+
+	vid = vifs[mfc->mfc_parent].vid;
+	if (vid < RTLDSA_L3_PORT_VID(priv->cpu_port - 1))
+		return;
+
+	port = 4094 - vid;
+	mac = rtldsa_mc_group_mac(mc);
+
+	if (rtl83xx_mc_l2_claim(priv, vid, mac, port))
+		return;
+
+	mc->l2_vid = vid;
+	mc->l2_mac = mac;
+	mc->l2_port = port;
+}
+
+static void rtldsa_mc_l2_release(struct rtl838x_switch_priv *priv,
+				 struct rtl83xx_mc_route *mc)
+{
+	if (!mc->l2_vid)
+		return;
+
+	rtl83xx_mc_l2_release(priv, mc->l2_vid, mc->l2_mac, mc->l2_port);
+	mc->l2_vid = 0;
+}
+
 /* Program the hardware entry for a route whose output-interface list is
  * already built. Also used to reprogram one after a vif change.
  */
@@ -3073,6 +3128,12 @@ static int rtldsa_mc_route_program(struct rtl838x_switch_priv *priv,
 	priv->r->mc_route_write(slot, rt);
 	rtldsa_mc_offload_set(mc, action != ROUTE_ACT_TRAP2CPU);
 
+	/* A trapping route is meant to reach the CPU, so leave bridging alone. */
+	if (action == ROUTE_ACT_TRAP2CPU)
+		rtldsa_mc_l2_release(priv, mc);
+	else
+		rtldsa_mc_l2_claim(priv, mc);
+
 	return 0;
 }
 
@@ -3084,6 +3145,7 @@ static void rtldsa_mc_route_unprogram(struct rtl838x_switch_priv *priv,
 		priv->r->mc_route_write(mc->slot, &mc->rt);
 		mc->slot = -1;
 	}
+	rtldsa_mc_l2_release(priv, mc);
 	rtldsa_mc_oifs_release(priv, mc);
 	rtldsa_mc_offload_set(mc, false);
 }

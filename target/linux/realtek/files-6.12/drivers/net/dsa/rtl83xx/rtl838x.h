@@ -1622,6 +1622,13 @@ struct rtl83xx_mc_route {
 	struct rtl83xx_route rt;	/* Image of the programmed hardware entry */
 	struct rtl83xx_mc_oif_res oifs[RTLDSA_MC_MAX_VIFS];
 	int n_oifs;
+	/* The L2 multicast entry this route claimed so bridging stops flooding
+	 * the group into the ingress port's internal VLAN. l2_vid is zero when
+	 * no entry is held, which includes losing a race with the MDB path.
+	 */
+	u16 l2_vid;
+	int l2_port;
+	u64 l2_mac;
 	bool offloaded;
 };
 

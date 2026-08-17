@@ -140,6 +140,8 @@ void rtl83xx_l3_flush_neigh_routes(struct rtl838x_switch_priv *priv, int port);
 int rtl83xx_packet_cntr_alloc(struct rtl838x_switch_priv *priv);
 int rtl83xx_port_get_stp_state(struct rtl838x_switch_priv *priv, int port);
 int rtl83xx_mc_group_alloc_mask(struct rtl838x_switch_priv *priv, u64 portmask);
+int rtl83xx_mc_l2_claim(struct rtl838x_switch_priv *priv, int vid, u64 mac, int port);
+void rtl83xx_mc_l2_release(struct rtl838x_switch_priv *priv, int vid, u64 mac, int port);
 int rtl83xx_port_is_under(const struct net_device *dev, struct rtl838x_switch_priv *priv);
 void rtl83xx_port_stp_state_set(struct dsa_switch *ds, int port, u8 state);
 int rtl83xx_setup_tc(struct net_device *dev, enum tc_setup_type type, void *type_data);
