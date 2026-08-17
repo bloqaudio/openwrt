@@ -624,9 +624,16 @@ static void rtl930x_fill_l2_row(u32 r[], struct rtl838x_l2_entry *e)
 
 	r[2] |= e->next_hop ? BIT(12) : 0;
 
+	/* FID_RVID is part of the lookup key for both entry types, and the hash
+	 * seed folds it in, so it has to be written outside the type split. A
+	 * multicast entry left without it lands in the bucket its VLAN selects
+	 * but stores zero, so no lookup can ever match it and the driver cannot
+	 * find it again to remove it.
+	 */
+	r[1] |= e->rvid & 0xfff;
+
 	if (e->type == L2_UNICAST) {
 		r[2] |= e->is_static ? BIT(14) : 0;
-		r[1] |= e->rvid & 0xfff;
 		/* The SPA field {devID[3:0], port[5:0]} is composed below -
 		 * OR-ing the raw port on top would corrupt the devID bits
 		 * for trunk entries.
