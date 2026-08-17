@@ -985,6 +985,13 @@ typedef enum {
 #define RTL931X_L3_HOST_TBL_CTRL		(0xF004)
 #define RTL931X_L3_IPUC_ROUTE_CTRL		(0xF008)
 #define RTL931X_L3_IP6UC_ROUTE_CTRL		(0xF00C)
+/* Multicast routing has a global enable of its own, in addition to the
+ * per-ingress-interface IPMC_ROUTE_EN in L3_IGR_INTF. Both are required: with
+ * GLB_EN (bit 0) clear the route lookup is not performed at all, so an entry
+ * stays valid and correctly keyed and its hit bit never sets.
+ */
+#define RTL931X_L3_IPMC_ROUTE_CTRL		(0xF010)
+#define RTL931X_L3_IP6MC_ROUTE_CTRL		(0xF014)
 #define RTL931X_L3_INTF_IP_MTU(i)		(0xF1E0 + ((i) << 2))
 #define RTL931X_L3_INTF_IP6_MTU(i)		(0xF220 + ((i) << 2))
 #define RTL931X_L3_ENTRY_MV_CTRL		(0xF260)
@@ -1053,6 +1060,12 @@ typedef enum {
 #define MAX_ROUTER_MACS 64
 #define L3_EGRESS_DMACS 2048
 #define MAX_SMACS 64
+/* Hardware output-interface list elements backing IPMR/IP6MR routes, sized
+ * for the largest family: RTL931x has 16384, RTL930x 512. Clamped per family
+ * at L3 setup through priv->n_mc_oifs. Element 0 doubles as the "no next
+ * element" encoding on both families and is never allocated.
+ */
+#define MAX_MC_OIFS 16384
 #define DSCP_MAP_MAX 64
 
 /* This interval needs to be short enough to prevent an undetected counter
@@ -1509,6 +1522,24 @@ struct rtl93xx_route_attr {
 	u8 action;
 };
 
+/* Result fields of a multicast route entry. The unicast attributes above
+ * describe a nexthop; a multicast entry replicates instead, so it carries a
+ * reverse-path check and a pointer to an output-interface list.
+ */
+struct rtl93xx_mc_route_attr {
+	u16 rpf_vid;		/* Expected ingress VLAN. Both families compare a
+				 * VLAN here, not an L3 interface id: Longan has
+				 * only a VID field, and Mango's RPF id follows
+				 * its multicast key select, which this driver
+				 * leaves in VLAN mode.
+				 */
+	bool rpf_check;
+	u8 rpf_fail_action;	/* ROUTE_ACT_* */
+	u8 ttl_min;		/* Ingress admission threshold, 0 = accept any */
+	u16 oif_idx;		/* Head element of the output-interface list */
+	bool oif_valid;
+};
+
 struct rtl83xx_route {
 	struct in6_addr gw_ip6;		/* IP of the route's gateway - the hashtable key.
 					 * IPv4 gateways are stored v4-mapped so the
@@ -1523,12 +1554,89 @@ struct rtl83xx_route {
 					 * torn down on neighbour invalidation
 					 */
 	int ifindex;			/* netdev the gateway neighbour lives on; 0 = unknown */
+	u32 src_ip;			/* IPv4 multicast source, 0 for (*,G) */
+	struct in6_addr src_ip6;	/* IPv6 multicast source, :: for (*,G) */
 	int id;				/* ID number of this route */
 	struct rhlist_head linkage;
 	u16 switch_mac_id;		/* Index into switch's own MACs, RTL839X only */
 	struct rtl83xx_nexthop nh;
 	struct pie_rule pr;
 	struct rtl93xx_route_attr attr;
+	struct rtl93xx_mc_route_attr mc;
+};
+
+/* Multicast routing tracks one vif table per address family. The value must
+ * match the kernel's MAXVIFS; common.c asserts that against <linux/mroute.h>
+ * so this header does not have to pull the multicast routing headers in.
+ */
+#define RTLDSA_MC_MAX_VIFS 32
+
+/* One element of a hardware output-interface list: an egress L3 interface
+ * together with the port set inside it. Hardware chains the elements, so a
+ * writer needs its successor as well as its own contents.
+ */
+struct rtl83xx_mc_oif {
+	u16 intf_id;		/* Index into the L3 egress interface table */
+	u16 pmask_idx;		/* Multicast portmask group */
+	u16 next;		/* Successor element, 0 when this is the last */
+	bool last;
+	bool ttl_dec;
+	bool ttl_check;
+};
+
+/* Resources a single output interface of a multicast route holds. Freed in
+ * reverse on teardown; the vif index ties it back to the kernel's vif table
+ * so a vif going away can find the routes referencing it.
+ */
+struct rtl83xx_mc_oif_res {
+	u16 oif_idx;
+	u16 pmask_idx;
+	u16 intf_id;
+	u16 vif;
+};
+
+/* Key of an offloaded multicast route. IPv4 addresses are stored v4-mapped so
+ * an IPv4 and an IPv6 group can never share a bucket, matching the convention
+ * struct rtl83xx_route uses for gateways.
+ */
+struct rtl83xx_mc_key {
+	struct in6_addr grp;
+	struct in6_addr src;	/* :: for (*,G) */
+	u32 family;		/* RTNL_FAMILY_IPMR or RTNL_FAMILY_IP6MR. Sized so the
+				 * key has no padding: rhashtable compares it with
+				 * memcmp over the whole struct.
+				 */
+};
+
+struct rtl83xx_mc_route {
+	struct rhash_head node;
+	/* Iterating the hashtable holds rcu_read_lock, which rules out the
+	 * mutex-taking table accessors, so bulk work walks this list under RTNL
+	 * instead.
+	 */
+	struct list_head list;
+	struct rtl83xx_mc_key key;
+	struct mr_mfc *mfc;		/* Reference held for the route's lifetime */
+	int id;				/* Host-route id, offset by MAX_ROUTES */
+	int slot;			/* Hardware host-table slot, -1 if unplaced */
+	struct rtl83xx_route rt;	/* Image of the programmed hardware entry */
+	struct rtl83xx_mc_oif_res oifs[RTLDSA_MC_MAX_VIFS];
+	int n_oifs;
+	bool offloaded;
+};
+
+/* A multicast routing vif. Only vifs whose netdev resolves to a switch L3
+ * interface can be replicated in hardware; the rest keep dev set but stay
+ * invalid so a route using them is trapped instead of silently dropped.
+ */
+struct rtl83xx_mc_vif {
+	struct net_device *dev;
+	u16 intf_id;
+	u16 vid;		/* VLAN the interface routes in; the reverse-path
+				 * check compares against it
+				 */
+	u16 pmask_idx;
+	bool valid;
 };
 
 /**
@@ -1668,6 +1776,33 @@ struct rtl838x_reg {
 	void (*get_l3_router_mac)(u32 idx, struct rtl93xx_rt_mac *m);
 	void (*set_l3_router_mac)(u32 idx, struct rtl93xx_rt_mac *m);
 	void (*set_l3_egress_intf)(int idx, struct rtl838x_l3_intf *intf);
+	/* Multicast route entries share the host-route memory with unicast
+	 * ones and are told apart by rtl93xx_route_attr::type, but they are
+	 * wider and hash on (source, group) instead of the destination, so
+	 * they need their own accessors and slot search.
+	 */
+	void (*mc_route_read)(int idx, struct rtl83xx_route *rt);
+	void (*mc_route_write)(int idx, struct rtl83xx_route *rt);
+	int (*mc_find_slot)(struct rtl83xx_route *rt, bool must_exist);
+	void (*mc_oif_write)(int idx, const struct rtl83xx_mc_oif *oif);
+	void (*mc_oif_read)(int idx, struct rtl83xx_mc_oif *oif);
+	/* Print the entry's raw table words. A decode can only show fields
+	 * somebody thought to add; the raw words let any bit be checked from a
+	 * dump without deriving offsets by hand.
+	 */
+	void (*mc_route_dump)(int idx, u8 type, struct seq_file *m);
+	/* Both families gate multicast routing globally at L3 setup. Mango has a
+	 * second, per-ingress-interface gate on top of that, and needs both; a
+	 * family with no per-interface gate leaves this unset.
+	 */
+	void (*l3_mc_intf_enable)(int idx, bool enable);
+	bool l3_mc_offload;
+	/* Print where this family gates multicast routing, so a dump can show
+	 * whether it is armed for an interface rather than only that the driver
+	 * asked for it.
+	 */
+	void (*l3_mc_dump)(struct rtl838x_switch_priv *priv, int intf_id,
+			   struct seq_file *m);
 	void (*set_distribution_algorithm)(int group, int algoidx, u32 algomask);
 	void (*set_receive_management_action)(int port, rma_ctrl_t type, action_type_t action);
 	void (*led_init)(struct rtl838x_switch_priv *priv);
@@ -1743,6 +1878,16 @@ struct rtl838x_switch_priv {
 	int n_route_ids;	/* family clamp on the route id pools */
 	int n_host_route_ids;
 	int ip6_prefix_hw_cnt;	/* entries programmed in the IPv6 prefix region */
+	/* Offloaded multicast routes, keyed on struct rtl83xx_mc_key. The vif
+	 * tables are indexed by address family: 0 for IPv4, 1 for IPv6, since
+	 * the kernel keeps a separate vif space per family.
+	 */
+	struct rhashtable mc_routes;
+	struct list_head mc_route_list;
+	bool mc_routes_initialized;
+	struct rtl83xx_mc_vif mc_vifs[2][RTLDSA_MC_MAX_VIFS];
+	unsigned long mc_oif_use_bm[MAX_MC_OIFS >> 5];
+	int n_mc_oifs;		/* family clamp on the output-interface list pool */
 	struct rtl838x_l3_intf *interfaces[MAX_INTERFACES];
 	u16 intf_mtus[MAX_INTF_MTUS];
 	int intf_mtu_count[MAX_INTF_MTUS];
