@@ -1120,6 +1120,144 @@ static u32 rtl930x_l3_hash6(struct in6_addr *ip6, int algorithm, bool move_dip)
 	return hash;
 }
 
+/* Multicast host-route hash, algorithms 0 and 1. Unlike the unicast hashes
+ * above these fold the source address in as well as the group. The VLAN rows
+ * of both algorithms are omitted: they only contribute in the SIP_GIP_VID
+ * hash-key mode, and this driver leaves the hardware in the default SIP_GIP
+ * mode.
+ */
+static u32 rtl930x_mc_hash4(u32 sip, u32 gip, int algorithm)
+{
+	u32 rows[8];
+	u32 hash;
+	u32 s0, s1, pH;
+
+	memset(rows, 0, sizeof(rows));
+
+	if (!algorithm) {
+		rows[0] = HASH_PICK(sip, 24, 8);
+		rows[1] = HASH_PICK(sip, 15, 9);
+		rows[2] = HASH_PICK(sip, 6, 9);
+		rows[3] = HASH_PICK(sip, 0, 6) << 2;
+		rows[4] = HASH_PICK(gip, 27, 5);
+		rows[5] = HASH_PICK(gip, 18, 9);
+		rows[6] = HASH_PICK(gip, 9, 9);
+		rows[7] = HASH_PICK(gip, 0, 9);
+		hash = rows[0] ^ rows[1] ^ rows[2] ^ rows[3] ^
+		       rows[4] ^ rows[5] ^ rows[6] ^ rows[7];
+	} else {
+		rows[0] = HASH_PICK(sip, 26, 6);
+		rows[1] = HASH_PICK(sip, 17, 9);
+		rows[2] = HASH_PICK(sip, 8, 9);
+		rows[3] = HASH_PICK(sip, 0, 8) << 1;
+		rows[4] = HASH_PICK(gip, 27, 5);
+		rows[5] = HASH_PICK(gip, 18, 9);
+		rows[6] = HASH_PICK(gip, 9, 9);
+		rows[7] = HASH_PICK(gip, 0, 9);
+		s0 = rows[0] + rows[1] + rows[2] + rows[3] +
+		     rows[4] + rows[5] + rows[6];
+		s1 = (s0 & 0x1ff) + ((s0 & (0x1ff << 9)) >> 9);
+		pH = (s1 & 0x1ff) + ((s1 & (0x1ff << 9)) >> 9);
+		hash = pH ^ rows[7];
+	}
+	return hash;
+}
+
+static u32 rtl930x_mc_hash6(const struct in6_addr *sip, const struct in6_addr *gip,
+			    int algorithm)
+{
+	const u8 *s = sip->s6_addr;	/* s[0] is the most significant octet */
+	const u8 *g = gip->s6_addr;
+	u32 rows[30];
+	u32 hash;
+	u32 s0, s1, pH;
+
+	memset(rows, 0, sizeof(rows));
+
+	if (!algorithm) {
+		rows[0] = HASH_PICK(s[0], 3, 5);
+		rows[1] = (HASH_PICK(s[0], 0, 3) << 6) | HASH_PICK(s[1], 2, 6);
+		rows[2] = (HASH_PICK(s[1], 0, 2) << 7) | HASH_PICK(s[2], 1, 7);
+		rows[3] = (HASH_PICK(s[2], 0, 1) << 8) | HASH_PICK(s[3], 0, 8);
+		rows[4] = (HASH_PICK(s[4], 0, 8) << 1) | HASH_PICK(s[5], 7, 1);
+		rows[5] = (HASH_PICK(s[5], 0, 7) << 2) | HASH_PICK(s[6], 6, 2);
+		rows[6] = (HASH_PICK(s[6], 0, 6) << 3) | HASH_PICK(s[7], 5, 3);
+		rows[7] = (HASH_PICK(s[7], 0, 5) << 4) | HASH_PICK(s[8], 4, 4);
+		rows[8] = (HASH_PICK(s[8], 0, 4) << 5) | HASH_PICK(s[9], 3, 5);
+		rows[9] = (HASH_PICK(s[9], 0, 3) << 6) | HASH_PICK(s[10], 2, 6);
+		rows[10] = (HASH_PICK(s[10], 0, 2) << 7) | HASH_PICK(s[11], 1, 7);
+		rows[11] = (HASH_PICK(s[11], 0, 1) << 8) | HASH_PICK(s[12], 0, 8);
+		rows[12] = (HASH_PICK(s[13], 0, 8) << 1) | HASH_PICK(s[14], 7, 1);
+		rows[13] = (HASH_PICK(s[14], 0, 7) << 2) | HASH_PICK(s[15], 6, 2);
+		/* The trailing source row is shifted by 2, not 3 */
+		rows[14] = HASH_PICK(s[15], 0, 6) << 2;
+
+		rows[15] = HASH_PICK(g[0], 6, 2);
+		rows[16] = (HASH_PICK(g[0], 0, 6) << 3) | HASH_PICK(g[1], 5, 3);
+		rows[17] = (HASH_PICK(g[1], 0, 5) << 4) | HASH_PICK(g[2], 4, 4);
+		rows[18] = (HASH_PICK(g[2], 0, 4) << 5) | HASH_PICK(g[3], 3, 5);
+		rows[19] = (HASH_PICK(g[3], 0, 3) << 6) | HASH_PICK(g[4], 2, 6);
+		rows[20] = (HASH_PICK(g[4], 0, 2) << 7) | HASH_PICK(g[5], 1, 7);
+		rows[21] = (HASH_PICK(g[5], 0, 1) << 8) | HASH_PICK(g[6], 0, 8);
+		rows[22] = (HASH_PICK(g[7], 0, 8) << 1) | HASH_PICK(g[8], 7, 1);
+		rows[23] = (HASH_PICK(g[8], 0, 7) << 2) | HASH_PICK(g[9], 6, 2);
+		rows[24] = (HASH_PICK(g[9], 0, 6) << 3) | HASH_PICK(g[10], 5, 3);
+		rows[25] = (HASH_PICK(g[10], 0, 5) << 4) | HASH_PICK(g[11], 4, 4);
+		rows[26] = (HASH_PICK(g[11], 0, 4) << 5) | HASH_PICK(g[12], 3, 5);
+		rows[27] = (HASH_PICK(g[12], 0, 3) << 6) | HASH_PICK(g[13], 2, 6);
+		rows[28] = (HASH_PICK(g[13], 0, 2) << 7) | HASH_PICK(g[14], 1, 7);
+		rows[29] = (HASH_PICK(g[14], 0, 1) << 8) | HASH_PICK(g[15], 0, 8);
+
+		hash = 0;
+		for (int i = 0; i < 30; i++)
+			hash ^= rows[i];
+	} else {
+		rows[0] = HASH_PICK(s[12], 2, 6);
+		rows[1] = (HASH_PICK(s[12], 0, 2) << 7) | HASH_PICK(s[13], 1, 7);
+		rows[2] = (HASH_PICK(s[13], 0, 1) << 8) | HASH_PICK(s[14], 0, 8);
+		rows[3] = HASH_PICK(s[15], 0, 8) << 1;
+
+		rows[4] = HASH_PICK(s[0], 0, 8);
+		rows[5] = (HASH_PICK(s[1], 0, 8) << 1) | HASH_PICK(s[2], 7, 1);
+		rows[6] = (HASH_PICK(s[2], 0, 7) << 2) | HASH_PICK(s[3], 6, 2);
+		rows[7] = (HASH_PICK(s[3], 0, 6) << 3) | HASH_PICK(s[4], 5, 3);
+		rows[8] = (HASH_PICK(s[4], 0, 5) << 4) | HASH_PICK(s[5], 4, 4);
+		rows[9] = (HASH_PICK(s[5], 0, 4) << 5) | HASH_PICK(s[6], 3, 5);
+		rows[10] = (HASH_PICK(s[6], 0, 3) << 6) | HASH_PICK(s[7], 2, 6);
+		rows[11] = (HASH_PICK(s[7], 0, 2) << 7) | HASH_PICK(s[8], 1, 7);
+		rows[12] = (HASH_PICK(s[8], 0, 1) << 8) | HASH_PICK(s[9], 0, 8);
+		rows[13] = (HASH_PICK(s[10], 0, 8) << 1) | HASH_PICK(s[11], 7, 1);
+		/* The last source row shares its word with the top group bits */
+		rows[14] = (HASH_PICK(s[11], 0, 7) << 2) | HASH_PICK(g[0], 6, 2);
+
+		rows[15] = (HASH_PICK(g[0], 0, 6) << 3) | HASH_PICK(g[1], 5, 3);
+		rows[16] = (HASH_PICK(g[1], 0, 5) << 4) | HASH_PICK(g[2], 4, 4);
+		rows[17] = (HASH_PICK(g[2], 0, 4) << 5) | HASH_PICK(g[3], 3, 5);
+		rows[18] = (HASH_PICK(g[3], 0, 3) << 6) | HASH_PICK(g[4], 2, 6);
+		rows[19] = (HASH_PICK(g[4], 0, 2) << 7) | HASH_PICK(g[5], 1, 7);
+		rows[20] = (HASH_PICK(g[5], 0, 1) << 8) | HASH_PICK(g[6], 0, 8);
+		rows[21] = (HASH_PICK(g[7], 0, 8) << 1) | HASH_PICK(g[8], 7, 1);
+		rows[22] = (HASH_PICK(g[8], 0, 7) << 2) | HASH_PICK(g[9], 6, 2);
+		rows[23] = (HASH_PICK(g[9], 0, 6) << 3) | HASH_PICK(g[10], 5, 3);
+		rows[24] = (HASH_PICK(g[10], 0, 5) << 4) | HASH_PICK(g[11], 4, 4);
+		rows[25] = HASH_PICK(g[11], 0, 4) << 5;
+		rows[26] = HASH_PICK(g[12], 3, 5);
+		rows[27] = (HASH_PICK(g[12], 0, 3) << 6) | HASH_PICK(g[13], 2, 6);
+		rows[28] = (HASH_PICK(g[13], 0, 2) << 7) | HASH_PICK(g[14], 1, 7);
+		rows[29] = (HASH_PICK(g[14], 0, 1) << 8) | HASH_PICK(g[15], 0, 8);
+
+		s0 = rows[0] + rows[1] + rows[2] + rows[3] +
+		     rows[26] + rows[27] + rows[28];
+		s1 = (s0 & 0x1ff) + ((s0 & (0x1ff << 9)) >> 9);
+		pH = (s1 & 0x1ff) + ((s1 & (0x1ff << 9)) >> 9);
+
+		hash = pH ^ rows[29];
+		for (int i = 4; i <= 25; i++)
+			hash ^= rows[i];
+	}
+	return hash;
+}
+
 /* Read a prefix route entry from the L3_PREFIX_ROUTE_IPUC table
  * We currently only support IPv4 and IPv6 unicast route
  */
@@ -1446,6 +1584,299 @@ static int rtl930x_find_l3_slot(struct rtl83xx_route *rt, bool must_exist)
 	}
 
 	return -1;
+}
+
+/* RPF_FAIL_ACT does not use the ROUTE_ACT_* encoding of the other action
+ * fields: hardware numbers it 0 TRAP, 1 DROP, 2 COPY, 3 ASSERT_CHK, so a
+ * zeroed field traps instead of dropping. There is no forward equivalent -
+ * a reverse-path failure always has to stop the replication.
+ */
+static u32 rtl930x_mc_rpf_act_enc(u8 action)
+{
+	switch (action) {
+	case ROUTE_ACT_TRAP2CPU:
+		return 0;
+	case ROUTE_ACT_COPY2CPU:
+		return 2;
+	default:
+		return 1;
+	}
+}
+
+static u8 rtl930x_mc_rpf_act_dec(u32 v)
+{
+	switch (v) {
+	case 0:
+		return ROUTE_ACT_TRAP2CPU;
+	case 2:
+		return ROUTE_ACT_COPY2CPU;
+	default:
+		return ROUTE_ACT_DROP;
+	}
+}
+
+/* Read a multicast host route entry. Multicast entries share the host route
+ * table with the unicast ones and are told apart by their entry type, so a
+ * unicast entry read through here reports its type and nothing else.
+ */
+static void rtl930x_mc_route_read(int idx, struct rtl83xx_route *rt)
+{
+	u32 a[4], v;
+	/* Read L3_HOST_ROUTE_IPMC/IP6MC table (1) via register RTL9300_TBL_1 */
+	struct table_reg *r = rtl_table_get(RTL9300_TBL_1, 1);
+
+	idx = ((idx / 6) * 8) + (idx % 6);
+
+	rtl_table_read(r, idx);
+	/* A multicast entry spans 11 registers, data(0) holding bits 351:320 */
+	v = sw_r32(rtl_table_data(r, 0));
+	rt->attr.valid = !!(v & BIT(31));
+	if (!rt->attr.valid)
+		goto out;
+	rt->attr.type = (v >> 29) & 0x3;
+
+	switch (rt->attr.type) {
+	case 1: /* IPv4 multicast route */
+		v = sw_r32(rtl_table_data(r, 4));
+		/* An all-ones source is the hardware's (*,G) wildcard */
+		rt->src_ip = v == 0xffffffff ? 0 : v;
+		rt->dst_ip = sw_r32(rtl_table_data(r, 8));
+		break;
+	case 3: /* IPv6 multicast route */
+		for (int i = 0; i < 4; i++)
+			a[i] = sw_r32(rtl_table_data(r, 1 + i));
+		if ((a[0] & a[1] & a[2] & a[3]) == 0xffffffff)
+			ipv6_addr_set(&rt->src_ip6, 0, 0, 0, 0);
+		else
+			ipv6_addr_set(&rt->src_ip6, a[0], a[1], a[2], a[3]);
+		ipv6_addr_set(&rt->dst_ip6,
+			      sw_r32(rtl_table_data(r, 5)), sw_r32(rtl_table_data(r, 6)),
+			      sw_r32(rtl_table_data(r, 7)), sw_r32(rtl_table_data(r, 8)));
+		break;
+	default: /* a unicast entry sharing the table */
+		goto out;
+	}
+
+	v = sw_r32(rtl_table_data(r, 9));
+	rt->attr.hit = !!(v & BIT(29));
+	rt->mc.ttl_min = (v >> 21) & 0xff;
+	rt->mc.rpf_vid = (v >> 1) & 0xfff;
+
+	v = sw_r32(rtl_table_data(r, 10));
+	rt->attr.qos_prio = (v >> 29) & 0x7;
+	rt->attr.action = (v >> 13) & 0x3;
+	rt->mc.rpf_check = !!(v & BIT(12));
+	rt->mc.rpf_fail_action = rtl930x_mc_rpf_act_dec((v >> 10) & 0x3);
+	rt->mc.oif_valid = !!(v & BIT(9));
+	rt->mc.oif_idx = v & 0x1ff;
+
+out:
+	rtl_table_release(r);
+}
+
+static void rtl930x_mc_route_write(int idx, struct rtl83xx_route *rt)
+{
+	u32 d[11], v;
+	/* Access L3_HOST_ROUTE_IPMC/IP6MC table (1) via register RTL9300_TBL_1 */
+	struct table_reg *r = rtl_table_get(RTL9300_TBL_1, 1);
+
+	idx = ((idx / 6) * 8) + (idx % 6);
+
+	memset(d, 0, sizeof(d));
+
+	/* IPMC_TYPE has to be set because the host table runs in forced
+	 * lookup mode; without it the entry is valid but never matches.
+	 */
+	d[0] = (rt->attr.valid ? BIT(31) : 0) | ((rt->attr.type & 0x3) << 29) | BIT(28);
+
+	if (rt->attr.type == 3) {
+		bool wild = ipv6_addr_any(&rt->src_ip6);
+
+		/* An all-ones source is the hardware's (*,G) wildcard */
+		for (int i = 0; i < 4; i++) {
+			d[1 + i] = wild ? 0xffffffff : rt->src_ip6.s6_addr32[i];
+			d[5 + i] = rt->dst_ip6.s6_addr32[i];
+		}
+	} else {
+		d[4] = rt->src_ip ? rt->src_ip : 0xffffffff;
+		d[8] = rt->dst_ip;
+	}
+
+	/* MTU_MAX_IDX, STACK_FWD_PMSK (single unit) and QOS_AS stay 0.
+	 *
+	 * VID carries the expected ingress VLAN for the reverse-path check and
+	 * is only meaningful with RPF_CHK_EN set. VID_CMP stays 0: it would add
+	 * the VLAN to the lookup key, and the hardware treats that as mutually
+	 * exclusive with the reverse-path check, which reads the same field.
+	 */
+	d[9] = (rt->attr.hit ? BIT(29) : 0) | ((rt->mc.ttl_min & 0xff) << 21) |
+	       ((rt->mc.rpf_vid & 0xfff) << 1);
+
+	/* L2_EN stays clear: a routed multicast frame keeps whatever bridging
+	 * decides for it, and the L2 multicast table is where that is steered.
+	 */
+	v = (rt->attr.qos_prio & 0x7) << 29;
+	v |= BIT(15);					/* L3_EN */
+	v |= (rt->attr.action & 0x3) << 13;		/* L3_ACT */
+	v |= rt->mc.rpf_check ? BIT(12) : 0;
+	v |= rtl930x_mc_rpf_act_enc(rt->mc.rpf_fail_action) << 10;
+	v |= rt->mc.oif_valid ? BIT(9) : 0;
+	v |= rt->mc.oif_idx & 0x1ff;
+	d[10] = v;
+
+	for (int i = 0; i < 11; i++)
+		sw_w32(d[i], rtl_table_data(r, i));
+
+	rtl_table_write(r, idx);
+	rtl_table_release(r);
+}
+
+/* Print an entry's raw table words. Both multicast entry types are 11 registers
+ * wide on this family.
+ */
+static void rtl930x_mc_route_dump(int idx, u8 type, struct seq_file *m)
+{
+	struct table_reg *r = rtl_table_get(RTL9300_TBL_1, 1);
+	u32 d[11];
+
+	rtl_table_read(r, ((idx / 6) * 8) + (idx % 6));
+	for (int i = 0; i < 11; i++)
+		d[i] = sw_r32(rtl_table_data(r, i));
+	rtl_table_release(r);
+
+	seq_printf(m, "              raw:");
+	for (int i = 0; i < 11; i++)
+		seq_printf(m, " %08x", d[i]);
+	seq_puts(m, "\n");
+}
+
+static int rtl930x_mc_find_slot(struct rtl83xx_route *rt, bool must_exist)
+{
+	int slot_width, algorithm, addr, idx;
+	struct rtl83xx_route route_entry;
+	struct in6_addr sip6 = rt->src_ip6;
+	u32 sip = rt->src_ip ? rt->src_ip : 0xffffffff;
+	u32 hash;
+
+	/* An IPv4 multicast entry covers two slots of a hash row, an IPv6 one
+	 * covers all six - so an IPv6 group can only start at slot 0.
+	 */
+	slot_width = rt->attr.type == 3 ? 6 : 2;
+
+	/* (*,G) is keyed as an all-ones source, the hardware's own wildcard */
+	if (ipv6_addr_any(&sip6))
+		ipv6_addr_set(&sip6, 0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff);
+
+	for (int t = 0; t < 2; t++) {
+		/* Multicast has its own pair of algorithm selects, distinct
+		 * from the unicast pair the host route lookup uses.
+		 */
+		algorithm = (sw_r32(RTL930X_L3_HOST_TBL_CTRL) >> (4 + t)) & 0x1;
+		if (rt->attr.type == 3)
+			hash = rtl930x_mc_hash6(&sip6, &rt->dst_ip6, algorithm);
+		else
+			hash = rtl930x_mc_hash4(sip, rt->dst_ip, algorithm);
+
+		pr_debug("%s: table %d, algorithm %d, hash %04x\n", __func__, t, algorithm, hash);
+
+		for (int s = 0; s < 6; s += slot_width) {
+			addr = (t << 12) | ((hash & 0x1ff) << 3) | s;
+			idx = ((addr / 8) * 6) + (addr % 8);
+
+			/* mc_route_read returns early on invalid entries -
+			 * clear the struct so stale fields from the previous
+			 * slot cannot produce a false match.
+			 */
+			memset(&route_entry, 0, sizeof(route_entry));
+			rtl930x_mc_route_read(idx, &route_entry);
+
+			if (!must_exist) {
+				bool free = !route_entry.attr.valid;
+
+				/* A multi-slot entry fits only if every slot
+				 * of its span is empty.
+				 */
+				for (int k = 1; k < slot_width && free; k++) {
+					int kidx = ((((addr + k) / 8) * 6) + ((addr + k) % 8));
+
+					memset(&route_entry, 0, sizeof(route_entry));
+					rtl930x_mc_route_read(kidx, &route_entry);
+					free = !route_entry.attr.valid;
+				}
+				if (free)
+					return idx;
+				continue;
+			}
+			if (route_entry.attr.valid &&
+			    route_entry.attr.type == rt->attr.type &&
+			    (rt->attr.type == 3 ?
+			     (ipv6_addr_equal(&route_entry.dst_ip6, &rt->dst_ip6) &&
+			      ipv6_addr_equal(&route_entry.src_ip6, &rt->src_ip6)) :
+			     (route_entry.dst_ip == rt->dst_ip &&
+			      route_entry.src_ip == rt->src_ip)))
+				return idx;
+		}
+	}
+
+	return -1;
+}
+
+/* Write one element of a hardware output-interface list. SA_REPLACE is always
+ * set: a routed replica leaves on a different L3 interface and has to carry
+ * that interface's MAC as its source.
+ */
+static void rtl930x_mc_oif_write(int idx, const struct rtl83xx_mc_oif *oif)
+{
+	u32 v;
+	/* Access L3_EGR_INTF_LIST table (5) via register RTL9300_TBL_1 */
+	struct table_reg *r = rtl_table_get(RTL9300_TBL_1, 5);
+
+	v = (oif->next & 0x1ff) << 21;
+	v |= oif->last ? BIT(20) : 0;
+	v |= oif->ttl_dec ? BIT(19) : 0;
+	v |= oif->ttl_check ? BIT(18) : 0;
+	v |= BIT(17);
+	v |= (oif->intf_id & 0x7f) << 10;
+	v |= oif->pmask_idx & 0x3ff;
+
+	sw_w32(v, rtl_table_data(r, 0));
+	rtl_table_write(r, idx);
+	rtl_table_release(r);
+}
+
+static void rtl930x_mc_oif_read(int idx, struct rtl83xx_mc_oif *oif)
+{
+	struct table_reg *r = rtl_table_get(RTL9300_TBL_1, 5);
+	u32 v;
+
+	rtl_table_read(r, idx);
+	v = sw_r32(rtl_table_data(r, 0));
+	rtl_table_release(r);
+
+	oif->next = (v >> 21) & 0x1ff;
+	oif->last = !!(v & BIT(20));
+	oif->ttl_dec = !!(v & BIT(19));
+	oif->ttl_check = !!(v & BIT(18));
+	oif->intf_id = (v >> 10) & 0x7f;
+	oif->pmask_idx = v & 0x3ff;
+}
+
+/* Multicast routing is gated globally on this family, so the interface index is
+ * not consulted.
+ */
+static void rtl930x_l3_mc_dump(struct rtl838x_switch_priv *priv, int intf_id,
+			       struct seq_file *m)
+{
+	u32 v4 = sw_r32(RTL930X_L3_IPMC_ROUTE_CTRL);
+	u32 v6 = sw_r32(RTL930X_L3_IP6MC_ROUTE_CTRL);
+	u32 h = sw_r32(RTL930X_L3_HOST_TBL_CTRL);
+
+	seq_printf(m, "    HOST_TBL_CTRL %08x: LU_MODE_SEL %d HASH_KEY_SEL %d MC_ALG t0 %d t1 %d\n",
+		   h, h & 1, (h >> 1) & 1, (h >> 4) & 1, (h >> 5) & 1);
+	seq_printf(m, "    global: IPMC_ROUTE_CTRL %08x (GLB_EN %d LU_MIS_ACT %d)\n",
+		   v4, v4 & 1, (v4 >> 15) & 3);
+	seq_printf(m, "            IP6MC_ROUTE_CTRL %08x (GLB_EN %d LU_MIS_ACT %d)\n",
+		   v6, v6 & 1, (v6 >> 21) & 3);
 }
 
 /* Write a prefix route into the routing table CAM at position idx
@@ -2364,6 +2795,7 @@ static void rtl930x_set_l3_egress_mac(u32 idx, u64 mac)
  */
 #define RTL930X_ROUTE_TBL_SIZE		512
 #define RTL930X_MAX_HOST_ROUTES		1536	/* 2048 addresses, 6 usable per 8 */
+#define RTL930X_MC_OIF_TBL_SIZE		512
 #define RTL930X_ROUTE_IDX_CATCHALL_IP4	(RTL930X_ROUTE_TBL_SIZE - 1)
 /* An IPv6 prefix entry is only valid at an index == 0 or 3 (mod 8) and
  * occupies a multi-slot footprint (SDK route-entry allocator); 507 is
@@ -2401,9 +2833,22 @@ static int rtl930x_l3_setup(struct rtl838x_switch_priv *priv)
 	for (int i = 0; i < MAX_SMACS; i++)
 		rtl930x_set_l3_egress_mac(L3_EGRESS_DMACS + i, 0ULL);
 
-	/* Configure the default L3 hash algorithm */
-	sw_w32_mask(BIT(2), 0, RTL930X_L3_HOST_TBL_CTRL);  /* Algorithm selection 0 = 0 */
-	sw_w32_mask(0, BIT(3), RTL930X_L3_HOST_TBL_CTRL);  /* Algorithm selection 1 = 1 */
+	/* Host table lookup control (L3_HOST_TBL_CTRL): LU_MODE_SEL 0,
+	 * LU_FORCE_MODE_HASH_KEY_SEL 1, UC_HASH_ALG_SEL_0 2, UC_HASH_ALG_SEL_1 3,
+	 * MC_HASH_ALG_SEL_0 4, MC_HASH_ALG_SEL_1 5.
+	 *
+	 * Unicast keeps algorithm 0 for table 0 and algorithm 1 for table 1.
+	 *
+	 * The multicast bits cannot be left at reset. LU_MODE_SEL selects forced
+	 * lookup mode, which is what makes IPMC_TYPE = 1 in a multicast entry
+	 * the matching value. LU_FORCE_MODE_HASH_KEY_SEL selects whether the
+	 * ingress VLAN joins the multicast hash key; the slot search hashes
+	 * source and group only, so a set bit would place every multicast entry
+	 * in a bucket the hardware never searches and no entry would ever match.
+	 * Both multicast tables use algorithm 0, as the vendor multicast init
+	 * does. Unicast hashing has no VLAN term, so none of this affects it.
+	 */
+	sw_w32_mask(0x3f, BIT(3), RTL930X_L3_HOST_TBL_CTRL);
 
 	pr_debug("L3_IPUC_ROUTE_CTRL %08x, IPMC_ROUTE %08x, IP6UC_ROUTE %08x, IP6MC_ROUTE %08x\n",
 		 sw_r32(RTL930X_L3_IPUC_ROUTE_CTRL), sw_r32(RTL930X_L3_IPMC_ROUTE_CTRL),
@@ -2479,6 +2924,12 @@ static int rtl930x_l3_setup(struct rtl838x_switch_priv *priv)
 	 */
 	priv->n_route_ids = RTL930X_ROUTE_TBL_SIZE;
 	priv->n_host_route_ids = RTL930X_MAX_HOST_ROUTES;
+
+	priv->n_mc_oifs = RTL930X_MC_OIF_TBL_SIZE;
+	/* Element 0 encodes "no next element" in an output-interface list, so
+	 * it can never back a real egress interface.
+	 */
+	set_bit(0, priv->mc_oif_use_bm);
 
 	return 0;
 }
@@ -3956,6 +4407,17 @@ const struct rtl838x_reg rtl930x_reg = {
 	.get_l3_router_mac = rtl930x_get_l3_router_mac,
 	.set_l3_router_mac = rtl930x_set_l3_router_mac,
 	.set_l3_egress_intf = rtl930x_set_l3_egress_intf,
+	/* l3_mc_intf_enable stays unset: this family has no ingress L3 interface
+	 * table to arm, so the global enable in l3_setup is the only gate.
+	 */
+	.l3_mc_offload = true,
+	.mc_route_read = rtl930x_mc_route_read,
+	.mc_route_write = rtl930x_mc_route_write,
+	.mc_find_slot = rtl930x_mc_find_slot,
+	.mc_oif_write = rtl930x_mc_oif_write,
+	.mc_oif_read = rtl930x_mc_oif_read,
+	.mc_route_dump = rtl930x_mc_route_dump,
+	.l3_mc_dump = rtl930x_l3_mc_dump,
 #endif
 	.set_distribution_algorithm = rtl930x_set_distribution_algorithm,
 	.led_init = rtl930x_led_init,
