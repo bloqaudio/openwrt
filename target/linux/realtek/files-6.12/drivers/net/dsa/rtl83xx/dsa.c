@@ -3317,6 +3317,29 @@ out:
 	mutex_unlock(&priv->reg_mutex);
 }
 
+/* Read back the L2 multicast entry a route claimed, so a dump can distinguish an
+ * entry that was never installed from one that is installed and not consulted.
+ */
+int rtl83xx_mc_l2_probe(struct rtl838x_switch_priv *priv, int vid, u64 mac,
+			u64 *portmask)
+{
+	u64 seed = priv->r->l2_hash_seed(mac, vid);
+	struct rtl838x_l2_entry e;
+	int idx, err = -ENOENT;
+
+	mutex_lock(&priv->reg_mutex);
+
+	idx = rtl83xx_find_l2_hash_entry(priv, seed, true, &e);
+	if (idx >= 0 && e.valid) {
+		*portmask = priv->r->read_mcast_pmask(e.mc_portmask_index);
+		err = 0;
+	}
+
+	mutex_unlock(&priv->reg_mutex);
+
+	return err;
+}
+
 static int rtl83xx_port_mdb_add(struct dsa_switch *ds, int port,
 				const struct switchdev_obj_port_mdb *mdb,
 				const struct dsa_db db)

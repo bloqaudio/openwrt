@@ -3347,6 +3347,133 @@ static void rtldsa_mc_route_del(struct rtl838x_switch_priv *priv,
 	rtldsa_mc_route_destroy(priv, mc);
 }
 
+/* Dump the multicast offload state: what the driver believes, what the hardware
+ * holds at the slot the driver put it in, and the chain and port sets it
+ * resolves through. Locating a multicast entry by scanning is not practical -
+ * the key hashes into one of two 1024-bucket tables and an entry is 2 or 6
+ * consecutive slots wide - so the slot is reported from the driver's own state
+ * and the hardware is read back at that slot.
+ *
+ * Callers hold RTNL, which is what serialises this against the notifier work.
+ */
+void rtl83xx_mc_table_dump(struct rtl838x_switch_priv *priv, struct seq_file *m)
+{
+	struct rtl83xx_mc_route *mc;
+	int fam, i;
+
+	if (!priv->r->l3_mc_offload) {
+		seq_puts(m, "multicast route offload not supported on this family\n");
+		return;
+	}
+	if (!priv->mc_routes_initialized) {
+		seq_puts(m, "multicast route table not initialised\n");
+		return;
+	}
+
+	seq_printf(m, "output-interface list elements: %d\n", priv->n_mc_oifs);
+
+	for (fam = 0; fam < 2; fam++) {
+		seq_printf(m, "vifs (%s):\n", fam ? "IPv6" : "IPv4");
+		for (i = 0; i < MAXVIFS; i++) {
+			struct rtl83xx_mc_vif *vif = &priv->mc_vifs[fam][i];
+
+			if (!vif->dev)
+				continue;
+
+			seq_printf(m, "  vif %d %s: valid %d intf %d vid %d pmask_grp %d",
+				   i, netdev_name(vif->dev), vif->valid,
+				   vif->intf_id, vif->vid, vif->pmask_idx);
+			if (vif->valid)
+				seq_printf(m, " ports %016llx",
+					   priv->r->read_mcast_pmask(vif->pmask_idx));
+			seq_puts(m, "\n");
+
+			if (vif->valid && priv->r->l3_mc_dump)
+				priv->r->l3_mc_dump(priv, vif->intf_id, m);
+		}
+	}
+
+	seq_puts(m, "routes:\n");
+	list_for_each_entry(mc, &priv->mc_route_list, list) {
+		struct rtl83xx_route rt = {};
+		u16 next;
+
+		seq_printf(m, "  %s (%pI6c, %pI6c) id %d slot %d offloaded %d oifs %d\n",
+			   mc->key.family == RTNL_FAMILY_IP6MR ? "IPv6" : "IPv4",
+			   &mc->key.src, &mc->key.grp, mc->id, mc->slot,
+			   mc->offloaded, mc->n_oifs);
+		seq_printf(m, "    iif vif %d, kernel flags %x\n",
+			   mc->mfc->mfc_parent, mc->mfc->mfc_flags);
+
+		for (i = 0; i < mc->n_oifs; i++)
+			seq_printf(m, "    sw oif %d: elem %d vif %d intf %d pmask_grp %d\n",
+				   i, mc->oifs[i].oif_idx, mc->oifs[i].vif,
+				   mc->oifs[i].intf_id, mc->oifs[i].pmask_idx);
+
+		if (mc->slot < 0) {
+			seq_puts(m, "    not placed in hardware\n");
+			continue;
+		}
+
+		priv->r->mc_route_read(mc->slot, &rt);
+		seq_printf(m, "    hw entry: valid %d type %d action %d hit %d\n",
+			   rt.attr.valid, rt.attr.type, rt.attr.action, rt.attr.hit);
+		/* Actions are ROUTE_ACT_* (0 forward, 1 trap, 2 copy, 3 drop),
+		 * not the per-family hardware encodings the register layer
+		 * translates to.
+		 */
+		seq_printf(m, "              rpf_check %d rpf_vid %d rpf_fail_act %d (ROUTE_ACT) ttl_min %d\n",
+			   rt.mc.rpf_check, rt.mc.rpf_vid, rt.mc.rpf_fail_action,
+			   rt.mc.ttl_min);
+		seq_printf(m, "              oif_valid %d oif_idx %d\n",
+			   rt.mc.oif_valid, rt.mc.oif_idx);
+		if (rt.attr.type == 3)
+			seq_printf(m, "              hw key (%pI6c, %pI6c)\n",
+				   &rt.src_ip6, &rt.dst_ip6);
+		else
+			seq_printf(m, "              hw key (%pI4, %pI4)\n",
+				   &rt.src_ip, &rt.dst_ip);
+
+		if (mc->l2_vid) {
+			u8 mac[ETH_ALEN];
+			u64 pmask;
+
+			u64_to_ether_addr(mc->l2_mac, mac);
+			if (rtl83xx_mc_l2_probe(priv, mc->l2_vid, mc->l2_mac, &pmask))
+				seq_printf(m, "              l2 claim: vid %d %pM not found\n",
+					   mc->l2_vid, mac);
+			else
+				seq_printf(m, "              l2 claim: vid %d %pM ports %016llx\n",
+					   mc->l2_vid, mac, pmask);
+		} else {
+			seq_puts(m, "              l2 claim: none\n");
+		}
+
+		if (priv->r->mc_route_dump)
+			priv->r->mc_route_dump(mc->slot, rt.attr.type, m);
+
+		if (!rt.mc.oif_valid || !priv->r->mc_oif_read)
+			continue;
+
+		/* Walk the chain the entry points at, bounded by the pool size
+		 * so a corrupt successor cannot spin here.
+		 */
+		next = rt.mc.oif_idx;
+		for (i = 0; i < priv->n_mc_oifs && next; i++) {
+			struct rtl83xx_mc_oif oif = {};
+
+			priv->r->mc_oif_read(next, &oif);
+			seq_printf(m, "    hw elem %d: intf %d pmask_grp %d ports %016llx ttl_dec %d ttl_chk %d last %d next %d\n",
+				   next, oif.intf_id, oif.pmask_idx,
+				   priv->r->read_mcast_pmask(oif.pmask_idx),
+				   oif.ttl_dec, oif.ttl_check, oif.last, oif.next);
+			if (oif.last)
+				break;
+			next = oif.next;
+		}
+	}
+}
+
 static void rtldsa_mc_teardown(struct rtl838x_switch_priv *priv)
 {
 	struct rtl83xx_mc_route *mc, *tmp;

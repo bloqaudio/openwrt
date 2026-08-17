@@ -7,6 +7,7 @@
 #include <linux/kernel.h>
 #include <linux/slab.h>
 #include <linux/string.h>
+#include <linux/rtnetlink.h>
 #include <asm/mach-rtl838x/mach-rtl83xx.h>
 
 #include "rtl83xx.h"
@@ -360,6 +361,33 @@ static int l2_table_open(struct inode *inode, struct file *filp)
 static const struct file_operations l2_table_fops = {
 	.owner = THIS_MODULE,
 	.open = l2_table_open,
+	.read = seq_read,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
+
+/* Read under RTNL: the multicast route list and vif tables are mutated only
+ * from the FIB notifier work, which holds it.
+ */
+static int l3_mc_table_show(struct seq_file *m, void *v)
+{
+	struct rtl838x_switch_priv *priv = m->private;
+
+	rtnl_lock();
+	rtl83xx_mc_table_dump(priv, m);
+	rtnl_unlock();
+
+	return 0;
+}
+
+static int l3_mc_table_open(struct inode *inode, struct file *filp)
+{
+	return single_open(filp, l3_mc_table_show, inode->i_private);
+}
+
+static const struct file_operations l3_mc_table_fops = {
+	.owner = THIS_MODULE,
+	.open = l3_mc_table_open,
 	.read = seq_read,
 	.llseek = seq_lseek,
 	.release = single_release,
@@ -1431,6 +1459,9 @@ void rtl930x_dbgfs_init(struct rtl838x_switch_priv *priv)
 	debugfs_create_file("drop_counters", 0400, dbg_dir, priv, &drop_counter_fops);
 
 	debugfs_create_file("l2_table", 0400, dbg_dir, priv, &l2_table_fops);
+	if (priv->r->l3_mc_offload)
+		debugfs_create_file("l3_mc_table", 0400, dbg_dir, priv,
+				    &l3_mc_table_fops);
 	if (priv->r->vendor_init_dump)
 		debugfs_create_file("vendor_init", 0400, dbg_dir, priv,
 				    &vendor_init_fops);
