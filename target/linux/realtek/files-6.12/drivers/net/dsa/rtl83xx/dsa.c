@@ -2060,19 +2060,22 @@ static void rtldsa_get_pause_stats(struct dsa_switch *ds, int port,
 	rtldsa_counters_unlock(priv, port);
 }
 
-static int rtl83xx_mc_group_alloc(struct rtl838x_switch_priv *priv, int port)
+int rtl83xx_mc_group_alloc_mask(struct rtl838x_switch_priv *priv, u64 portmask)
 {
 	int mc_group = find_first_zero_bit(priv->mc_group_bm, MAX_MC_GROUPS - 1);
-	u64 portmask;
 
 	if (mc_group >= MAX_MC_GROUPS - 1)
 		return -1;
 
 	set_bit(mc_group, priv->mc_group_bm);
-	portmask = BIT_ULL(port);
 	priv->r->write_mcast_pmask(mc_group, portmask);
 
 	return mc_group;
+}
+
+static int rtl83xx_mc_group_alloc(struct rtl838x_switch_priv *priv, int port)
+{
+	return rtl83xx_mc_group_alloc_mask(priv, BIT_ULL(port));
 }
 
 static u64 rtl83xx_mc_group_add_port(struct rtl838x_switch_priv *priv, int mc_group, int port)
