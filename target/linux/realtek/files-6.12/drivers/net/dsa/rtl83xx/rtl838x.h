@@ -1842,6 +1842,11 @@ struct rtl838x_switch_priv {
 	struct mii_bus *parent_bus;
 	const struct rtl838x_reg *r;
 	u8 cpu_port;
+	/* Port whose egress sampler is armed, or -1. An egress sample's CPU tag
+	 * names the port the frame arrived on and leaves PORT_DATA zero, so the
+	 * sampled port is only knowable while a single one is armed.
+	 */
+	int sample_egr_port;
 	u8 port_mask;
 	u8 port_width;
 	u8 port_ignore;

@@ -3869,6 +3869,11 @@ static int rtl83xx_sw_probe(struct platform_device *pdev)
 	if (!priv)
 		return -ENOMEM;
 
+	/* Zero is a valid port number, so the "no egress sampler" state has to
+	 * be set rather than inherited from the allocation.
+	 */
+	priv->sample_egr_port = -1;
+
 	priv->ds = devm_kzalloc(dev, sizeof(*priv->ds), GFP_KERNEL);
 
 	if (!priv->ds)

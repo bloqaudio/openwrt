@@ -3,6 +3,7 @@
 #include <net/dsa.h>
 #include <net/pkt_cls.h>
 #include <net/psample.h>
+#include <linux/bitfield.h>
 #include <linux/etherdevice.h>
 #include <linux/if_bridge.h>
 #include <linux/pkt_sched.h>
@@ -3610,25 +3611,48 @@ static int rtldsa_port_sample_add(struct dsa_switch *ds, int port,
 		return -EINVAL;
 	}
 
-	/* Egress sampling is declined on both supported families: on RTL930x
-	 * the egress rate field programs cleanly per the vendor reference but
-	 * the silicon delivers no egress sample copies to the CPU in any
-	 * tested configuration (switched and CPU-originated traffic, either
-	 * SMPL_SEL value), so accepting it would configure a sampler that
-	 * never samples. On RTL931x the field exists (SDK
-	 * swcore_rtl9310.h SFLOW_PORT_RATE_CTRL.EGR_RATE) but no hardware
-	 * test has proven that egress copies are delivered, so it stays
-	 * declined until proven otherwise.
+	/* SMPL_SEL picks the sampled direction for the whole switch, so
+	 * ingress and egress samplers cannot be armed at the same time:
+	 * whichever is configured last would silently stop the other. Refuse
+	 * instead, because a sampler that has quietly stopped reporting looks
+	 * exactly like a link with no traffic on it.
 	 */
-	if (!sample->ingress) {
-		NL_SET_ERR_MSG_MOD(extack,
-				   "Only ingress sampling is supported on this switch");
-		return -EOPNOTSUPP;
+	for (int i = 0; i < priv->cpu_port; i++) {
+		if (!priv->ports[i].sample[sample->ingress ? 1 : 0].group)
+			continue;
+
+		if (sample->ingress)
+			NL_SET_ERR_MSG_MOD(extack,
+					   "Egress sampling is already active; the switch samples one direction at a time");
+		else
+			NL_SET_ERR_MSG_MOD(extack,
+					   "Ingress sampling is already active; the switch samples one direction at a time");
+		return -EBUSY;
 	}
 
-	s = &priv->ports[port].sample[0];
-	mask = RTL930X_SFLOW_IGR_RATE_MASK;
-	val = sample->rate;
+	/* An egress sample arrives tagged with the port the frame came in on,
+	 * and the tag's PORT_DATA field reads zero, so nothing identifies the
+	 * port it left by. Sampling one egress port at a time keeps that
+	 * answerable; a second one would make every sample ambiguous.
+	 */
+	if (!sample->ingress && priv->sample_egr_port >= 0 &&
+	    priv->sample_egr_port != port) {
+		NL_SET_ERR_MSG_MOD(extack,
+				   "Another port is already egress-sampling; the switch cannot identify which port an egress sample left by");
+		return -EBUSY;
+	}
+
+	s = &priv->ports[port].sample[sample->ingress ? 0 : 1];
+	/* The two rates share one word, so the value has to be placed in the
+	 * field being written rather than at bit 0.
+	 */
+	if (sample->ingress) {
+		mask = RTL930X_SFLOW_IGR_RATE_MASK;
+		val = FIELD_PREP(RTL930X_SFLOW_IGR_RATE_MASK, sample->rate);
+	} else {
+		mask = RTL930X_SFLOW_EGR_RATE_MASK;
+		val = FIELD_PREP(RTL930X_SFLOW_EGR_RATE_MASK, sample->rate);
+	}
 
 	if (priv->family_id == RTL9310_FAMILY_ID) {
 		sflow_ctrl = RTL931X_SFLOW_CTRL;
@@ -3640,12 +3664,13 @@ static int rtldsa_port_sample_add(struct dsa_switch *ds, int port,
 
 	mutex_lock(&priv->reg_mutex);
 
-	/* Sample copies go to the local CPU; when a packet is both
-	 * ingress- and egress-sampled, keep the ingress copy.
-	 * SMPL_SEL/CPU_SEL sit at the same bit positions on both families.
+	/* CPU_SEL 0 sends sample copies to the local CPU. SMPL_SEL selects
+	 * which direction is sampled, 0 ingress and 1 egress, for the whole
+	 * switch - which is why only one direction may be armed at a time.
 	 */
 	sw_w32_mask(RTL930X_SFLOW_CTRL_SMPL_SEL | RTL930X_SFLOW_CTRL_CPU_SEL,
-		    0, sflow_ctrl);
+		    sample->ingress ? 0 : RTL930X_SFLOW_CTRL_SMPL_SEL,
+		    sflow_ctrl);
 	sw_w32_mask(mask, val, rate_ctrl);
 
 	/* Ref the new group before dropping the old one: both pointers may
@@ -3657,6 +3682,8 @@ static int rtldsa_port_sample_add(struct dsa_switch *ds, int port,
 	WRITE_ONCE(s->group, group);
 	s->rate = sample->rate;
 	s->trunc_size = sample->truncate ? sample->trunc_size : 0;
+	if (!sample->ingress)
+		WRITE_ONCE(priv->sample_egr_port, port);
 
 	mutex_unlock(&priv->reg_mutex);
 
@@ -3686,6 +3713,8 @@ static void rtldsa_port_sample_del(struct dsa_switch *ds, int port,
 	WRITE_ONCE(s->group, NULL);
 	s->rate = 0;
 	s->trunc_size = 0;
+	if (!sample->ingress)
+		WRITE_ONCE(priv->sample_egr_port, -1);
 	mutex_unlock(&priv->reg_mutex);
 
 	/* The conduit RX path reads the group under rcu_read_lock() */
@@ -3718,6 +3747,16 @@ void rtl83xx_sample_rx(struct net_device *conduit, int port, bool egress,
 		return;
 
 	rcu_read_lock();
+
+	/* The tag names the port the frame arrived on. For an egress sample
+	 * the port of interest is the one that sampled it, which is knowable
+	 * because only one egress sampler may be armed.
+	 */
+	if (egress) {
+		port = READ_ONCE(priv->sample_egr_port);
+		if (port < 0)
+			goto out_unlock;
+	}
 
 	s = &priv->ports[port].sample[egress ? 1 : 0];
 	group = READ_ONCE(s->group);
