@@ -3759,6 +3759,7 @@ void rtl83xx_sample_rx(struct net_device *conduit, int port, bool egress,
 	}
 
 	s = &priv->ports[port].sample[egress ? 1 : 0];
+	priv->ports[port].sample[egress ? 1 : 0].seen++;
 	group = READ_ONCE(s->group);
 	if (!group)
 		goto out_unlock;

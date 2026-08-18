@@ -869,6 +869,32 @@ static const struct file_operations vendor_init_fops = {
  * switch-global, but the port enable is not. Show every queue and drop
  * precedence row as programmed, in the hardware's 256-byte page units.
  */
+static ssize_t sflow_seen_read(struct file *filp, char __user *buffer,
+			       size_t count, loff_t *ppos)
+{
+	struct rtl838x_port *p = filp->private_data;
+	struct rtl838x_switch_priv *priv = p->dp->ds->priv;
+	char buf[160];
+	int len;
+
+	len = scnprintf(buf, sizeof(buf),
+			"ingress_seen %llu\ningress_armed %u\n"
+			"egress_seen %llu\negress_armed %u\n",
+			priv->ports[p->dp->index].sample[0].seen,
+			!!priv->ports[p->dp->index].sample[0].group,
+			priv->ports[p->dp->index].sample[1].seen,
+			!!priv->ports[p->dp->index].sample[1].group);
+
+	return simple_read_from_buffer(buffer, count, ppos, buf, len);
+}
+
+static const struct file_operations sflow_seen_fops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.read = sflow_seen_read,
+	.llseek = default_llseek,
+};
+
 static ssize_t swred_read(struct file *filp, char __user *buffer, size_t count,
 			  loff_t *ppos)
 {
@@ -1517,6 +1543,8 @@ void rtl930x_dbgfs_init(struct rtl838x_switch_priv *priv)
 		}
 		debugfs_create_file("swred", 0400, port_dir,
 				    &priv->ports[i], &swred_fops);
+		debugfs_create_file("sflow_seen", 0400, port_dir,
+				    &priv->ports[i], &sflow_seen_fops);
 		debugfs_create_file("flow_control", 0400, port_dir,
 				    &priv->ports[i], &flow_control_fops);
 		debugfs_create_file("sched_algo", 0600, port_dir,

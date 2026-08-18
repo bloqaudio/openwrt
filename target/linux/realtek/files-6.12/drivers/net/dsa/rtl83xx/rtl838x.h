@@ -1173,6 +1173,10 @@ struct rtldsa_sample {
 	struct psample_group *group;
 	u32 rate;
 	u32 trunc_size;
+	/* Frames the ASIC tagged as sampled in this direction, counted on
+	 * arrival and before any delivery decision.
+	 */
+	u64 seen;
 };
 
 #define RTL838X_SWRED_DROP_PRECEDENCES	3
