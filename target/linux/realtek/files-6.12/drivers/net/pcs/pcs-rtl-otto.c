@@ -3462,6 +3462,32 @@ static void rtpcs_931x_sds_rxcal_pcb_adapt(struct rtpcs_serdes *sds)
 }
 
 /*
+ * Sample the symbol-error counter. One clean sample is enough to pass: a lane
+ * that has just changed mode reports errors from the transition itself.
+ */
+static int rtpcs_931x_sds_symerr_check(struct rtpcs_serdes *sds,
+				       phy_interface_t mode)
+{
+	u32 errors;
+	int i, ret;
+
+	for (i = 0; i < 3; i++) {
+		ret = rtpcs_931x_sds_symerr_clear(sds, mode);
+		if (ret)
+			return 0;
+		msleep(150);
+
+		ret = rtpcs_931x_sds_symerr_get(sds, mode, &errors);
+		if (ret)
+			return 0;
+		if (!errors)
+			return 0;
+	}
+
+	return -EIO;
+}
+
+/*
  * Full receive calibration for one SerDes. The vendor powers the lane down
  * across the adaptation, so the port must be quiesced first.
  */
@@ -3802,7 +3828,12 @@ static int rtpcs_931x_setup_serdes(struct rtpcs_link *link,
 	    mode == PHY_INTERFACE_MODE_XGMII ||
 	    mode == PHY_INTERFACE_MODE_10GBASER ||
 	    mode == PHY_INTERFACE_MODE_10GKR) {
-		if (rtpcs_sds_retry_wait_for_link(link, true))
+		/* A lane can lock and report link while decoding nothing, so
+		 * the link indication only skips calibration once the symbol
+		 * error counter agrees the receiver is usable.
+		 */
+		if (rtpcs_sds_retry_wait_for_link(link, true) &&
+		    !rtpcs_931x_sds_symerr_check(sds, mode))
 			return 0;
 		rtpcs_931x_sds_rx_calibrate(sds);
 	}
@@ -3821,26 +3852,7 @@ static int rtpcs_931x_setup_serdes(struct rtpcs_link *link,
  */
 static int rtpcs_931x_verify_rx(struct rtpcs_link *link)
 {
-	u32 errors;
-	int i, ret;
-
-	for (i = 0; i < 3; i++) {
-		ret = rtpcs_931x_sds_symerr_clear(link->sds, link->retry_mode);
-		if (ret)
-			return 0;
-		msleep(150);
-
-		ret = rtpcs_931x_sds_symerr_get(link->sds, link->retry_mode,
-						&errors);
-		if (ret == -EOPNOTSUPP)
-			return 0;
-		if (ret)
-			return 0;
-		if (!errors)
-			return 0;
-	}
-
-	return -EIO;
+	return rtpcs_931x_sds_symerr_check(link->sds, link->retry_mode);
 }
 
 /*
