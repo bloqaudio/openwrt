@@ -1,0 +1,71 @@
+From: OpenWrt
+Subject: [PATCH] net: phylink: report the advertised pause request
+
+phylink_ethtool_get_pauseparam() always reports the MLO_PAUSE_RX/TX bits of
+link_config.pause. Those bits are the manual override that is only consulted
+when pause autonegotiation is off; while pause AN is on the request lives in
+the pause bits of link_config.advertising, which phylink seeds from the MAC's
+MAC_SYM_PAUSE/MAC_ASYM_PAUSE capabilities and keeps in step with every
+set_pauseparam(). Nothing seeds the override bits from that advertisement, so
+until a first set_pauseparam() the two disagree and a port advertising pause
+reports rx/tx off.
+
+That is not only a wrong reading. The ethtool netlink layer pre-fills the
+request from get_pauseparam(), and ethnl_set_pause() returns success without
+calling set_pauseparam() when no field changed value. A port advertising pause
+therefore reports off, and a request for off is discarded as a no-op with
+rc 0, leaving the advertisement in place. The setting only lands if autoneg is
+toggled in the same command, which restarts negotiation and drops the link.
+
+Derive the reported rx/tx from the advertisement while pause AN is on, using
+the inverse of the mapping linkmode_set_pause() applies, and keep reporting
+the override bits when pause AN is off, since those are what the resolver
+then enforces. get_pauseparam() becomes an exact readback of set_pauseparam()
+in every combination, so the netlink change detection no longer discards a
+valid request.
+
+This changes only what is reported and, through that, which requests reach
+set_pauseparam(). Capability advertisement, negotiation and MAC programming
+are untouched.
+
+---
+ drivers/net/phy/phylink.c | 25 +++++++++++++++++++++----
+ 1 file changed, 21 insertions(+), 4 deletions(-)
+
+--- a/drivers/net/phy/phylink.c
++++ b/drivers/net/phy/phylink.c
+@@ -2941,11 +2941,32 @@
+ void phylink_ethtool_get_pauseparam(struct phylink *pl,
+ 				    struct ethtool_pauseparam *pause)
+ {
++	const unsigned long *adv = pl->link_config.advertising;
++	bool rx, tx;
++
+ 	ASSERT_RTNL();
+ 
+ 	pause->autoneg = !!(pl->link_config.pause & MLO_PAUSE_AN);
+-	pause->rx_pause = !!(pl->link_config.pause & MLO_PAUSE_RX);
+-	pause->tx_pause = !!(pl->link_config.pause & MLO_PAUSE_TX);
++
++	if (pause->autoneg) {
++		/* MLO_PAUSE_RX/TX are the manual override, consulted only
++		 * while pause AN is off, and they stay clear until something
++		 * writes them. While pause AN is on the request is carried by
++		 * the advertisement, so invert the mapping applied by
++		 * linkmode_set_pause(). Reporting the override bits instead
++		 * understates an advertised request, and the ethtool netlink
++		 * layer diffs a set against this reply and drops one that
++		 * matches, so such a request is lost without an error.
++		 */
++		rx = phylink_test(adv, Pause);
++		tx = rx ^ phylink_test(adv, Asym_Pause);
++	} else {
++		rx = pl->link_config.pause & MLO_PAUSE_RX;
++		tx = pl->link_config.pause & MLO_PAUSE_TX;
++	}
++
++	pause->rx_pause = rx;
++	pause->tx_pause = tx;
+ }
+ EXPORT_SYMBOL_GPL(phylink_ethtool_get_pauseparam);
+ 
