@@ -630,8 +630,12 @@ static void rtl931x_fill_l2_entry(u32 r[], struct rtl838x_l2_entry *e)
 		e->suspended = !!(r[2] & BIT(12));
 		e->age = (r[2] >> 16) & 7;
 
-		/* HW doesn't use VID but FID for as key */
+		/* FID is the lookup key, and it is the only VLAN the row
+		 * stores. There is no route-id field either, so leave nothing
+		 * for a caller to read back stale.
+		 */
 		e->vid = (r[0] >> 16) & 0xfff;
+		e->nh_route_id = 0;
 
 		if (e->is_l2_tunnel)
 			e->l2_tunnel_id = ((r[2] & 0xff) << 4) | (r[3] >> 28);
