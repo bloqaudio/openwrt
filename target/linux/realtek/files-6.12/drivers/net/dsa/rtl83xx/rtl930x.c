@@ -589,10 +589,14 @@ static void rtl930x_fill_l2_entry(u32 r[], struct rtl838x_l2_entry *e)
 		/* AGE is 3 bits wide, between SPA and SA_BLK */
 		e->age = (r[2] >> 17) & 7;
 		e->valid = true;
-		/* the UC_VID field in hardware is used for the VID or for the route id */
+		/* UC_VID carries the route id instead of the VLAN once the
+		 * entry serves as a nexthop. FID_RVID is the lookup key, so
+		 * report the VLAN from there or the entry cannot be addressed
+		 * by MAC and VLAN any more.
+		 */
 		if (e->next_hop) {
 			e->nh_route_id = r[2] & 0x7ff;
-			e->vid = 0;
+			e->vid = e->rvid;
 		} else {
 			e->vid = r[2] & 0xfff;
 			e->nh_route_id = 0;
