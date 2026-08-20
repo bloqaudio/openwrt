@@ -674,13 +674,13 @@ static int rtl83xx_l2_nexthop_add(struct rtl838x_switch_priv *priv, struct rtl83
 		/* If the entry is already a valid next hop entry, don't change it */
 		if (e.next_hop)
 			return 0;
-		/* A dynamically learned entry would age out underneath the
-		 * nexthop and leave the route forwarding into an invalid L2
-		 * entry (silent drops). Pin it while it serves as a nexthop;
-		 * nexthop removal deletes it and the address is re-learned
-		 * like any other.
+		/* Leave a learned entry dynamic. Hardware relearns a dynamic
+		 * row in place when its host moves port and preserves the
+		 * nexthop bit and the route id; a static row is never
+		 * relearned, so pinning one black-holes a host that moves.
+		 * The L3 activity worker keeps the row from ageing out
+		 * under the route.
 		 */
-		e.is_static = true;
 	} else {
 		/* The probe reads above leave stale fields (is_trunk,
 		 * stack_dev, ...) in the entry when the slot is free; any
@@ -693,6 +693,10 @@ static int rtl83xx_l2_nexthop_add(struct rtl838x_switch_priv *priv, struct rtl83
 		e.type = L2_UNICAST;
 		u64_to_ether_addr(nh->mac, &e.mac[0]);
 		e.valid = true;
+		/* Nothing ever learns this address - a routed standalone port
+		 * has hardware learning disabled - so the row has to be
+		 * static or it would expire with no way back.
+		 */
 		e.is_static = true;
 		e.rvid = nh->rvid;
 		e.age = 0;			/* With port-ignore */
@@ -753,6 +757,64 @@ static int rtl83xx_l2_nexthop_rm(struct rtl838x_switch_priv *priv, struct rtl83x
 	priv->r->write_l2_entry_using_hash(row, i & 0x3, &e);
 
 	return 0;
+}
+
+/* The row packers clamp to the family's field width, so the maximum is just
+ * the widest encoding. The floor has to leave more than one aging interval of
+ * margin, which is tens of seconds against a worker running every couple of
+ * seconds.
+ */
+#define RTLDSA_L2_NEXTHOP_AGE_MAX	7
+#define RTLDSA_L2_NEXTHOP_AGE_FLOOR	1
+
+/* Ages a nexthop's L2 entry back up so it cannot expire while a route still
+ * points at it.
+ *
+ * Hardware refreshes the age itself whenever the host transmits, so only a
+ * silent neighbour ever decays this far. The rewrite puts back the source port
+ * that was just read and so discards a hardware relearn that raced it; that is
+ * self-correcting because the entry is dynamic and the next frame from the host
+ * relearns it, and it is rare because a row this close to expiry is by
+ * definition not seeing frames.
+ */
+static void rtl83xx_l2_nexthop_age(struct rtl838x_switch_priv *priv,
+				   u64 mac, u16 rvid, u16 l2_id)
+{
+	u64 seed = priv->r->l2_hash_seed(mac, rvid);
+	struct rtl838x_l2_entry e = { };
+	int idx = -1;
+
+	/* The entry parser leaves the caller's structure alone for an invalid
+	 * row, so nothing below may be trusted until valid is seen.
+	 *
+	 * (l2_id >> 2, l2_id & 3) is the addressing the add path writes the
+	 * entry with, so it names the same row. Anything else in that slot
+	 * means the table moved underneath us and the entry has to be
+	 * searched for by seed.
+	 */
+	if ((priv->r->read_l2_entry_using_hash(l2_id >> 2, l2_id & 0x3, &e) &
+	     0x0fffffffffffffffULL) == seed && e.valid && e.next_hop) {
+		idx = l2_id;
+	} else {
+		u32 key = priv->r->l2_hash_key(priv, seed);
+
+		for (int i = 0; i < priv->l2_bucket_size; i++) {
+			memset(&e, 0, sizeof(e));
+			if ((priv->r->read_l2_entry_using_hash(key, i, &e) &
+			     0x0fffffffffffffffULL) != seed ||
+			    !e.valid || !e.next_hop)
+				continue;
+			idx = i > 3 ? (((key >> 16) << 2) | (i - 4))
+				    : (((key & 0xffff) << 2) | i);
+			break;
+		}
+	}
+
+	if (idx < 0 || e.is_static || e.age > RTLDSA_L2_NEXTHOP_AGE_FLOOR)
+		return;
+
+	e.age = RTLDSA_L2_NEXTHOP_AGE_MAX;
+	priv->r->write_l2_entry_using_hash(idx >> 2, idx & 0x3, &e);
 }
 
 int rtl83xx_port_is_under(const struct net_device *dev, struct rtl838x_switch_priv *priv)
@@ -2380,11 +2442,19 @@ static int rtldsa_fib6_del(struct rtl838x_switch_priv *priv,
 
 #endif /* IS_BUILTIN(CONFIG_IPV6) */
 
-/* Hardware forwards offloaded traffic without the CPU seeing it, so ARP/ND
+/* Periodic reconciliation of the offloaded L3 state against the kernel's.
+ *
+ * Hardware forwards offloaded traffic without the CPU seeing it, so ARP/ND
  * would age an active neighbour out and the netevent handler would then drop
  * its host route, pushing the flow back onto the software path. Poll the
  * per-entry activity bit and mark the neighbour used, which keeps it in the
  * kernel's refresh cycle instead of letting it go stale.
+ *
+ * The same pass holds up the age of every nexthop's L2 entry. Those entries are
+ * dynamic so that hardware relearns them when their host moves port, and the
+ * price is that a silent neighbour's entry ages out, at which point hardware
+ * replaces its egress port with the don't-care value and the routes behind it
+ * no longer resolve to a port.
  *
  * The interval has to stay below the neighbour DELAY_PROBE_TIME (5 s by
  * default): a REACHABLE entry only escapes NUD_STALE if it was used within
@@ -2396,8 +2466,12 @@ struct rtldsa_l3_activity_probe {
 	struct in6_addr gw;
 	struct in6_addr dst6;
 	__be32 dst4;
+	u64 nh_mac;
 	int ifindex;
+	u16 nh_l2_id;
+	u16 nh_rvid;
 	u8 type;
+	bool host_route;
 };
 
 static void rtldsa_l3_neigh_confirm(const struct rtldsa_l3_activity_probe *p)
@@ -2434,26 +2508,37 @@ static void rtldsa_l3_activity_work_do(struct work_struct *work)
 							struct rtl838x_switch_priv,
 							l3_activity_work);
 	struct rtldsa_l3_activity_probe *probes;
+	unsigned long *aged;
 	struct rhashtable_iter iter;
 	struct rtl83xx_route *r;
 	int cnt, n = 0;
 
 	mutex_lock(&priv->reg_mutex);
-	cnt = bitmap_weight(priv->host_route_use_bm, MAX_HOST_ROUTES);
+	cnt = bitmap_weight(priv->host_route_use_bm, MAX_HOST_ROUTES) +
+	      bitmap_weight(priv->route_use_bm, MAX_ROUTES);
 	mutex_unlock(&priv->reg_mutex);
 	if (!cnt)
 		goto rearm;
 
-	probes = kmalloc_array(cnt, sizeof(*probes), GFP_KERNEL);
+	/* One entry per offloaded route: the id pools are large enough that a
+	 * contiguous allocation is not guaranteed to succeed.
+	 */
+	probes = kvmalloc_array(cnt, sizeof(*probes), GFP_KERNEL);
 	if (!probes)
 		goto rearm;
+
+	/* Routes share nexthops, and each nexthop costs a table read to age.
+	 * Without this the pass would re-read the same handful of entries once
+	 * per route.
+	 */
+	aged = bitmap_zalloc(priv->fib_entries, GFP_KERNEL);
 
 	rhltable_walk_enter(&priv->routes, &iter);
 	rhashtable_walk_start(&iter);
 	while ((r = rhashtable_walk_next(&iter)) != NULL) {
 		if (IS_ERR(r))
 			continue;
-		if (!r->is_host_route || !r->attr.valid || !r->ifindex ||
+		if (!r->attr.valid || !r->ifindex ||
 		    r->attr.action != ROUTE_ACT_FORWARD)
 			continue;
 		/* A route added after the bitmap count is picked up next time. */
@@ -2464,6 +2549,10 @@ static void rtldsa_l3_activity_work_do(struct work_struct *work)
 		probes[n].dst4 = r->dst_ip;
 		probes[n].ifindex = r->ifindex;
 		probes[n].type = r->attr.type;
+		probes[n].host_route = r->is_host_route;
+		probes[n].nh_mac = r->nh.mac;
+		probes[n].nh_rvid = r->nh.rvid;
+		probes[n].nh_l2_id = r->nh.l2_id;
 		n++;
 	}
 	rhashtable_walk_stop(&iter);
@@ -2472,6 +2561,15 @@ static void rtldsa_l3_activity_work_do(struct work_struct *work)
 	for (int i = 0; i < n; i++) {
 		struct rtl83xx_route probe_rt = { };
 		int slot;
+
+		if (probes[i].nh_l2_id < priv->fib_entries &&
+		    (!aged || !test_and_set_bit(probes[i].nh_l2_id, aged)))
+			rtl83xx_l2_nexthop_age(priv, probes[i].nh_mac,
+					       probes[i].nh_rvid,
+					       probes[i].nh_l2_id);
+
+		if (!probes[i].host_route)
+			continue;
 
 		probe_rt.attr.type = probes[i].type;
 		probe_rt.dst_ip = probes[i].dst4;
@@ -2483,7 +2581,8 @@ static void rtldsa_l3_activity_work_do(struct work_struct *work)
 			rtldsa_l3_neigh_confirm(&probes[i]);
 	}
 
-	kfree(probes);
+	bitmap_free(aged);
+	kvfree(probes);
 
 rearm:
 	queue_delayed_work(priv->wq, &priv->l3_activity_work,
