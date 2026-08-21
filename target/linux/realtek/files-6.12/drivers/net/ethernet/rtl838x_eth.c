@@ -1945,6 +1945,21 @@ static void rtl838x_eth_remove(struct platform_device *pdev)
 	}
 }
 
+/* The reboot path resets the CPU but leaves the switch block running, so a DMA
+ * ring still armed here keeps writing into memory the next kernel has already
+ * claimed. The corruption surfaces later as an allocator crash at an arbitrary
+ * point in the following boot.
+ */
+static void rtl838x_eth_shutdown(struct platform_device *pdev)
+{
+	struct net_device *dev = platform_get_drvdata(pdev);
+
+	if (!dev)
+		return;
+
+	rtl838x_hw_stop(netdev_priv(dev));
+}
+
 static const struct of_device_id rtl838x_eth_of_ids[] = {
 	{ .compatible = "realtek,rtl838x-eth"},
 	{ /* sentinel */ }
@@ -1954,6 +1969,7 @@ MODULE_DEVICE_TABLE(of, rtl838x_eth_of_ids);
 static struct platform_driver rtl838x_eth_driver = {
 	.probe = rtl838x_eth_probe,
 	.remove_new = rtl838x_eth_remove,
+	.shutdown = rtl838x_eth_shutdown,
 	.driver = {
 		.name = "rtl838x-eth",
 		.pm = NULL,
