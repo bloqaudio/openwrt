@@ -3189,6 +3189,32 @@ out:
 	return err;
 }
 
+/* An entry learned on an aggregate names the trunk, not a port, so its port
+ * field cannot be compared against one. Report it on every member instead;
+ * matching it against a physical index attributes it to an unrelated port.
+ */
+static bool rtl83xx_l2_entry_on_port(struct rtl838x_switch_priv *priv,
+				     const struct rtl838x_l2_entry *e, int port)
+{
+	if (e->is_trunk) {
+		/* The member map is keyed by the DSA LAG id, which is 1-based,
+		 * while the entry carries the hardware trunk index the 93xx
+		 * accessors reach by subtracting one. The older families index
+		 * their register array directly and need no shift.
+		 */
+		int lag_id = e->trunk;
+
+		if (priv->family_id == RTL9300_FAMILY_ID ||
+		    priv->family_id == RTL9310_FAMILY_ID)
+			lag_id++;
+
+		return lag_id < MAX_LAGS &&
+		       priv->lags_port_members[lag_id] & BIT_ULL(port);
+	}
+
+	return e->port == port || e->port == RTL930X_PORT_IGNORE;
+}
+
 static int rtl83xx_port_fdb_dump(struct dsa_switch *ds, int port,
 				 dsa_fdb_dump_cb_t *cb, void *data)
 {
@@ -3203,7 +3229,7 @@ static int rtl83xx_port_fdb_dump(struct dsa_switch *ds, int port,
 		if (!e.valid)
 			continue;
 
-		if (e.port == port || e.port == RTL930X_PORT_IGNORE)
+		if (rtl83xx_l2_entry_on_port(priv, &e, port))
 			cb(e.mac, e.vid, e.is_static, data);
 
 		if (!((i + 1) % 64))
@@ -3216,7 +3242,7 @@ static int rtl83xx_port_fdb_dump(struct dsa_switch *ds, int port,
 		if (!e.valid)
 			continue;
 
-		if (e.port == port)
+		if (rtl83xx_l2_entry_on_port(priv, &e, port))
 			cb(e.mac, e.vid, e.is_static, data);
 	}
 
