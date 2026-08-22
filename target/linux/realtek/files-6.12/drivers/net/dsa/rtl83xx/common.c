@@ -3973,6 +3973,9 @@ static int rtl83xx_sw_probe(struct platform_device *pdev)
 	 */
 	priv->sample_egr_port = -1;
 
+	/* No LAG has a primary port until its first member joins. */
+	memset(priv->lag_primary, -1, sizeof(priv->lag_primary));
+
 	priv->ds = devm_kzalloc(dev, sizeof(*priv->ds), GFP_KERNEL);
 
 	if (!priv->ds)

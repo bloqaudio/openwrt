@@ -1869,7 +1869,7 @@ struct rtl838x_switch_priv {
 	/** @lag_primary: port of a LAG is primary (repesenting) and is added to
 	 * the port matrix
 	 */
-	u32 lag_primary[MAX_LAGS + 1];
+	int lag_primary[MAX_LAGS + 1];
 
 	/**
 	 * @lag_non_primary: Port (bit) is part of any LAG but not the
