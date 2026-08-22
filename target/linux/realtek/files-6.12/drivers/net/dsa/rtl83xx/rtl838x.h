@@ -1860,13 +1860,16 @@ struct rtl838x_switch_priv {
 	u16 n_mst;
 	struct dentry *dbgfs_dir;
 
+	/* lags_port_members[] and lag_primary[] are indexed by the one-based
+	 * DSA LAG id; slot 0 is unused.
+	 */
 	/** @lags_port_members: Port (bit) is part of a specific LAG */
-	u64 lags_port_members[MAX_LAGS];
+	u64 lags_port_members[MAX_LAGS + 1];
 
 	/** @lag_primary: port of a LAG is primary (repesenting) and is added to
 	 * the port matrix
 	 */
-	u32 lag_primary[MAX_LAGS];
+	u32 lag_primary[MAX_LAGS + 1];
 
 	/**
 	 * @lag_non_primary: Port (bit) is part of any LAG but not the

@@ -3208,7 +3208,7 @@ static bool rtl83xx_l2_entry_on_port(struct rtl838x_switch_priv *priv,
 		    priv->family_id == RTL9310_FAMILY_ID)
 			lag_id++;
 
-		return lag_id < MAX_LAGS &&
+		return lag_id >= 1 && lag_id <= MAX_LAGS &&
 		       priv->lags_port_members[lag_id] & BIT_ULL(port);
 	}
 
@@ -3895,7 +3895,7 @@ static bool rtl83xx_lag_can_offload(struct dsa_switch *ds,
 	int id;
 
 	id = dsa_lag_id(ds->dst, lag);
-	if (id < 0 || id >= ds->num_lag_ids)
+	if (id <= 0 || id > ds->num_lag_ids)
 		return false;
 
 	if (info->tx_type != NETDEV_LAG_TX_TYPE_HASH)
@@ -3926,7 +3926,7 @@ static int rtl83xx_port_lag_change(struct dsa_switch *ds, int port)
 		return 0;
 
 	group = dsa_lag_id(ds->dst, dp->lag->dev);
-	if (group < 0 || group >= ds->num_lag_ids)
+	if (group <= 0 || group > ds->num_lag_ids)
 		return 0;
 
 	mutex_lock(&priv->reg_mutex);
@@ -4017,10 +4017,10 @@ static int rtl83xx_port_lag_leave(struct dsa_switch *ds, int port,
 	 * the leave runs, and bailing out here would leave stale state
 	 * behind that blocks any future join of this port.
 	 */
-	for (group = 0; group < ds->num_lag_ids; group++)
+	for (group = 1; group <= ds->num_lag_ids; group++)
 		if (priv->lags_port_members[group] & BIT_ULL(port))
 			break;
-	if (group == ds->num_lag_ids) {
+	if (group > ds->num_lag_ids) {
 		pr_info("port_lag_leave: port %d not in any LAG\n", port);
 		err = 0;
 		goto out;

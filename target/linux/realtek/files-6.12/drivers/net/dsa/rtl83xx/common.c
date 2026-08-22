@@ -474,11 +474,11 @@ int rtl83xx_lag_add(struct dsa_switch *ds, int group, int port, struct netdev_la
 	u32 algomsk = 0;
 	u32 algoidx = 0;
 
-	for (i = 0; i < priv->ds->num_lag_ids; i++) {
+	for (i = 1; i <= priv->ds->num_lag_ids; i++) {
 		if (priv->lags_port_members[i] & BIT_ULL(port))
 			break;
 	}
-	if (i != priv->ds->num_lag_ids) {
+	if (i <= priv->ds->num_lag_ids) {
 		pr_err("%s: Port %d already member of LAG %d.\n", __func__, port, i);
 		return -ENOSPC;
 	}
@@ -537,7 +537,7 @@ int rtl83xx_lag_del(struct dsa_switch *ds, int group, int port)
 {
 	struct rtl838x_switch_priv *priv = ds->priv;
 
-	if (group >= priv->ds->num_lag_ids) {
+	if (group <= 0 || group > priv->ds->num_lag_ids) {
 		pr_err("%s: LAG %d invalid.\n", __func__, group);
 		return -EINVAL;
 	}
@@ -4005,7 +4005,11 @@ static int rtl83xx_sw_probe(struct platform_device *pdev)
 		priv->ds->num_ports = 29;
 		priv->fib_entries = 8192;
 		rtl8380_get_version(priv);
-		priv->ds->num_lag_ids = 8;
+		/* The one-based DSA ID is used directly as the trunk register
+		 * index, so register zero is unusable and the count stops at the
+		 * last valid index.
+		 */
+		priv->ds->num_lag_ids = 7;
 		priv->l2_bucket_size = 4;
 		priv->n_mst = 64;
 		priv->n_pie_blocks = 12;
@@ -4022,7 +4026,11 @@ static int rtl83xx_sw_probe(struct platform_device *pdev)
 		priv->ds->num_ports = 53;
 		priv->fib_entries = 16384;
 		rtl8390_get_version(priv);
-		priv->ds->num_lag_ids = 16;
+		/* The one-based DSA ID is used directly as the trunk register
+		 * index, so register zero is unusable and the count stops at the
+		 * last valid index.
+		 */
+		priv->ds->num_lag_ids = 15;
 		priv->l2_bucket_size = 4;
 		priv->n_mst = 256;
 		priv->n_pie_blocks = 18;
