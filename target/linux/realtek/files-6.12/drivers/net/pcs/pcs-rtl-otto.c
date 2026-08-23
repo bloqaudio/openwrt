@@ -3817,20 +3817,17 @@ static int rtpcs_931x_setup_serdes(struct rtpcs_link *link,
 	}
 
 	/*
-	 * Train the receiver once the lane is in its final mode. The vendor
-	 * does this from dal_mango_construct_serdesConfig_init() for XSGMII
-	 * and both USXGMII submodes; without it a lane locks and reports link
-	 * but never decodes, which is fatal on boards whose bootloader cannot
-	 * bring the PHYs up at all.
+	 * Calibrate the modes the vendor calibrates from
+	 * _dal_mango_construct_sds_init(): XSGMII and both USXGMII submodes.
+	 * BASE-R is deliberately absent; its receiver is trained only by the
+	 * recovery ladder, once a health check says it is needed.
 	 */
 	if (mode == PHY_INTERFACE_MODE_10G_QXGMII ||
 	    mode == PHY_INTERFACE_MODE_USXGMII ||
-	    mode == PHY_INTERFACE_MODE_XGMII ||
-	    mode == PHY_INTERFACE_MODE_10GBASER ||
-	    mode == PHY_INTERFACE_MODE_10GKR) {
-		/* A lane can lock and report link while decoding nothing, so
-		 * the link indication only skips calibration once the symbol
-		 * error counter agrees the receiver is usable.
+	    mode == PHY_INTERFACE_MODE_XGMII) {
+		/* During a linkless retry, a lane can lock before setup reaches
+		 * calibration. Only skip calibration once the symbol error
+		 * counter agrees the receiver is usable.
 		 */
 		if (rtpcs_sds_retry_wait_for_link(link, true) &&
 		    !rtpcs_931x_sds_symerr_check(sds, mode))
