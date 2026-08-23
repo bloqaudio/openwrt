@@ -3870,6 +3870,11 @@ static int rtpcs_931x_recover_serdes(struct rtpcs_serdes *sds,
 
 	switch (tier) {
 	case RTPCS_SDS_RECOVERY_CALIBRATE:
+		/* Setup calibrates only the vendor's mode list, and a lane that
+		 * still reports link skips the setup that follows this tier, so
+		 * the tier has to train the receiver itself.
+		 */
+		rtpcs_931x_sds_rx_calibrate(sds);
 		return 0;
 	case RTPCS_SDS_RECOVERY_RX_RESET:
 		rtpcs_931x_sds_rx_reset(sds);
@@ -4458,10 +4463,12 @@ static void rtpcs_sds_setup_retry(struct work_struct *work)
 	if (rtpcs_sds_retry_handle_settle(link))
 		goto out;
 
-	/* A link is the only success condition.  The forced debug check must run
-	 * even on a live lane so that the stable-link veto can prove it harmless.
+	/* A live link is successful unless a verification pass is pending. The
+	 * forced debug check must also run so the stable-link veto can prove it
+	 * harmless.
 	 */
-	if (rtpcs_mac_link_up(link) && !link->retry_force) {
+	if (rtpcs_mac_link_up(link) && !link->retry_verify &&
+	    !link->retry_force) {
 		if (link->retry_recovery_active)
 			rtpcs_sds_retry_completed(link);
 		else
@@ -4501,7 +4508,7 @@ static void rtpcs_sds_setup_retry(struct work_struct *work)
 			goto out;
 		}
 
-		if (rtpcs_mac_link_up(link)) {
+		if (!ret && rtpcs_mac_link_up(link)) {
 			if (link->retry_recovery_active)
 				rtpcs_sds_retry_completed(link);
 			else
@@ -4613,15 +4620,26 @@ out:
 	mutex_unlock(&ctrl->lock);
 }
 
-static bool rtpcs_sds_arm_linkless_retry(struct rtpcs_link *link)
+static bool rtpcs_sds_arm_retry(struct rtpcs_link *link)
 {
 	struct rtpcs_ctrl *ctrl = link->ctrl;
 
 	lockdep_assert_held(&ctrl->lock);
 
-	if (!link->sfp_node || rtpcs_mac_link_up(link) ||
-	    rtpcs_sfp_module_absent(link))
+	if (!link->sfp_node || rtpcs_sfp_module_absent(link))
 		return false;
+
+	/* A lane that reports link can still be failing to decode. Arming such
+	 * a lane only queues a health sample; the sample sleeps, so it belongs
+	 * to the worker and must never run here. Escalation stays behind the
+	 * bad-sample count, so start counting from this link.
+	 */
+	if (rtpcs_mac_link_up(link)) {
+		if (!ctrl->cfg->verify_rx || link->retry_ladder_exhausted)
+			return false;
+		link->retry_bad_samples = 0;
+		link->retry_verify = true;
+	}
 
 	mod_delayed_work(system_power_efficient_wq, &link->retry_work,
 			 READ_ONCE(link->retry_settling) ?
@@ -4685,7 +4703,7 @@ static int rtpcs_pcs_enable(struct phylink_pcs *pcs)
 
 	mutex_lock(&ctrl->lock);
 	if (ctrl->cfg->setup_serdes)
-		rtpcs_sds_arm_linkless_retry(link);
+		rtpcs_sds_arm_retry(link);
 	mutex_unlock(&ctrl->lock);
 
 	return 0;
@@ -4729,11 +4747,11 @@ static int rtpcs_pcs_config(struct phylink_pcs *pcs, unsigned int neg_mode,
 		if (interface == link->sds->configured_mode) {
 			dev_dbg(ctrl->dev, "sds %d already in mode %s, no change\n",
 				link->sds->id, phy_modes(interface));
-			rtpcs_sds_arm_linkless_retry(link);
+			rtpcs_sds_arm_retry(link);
 		} else if (rtpcs_sfp_skip_setup(link)) {
 			dev_dbg(ctrl->dev, "sds %d: no module, skip setup for mode %s\n",
 				link->sds->id, phy_modes(interface));
-			rtpcs_sds_arm_linkless_retry(link);
+			rtpcs_sds_arm_retry(link);
 		} else {
 			link->retry_verify = false;
 			ret = rtpcs_sds_setup(link);
@@ -4750,7 +4768,7 @@ static int rtpcs_pcs_config(struct phylink_pcs *pcs, unsigned int neg_mode,
 			 * retry. Repeated clean linkless samples enter the bounded ladder;
 			 * they cannot abandon a lane with no signal to measure.
 			 */
-			if (rtpcs_sds_arm_linkless_retry(link) &&
+			if (rtpcs_sds_arm_retry(link) &&
 			    ctrl->cfg->verify_rx) {
 				link->retry_attempt = 0;
 				link->retry_bad_samples = 0;
