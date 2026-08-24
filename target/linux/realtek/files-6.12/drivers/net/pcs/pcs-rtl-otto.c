@@ -2580,8 +2580,14 @@ static void rtpcs_931x_sds_reset(struct rtpcs_serdes *sds)
 
 static void rtpcs_931x_sds_disable(struct rtpcs_serdes *sds)
 {
-	regmap_write(sds->ctrl->map,
-		     RTL931X_SERDES_MODE_CTRL + (sds->id >> 2) * 4, 0x9f);
+	int shift = (sds->id & 0x3) << 3;
+
+	/* SERDES_MODE_CTRL packs four lanes per word, one byte each. Writing
+	 * the whole word clears the mode of the three neighbours sharing it.
+	 */
+	regmap_write_bits(sds->ctrl->map,
+			  RTL931X_SERDES_MODE_CTRL + (sds->id >> 2) * 4,
+			  0xff << shift, 0x9f << shift);
 }
 
 /* phy_rtl9310_symErr_clear() clears digital XSGMII counters by writing
@@ -2899,8 +2905,10 @@ static void rtpcs_931x_sds_mii_mode_set(struct rtpcs_serdes *sds,
 
 	val |= (1 << 7);
 
-	regmap_write(sds->ctrl->map,
-		     RTL931X_SERDES_MODE_CTRL + 4 * (sds->id >> 2), val);
+	regmap_write_bits(sds->ctrl->map,
+			  RTL931X_SERDES_MODE_CTRL + 4 * (sds->id >> 2),
+			  0xff << ((sds->id & 0x3) << 3),
+			  val << ((sds->id & 0x3) << 3));
 }
 
 static int rtpcs_931x_sds_cmu_band_set(struct rtpcs_serdes *sds,
