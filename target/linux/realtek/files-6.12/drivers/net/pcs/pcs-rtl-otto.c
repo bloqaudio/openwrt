@@ -5322,12 +5322,35 @@ static const struct of_device_id rtpcs_of_match[] = {
 };
 MODULE_DEVICE_TABLE(of, rtpcs_of_match);
 
+/* The reboot path resets the CPU but leaves the switch block running. A retry or
+ * poll worker still armed here runs while the system tears down and drives
+ * indirect SerDes transactions into a block the next kernel has not reset, which
+ * leaves a lane mid-transaction; the following boot then stalls on its first
+ * access to that lane.
+ */
+static void rtpcs_shutdown(struct platform_device *pdev)
+{
+	struct rtpcs_ctrl *ctrl = platform_get_drvdata(pdev);
+
+	if (!ctrl)
+		return;
+
+	for (int i = 0; i < RTPCS_PORT_CNT; i++) {
+		if (!ctrl->link[i])
+			continue;
+
+		cancel_delayed_work_sync(&ctrl->link[i]->retry_work);
+		cancel_delayed_work_sync(&ctrl->link[i]->c37_poll_work);
+	}
+}
+
 static struct platform_driver rtpcs_driver = {
 	.driver = {
 		.name = "realtek-otto-pcs",
 		.of_match_table = rtpcs_of_match
 	},
 	.probe = rtpcs_probe,
+	.shutdown = rtpcs_shutdown,
 };
 module_platform_driver(rtpcs_driver);
 
