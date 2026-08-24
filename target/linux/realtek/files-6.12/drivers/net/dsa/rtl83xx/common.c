@@ -4286,9 +4286,30 @@ static const struct of_device_id rtl83xx_switch_of_ids[] = {
 
 MODULE_DEVICE_TABLE(of, rtl83xx_switch_of_ids);
 
+/* device_shutdown() calls .shutdown, never .remove_new, so a plain reboot leaves
+ * the notifiers registered and the self-arming pollers running. They keep
+ * touching the switch while the CPU resets, and the block is not reset with it,
+ * so the next boot can meet a register interface left mid-access. Quiesce the
+ * same things the remove path does, without tearing the driver down.
+ */
+static void rtl83xx_sw_shutdown(struct platform_device *pdev)
+{
+	struct rtl838x_switch_priv *priv = platform_get_drvdata(pdev);
+
+	if (!priv)
+		return;
+
+	unregister_fib_notifier(&init_net, &priv->fib_nb);
+	unregister_netevent_notifier(&priv->ne_nb);
+	cancel_delayed_work_sync(&priv->counters_work);
+	cancel_delayed_work_sync(&priv->l3_activity_work);
+	flush_workqueue(priv->wq);
+}
+
 static struct platform_driver rtl83xx_switch_driver = {
 	.probe = rtl83xx_sw_probe,
 	.remove_new = rtl83xx_sw_remove,
+	.shutdown = rtl83xx_sw_shutdown,
 	.driver = {
 		.name = "rtl83xx-switch",
 		.pm = NULL,
