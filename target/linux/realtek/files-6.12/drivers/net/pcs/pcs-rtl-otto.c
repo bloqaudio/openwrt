@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <dt-bindings/gpio/gpio.h>
+#include <linux/delay.h>
 #include <linux/debugfs.h>
 #include <linux/gpio.h>
 #include <linux/gpio/consumer.h>
@@ -15,6 +16,7 @@
 #include <linux/phylink.h>
 #include <linux/regmap.h>
 #include <linux/seq_file.h>
+#include <linux/stop_machine.h>
 #include <linux/workqueue.h>
 
 #define RTPCS_SDS_CNT				14
@@ -132,6 +134,8 @@
 #define RTL931X_SERDES_MODE_CTRL		(0x13cc)
 #define RTL931X_PS_SERDES_OFF_MODE_CTRL_ADDR	(0x13F4)
 #define RTL931X_MAC_SERDES_MODE_CTRL(sds)	(0x136C + (((sds) << 2)))
+#define RTL931X_SDS_INDRT_ACCESS_CTRL		(0x5638)
+#define RTL931X_SDS_INDRT_DATA_CTRL		(0x563c)
 
 enum rtpcs_sds_mode {
 	RTPCS_SDS_MODE_OFF = 0,
@@ -2713,6 +2717,89 @@ static void rtpcs_931x_sds_fiber_disable(struct rtpcs_serdes *sds)
 	rtpcs_sds_write_bits(sds, 0x1F, 0x9, 11, 6, v);
 }
 
+/*
+ * The analog mode-field RMW intermittently freezes a CPU inside the
+ * indirect-engine MMIO transaction when other CPUs are active, so it must
+ * run with the machine quiesced. stop_machine() forbids sleeping, which
+ * rules out the regular MDIO accessors; this drives the engine raw through
+ * the syscon regmap with a bounded udelay poll. The MDIO bus lock is held
+ * around the stop so no other transaction is in flight when the CPUs halt.
+ */
+struct rtpcs_931x_stopped_rmw {
+	struct regmap *map;
+	u32 back_sds;
+	u32 page, reg;
+	u32 msb, lsb, val;
+	int ret;
+};
+
+static int rtpcs_931x_indrt_wait_atomic(struct regmap *map)
+{
+	u32 cmd;
+	int i;
+
+	for (i = 0; i < 10000; i++) {
+		regmap_read(map, RTL931X_SDS_INDRT_ACCESS_CTRL, &cmd);
+		if (!(cmd & BIT(0)))
+			return 0;
+		udelay(1);
+	}
+	return -ETIMEDOUT;
+}
+
+static int rtpcs_931x_sds_mode_write_stopped(void *data)
+{
+	struct rtpcs_931x_stopped_rmw *a = data;
+	u32 op, val, mask;
+	int ret;
+
+	op = (a->reg << 13) | (a->page << 7) | (a->back_sds << 2);
+
+	ret = rtpcs_931x_indrt_wait_atomic(a->map);
+	if (ret)
+		goto out;
+	regmap_write(a->map, RTL931X_SDS_INDRT_ACCESS_CTRL, op | BIT(0));
+	ret = rtpcs_931x_indrt_wait_atomic(a->map);
+	if (ret)
+		goto out;
+	regmap_read(a->map, RTL931X_SDS_INDRT_DATA_CTRL, &val);
+
+	mask = GENMASK(a->msb, a->lsb);
+	val = (val & 0xffff & ~mask) | ((a->val << a->lsb) & mask);
+
+	regmap_write(a->map, RTL931X_SDS_INDRT_DATA_CTRL, val);
+	regmap_write(a->map, RTL931X_SDS_INDRT_ACCESS_CTRL, op | BIT(1) | BIT(0));
+	ret = rtpcs_931x_indrt_wait_atomic(a->map);
+out:
+	a->ret = ret;
+	return ret;
+}
+
+static void rtpcs_931x_sds_mode_field_write_quiesced(struct rtpcs_serdes *sds,
+						     u32 val)
+{
+	/* frontend SDS -> backing SDS for the analog page view */
+	static const u8 back_map[] = { 0, 1, 2, 3, 6, 7, 10, 11,
+				       14, 15, 18, 19, 22, 23 };
+	struct rtpcs_931x_stopped_rmw a = {
+		.map = sds->ctrl->map,
+		.back_sds = back_map[sds->id],
+		.page = 0x1F,
+		.reg = 0x9,
+		.msb = 11,
+		.lsb = 6,
+		.val = val,
+	};
+
+	mutex_lock(&sds->ctrl->bus->mdio_lock);
+	stop_machine(rtpcs_931x_sds_mode_write_stopped, &a, NULL);
+	mutex_unlock(&sds->ctrl->bus->mdio_lock);
+
+	if (a.ret)
+		pr_err("%s: quiesced mode write timed out on sds %d\n",
+		       __func__, sds->id);
+}
+
 static void rtpcs_931x_sds_fiber_mode_set(struct rtpcs_serdes *sds,
 					  phy_interface_t mode)
 {
@@ -2750,7 +2837,16 @@ static void rtpcs_931x_sds_fiber_mode_set(struct rtpcs_serdes *sds,
 	}
 
 	pr_info("%s writing analog SerDes Mode value %02x\n", __func__, val);
-	rtpcs_sds_write_bits(sds, 0x1F, 0x9, 11, 6, val);
+
+	/*
+	 * Quiesce only the USXGMII submodes. SFP+ recovery workers re-issue
+	 * their mode every few seconds on empty cages and must not trigger
+	 * periodic machine-wide stalls.
+	 */
+	if (val == 0x1B)
+		rtpcs_931x_sds_mode_field_write_quiesced(sds, val);
+	else
+		rtpcs_sds_write_bits(sds, 0x1F, 0x9, 11, 6, val);
 }
 
 static int rtpcs_931x_sds_cmu_page_get(phy_interface_t mode)
