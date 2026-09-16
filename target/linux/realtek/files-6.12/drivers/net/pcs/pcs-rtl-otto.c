@@ -244,6 +244,7 @@ struct rtpcs_link {
 	bool retry_force;
 	bool retry_bad_link_up;
 	bool retry_injected;
+	unsigned long retry_rearm;
 };
 
 struct rtpcs_config {
@@ -270,6 +271,7 @@ struct rtpcs_config {
 
 static bool rtpcs_sds_retry_wait_for_link(struct rtpcs_link *link,
 					  bool discard_prior);
+static void rtpcs_pcs_rearm_retry(struct rtpcs_link *link);
 
 typedef struct {
 	u8 page;
@@ -4105,8 +4107,10 @@ static void rtpcs_pcs_get_state(struct phylink_pcs *pcs, struct phylink_link_sta
 	for (int i = 0; i < 2; i++)
 		linkup = rtpcs_regmap_read_bits(ctrl, ctrl->cfg->mac_link_sts, port, port);
 
-	if (!linkup)
+	if (!linkup) {
+		rtpcs_pcs_rearm_retry(link);
 		return;
+	}
 
 	state->link = 1;
 	rtpcs_pcs_note_link_seen(link);
@@ -4305,6 +4309,29 @@ static bool rtpcs_sfp_module_absent(struct rtpcs_link *link)
 	present = (flags & GPIO_ACTIVE_LOW) ? !raw : raw;
 
 	return !present;
+}
+
+/*
+ * phylink issues no callback when an inserted module resolves to the cached
+ * link configuration, so this runs from pcs_get_state(): lock-free state
+ * only, never a register sequence. The stamp is what bounds a cage with no
+ * MOD-DEF0 GPIO, which can never report itself empty.
+ */
+static void rtpcs_pcs_rearm_retry(struct rtpcs_link *link)
+{
+	if (!link->ctrl->cfg->setup_serdes || !link->sfp_node ||
+	    rtpcs_sfp_module_absent(link))
+		return;
+
+	if (READ_ONCE(link->retry_settling))
+		return;
+
+	if (time_before(jiffies,
+			READ_ONCE(link->retry_rearm) + RTPCS_SDS_SETUP_RETRY_DELAY))
+		return;
+
+	WRITE_ONCE(link->retry_rearm, jiffies);
+	mod_delayed_work(system_power_efficient_wq, &link->retry_work, 0);
 }
 
 /* The first SerDes setup of an SFP port always runs, even if the cage
@@ -4958,6 +4985,13 @@ void rtpcs_pcs_set_sfp_node(struct phylink_pcs *pcs, struct device_node *np)
 
 	/* Borrows the caller's node reference for the driver lifetime */
 	link->sfp_node = np;
+
+	/* phylink runs its one-per-second in-band poll only for a PCS that
+	 * asks for it; the hot-plug re-arm in pcs_get_state() has no other
+	 * entry. Set before the DSA user ports exist, so phylink_start()
+	 * sees it.
+	 */
+	link->pcs.poll = true;
 }
 EXPORT_SYMBOL(rtpcs_pcs_set_sfp_node);
 
@@ -5016,6 +5050,9 @@ struct phylink_pcs *rtpcs_create(struct device *dev, struct device_node *np, int
 	link->sds = &ctrl->serdes[sds_id];
 	link->pcs.ops = ctrl->cfg->pcs_ops;
 	link->pcs.neg_mode = true;
+
+	link->retry_rearm = jiffies;
+
 	INIT_DELAYED_WORK(&link->retry_work, rtpcs_sds_setup_retry);
 	INIT_DELAYED_WORK(&link->c37_poll_work, rtpcs_pcs_c37_poll);
 
