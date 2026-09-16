@@ -262,6 +262,7 @@ struct rtpcs_config {
 	int (*set_autoneg)(struct rtpcs_serdes *sds, unsigned int neg_mode);
 	int (*setup_serdes)(struct rtpcs_link *link, phy_interface_t mode);
 	int (*verify_rx)(struct rtpcs_link *link);
+	int (*signal_detect)(struct rtpcs_link *link);
 	int (*recover_serdes)(struct rtpcs_serdes *sds,
 			      phy_interface_t mode,
 			      enum rtpcs_sds_recovery_tier tier);
@@ -3955,6 +3956,35 @@ static int rtpcs_931x_verify_rx(struct rtpcs_link *link)
 }
 
 /*
+ * _phy_rtl9310_remoteFault_handle() reads RXIDLE_D through the debug mux on
+ * the even lane of the pair: selector 0x35 in page 0x1f register 0x02, then
+ * page 0x1f register 0x14, bit 0 for the even lane and bit 1 for the odd
+ * lane; a set bit means the receiver sees idle. The selector is shared with
+ * the paired lane's calibration, so restore it. Return 1 on signal present.
+ */
+static int rtpcs_931x_signal_detect(struct rtpcs_link *link)
+{
+	struct rtpcs_serdes *sds = rtpcs_sds_get_even(link->sds);
+	int saved, status, ret;
+
+	lockdep_assert_held(&link->ctrl->lock);
+
+	saved = rtpcs_sds_read(sds, 0x1f, 0x02);
+	if (saved < 0)
+		return saved;
+
+	ret = rtpcs_sds_write(sds, 0x1f, 0x02, 0x35);
+	status = ret ? ret : rtpcs_sds_read(sds, 0x1f, 0x14);
+	ret = rtpcs_sds_write(sds, 0x1f, 0x02, saved);
+	if (ret)
+		return ret;
+	if (status < 0)
+		return status;
+
+	return !(status & BIT(link->sds->id & 1));
+}
+
+/*
  * phy_rtl9310_rx_rst() is the lightweight receiver reset used between Mango
  * adaptation passes.  phy_rtl9310_sds_rst() is the deeper OFF -> mode -> OFF
  * sequence; rtpcs_931x_sds_reset() is its register-exact local equivalent.
@@ -4591,6 +4621,15 @@ static void rtpcs_sds_setup_retry(struct work_struct *work)
 		mod_delayed_work(system_power_efficient_wq, &link->retry_work,
 				 RTPCS_SDS_SETUP_RETRY_DELAY);
 		goto out;
+	}
+
+	if (link->retry_verify && !link->retry_attempt &&
+	    !link->retry_ladder_exhausted &&
+	    link->retry_mode == PHY_INTERFACE_MODE_10GBASER &&
+	    !rtpcs_mac_link_up(link) && ctrl->cfg->signal_detect &&
+	    ctrl->cfg->signal_detect(link) > 0) {
+		link->retry_verify = false;
+		link->retry_escalating = true;
 	}
 
 	/* A successful pcs_config() is verified here, not under phylink's
@@ -5401,6 +5440,7 @@ static const struct rtpcs_config rtpcs_931x_cfg = {
 	.set_autoneg		= rtpcs_93xx_set_autoneg,
 	.setup_serdes		= rtpcs_931x_setup_serdes,
 	.verify_rx		= rtpcs_931x_verify_rx,
+	.signal_detect		= rtpcs_931x_signal_detect,
 	.recover_serdes	= rtpcs_931x_recover_serdes,
 };
 
