@@ -4647,8 +4647,9 @@ static void rtpcs_sds_setup_retry(struct work_struct *work)
 			rtpcs_sds_apply_autoneg(link, link->retry_neg_mode);
 		}
 		link->retry_force = false;
-		rtpcs_sds_retry_settle_start(link,
-					     RTPCS_SDS_RETRY_RESUME_SETUP);
+		rtpcs_sds_retry_settle_start(link, ret || link->retry_ladder_exhausted ?
+					     RTPCS_SDS_RETRY_RESUME_SETUP :
+					     RTPCS_SDS_RETRY_RESUME_VERIFY);
 		goto out;
 	}
 
