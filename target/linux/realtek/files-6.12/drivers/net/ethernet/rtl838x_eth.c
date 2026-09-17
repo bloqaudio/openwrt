@@ -1225,12 +1225,10 @@ static int rtl838x_hw_receive(struct net_device *dev, int r, int budget)
 	struct ring_b *ring = priv->membase;
 	unsigned long flags;
 	int work_done = 0;
-	u32	*last;
 	bool dsa = netdev_uses_dsa(dev);
 
 	pr_debug("---------------------------------------------------------- RX - %d\n", r);
 	spin_lock_irqsave(&priv->lock, flags);
-	last = (u32 *)KSEG1ADDR(sw_r32(priv->r->dma_if_rx_cur + r * 4));
 
 	do {
 		struct sk_buff *skb;
@@ -1239,13 +1237,8 @@ static int rtl838x_hw_receive(struct net_device *dev, int r, int budget)
 		u8 *data;
 		int len;
 
-		if ((ring->rx_r[r][ring->c_rx[r]] & 0x1)) {
-			if (&ring->rx_r[r][ring->c_rx[r]] != last) {
-				netdev_warn(dev, "Ring contention: r: %x, last %x, cur %x\n",
-					    r, (u32)last, (u32)&ring->rx_r[r][ring->c_rx[r]]);
-			}
+		if (ring->rx_r[r][ring->c_rx[r]] & 0x1)
 			break;
-		}
 
 		h = &ring->rx_header[r][ring->c_rx[r]];
 		data = (u8 *)KSEG1ADDR(h->buf);
@@ -1334,8 +1327,7 @@ next_frame:
 					       WRAP :
 					       0x1);
 		ring->c_rx[r] = (ring->c_rx[r] + 1) % priv->rxringlen;
-		last = (u32 *)KSEG1ADDR(sw_r32(priv->r->dma_if_rx_cur + r * 4));
-	} while (&ring->rx_r[r][ring->c_rx[r]] != last && work_done < budget);
+	} while (work_done < budget);
 
 	/* Update counters */
 	priv->r->update_cntr(r, work_done);
