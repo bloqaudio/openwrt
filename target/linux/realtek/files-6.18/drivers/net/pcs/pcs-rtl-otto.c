@@ -2175,13 +2175,19 @@ static int rtpcs_930x_sds_set_mode(struct rtpcs_serdes *sds, enum rtpcs_sds_mode
 	if (ret)
 		return ret;
 
-	if (hw_mode != RTPCS_SDS_MODE_OFF && rtpcs_930x_sds_wait_clock_ready(sds))
-		dev_err(sds->ctrl->dev, "SerDes %d could not sync clock\n", sds->id);
+	if (hw_mode != RTPCS_SDS_MODE_OFF) {
+		ret = rtpcs_930x_sds_wait_clock_ready(sds);
+		if (ret) {
+			dev_err(sds->ctrl->dev, "SerDes %d could not sync clock\n", sds->id);
+			return ret;
+		}
+	}
 
-	if (rtpcs_930x_sds_init_state_machine(sds, hw_mode))
+	ret = rtpcs_930x_sds_init_state_machine(sds, hw_mode);
+	if (ret)
 		dev_err(sds->ctrl->dev, "SerDes %d could not reset state machine\n", sds->id);
 
-	return 0;
+	return ret;
 }
 
 static int rtpcs_930x_sds_deactivate(struct rtpcs_serdes *sds)
@@ -3221,6 +3227,7 @@ static int rtpcs_930x_sds_config_attachment(struct rtpcs_serdes *sds,
 static int rtpcs_930x_sds_post_config(struct rtpcs_serdes *sds, enum rtpcs_sds_mode hw_mode)
 {
 	int calib_tries = 0;
+	bool calib_ok;
 
 	if (hw_mode == RTPCS_SDS_MODE_QSGMII)
 		return 0;
@@ -3230,9 +3237,13 @@ static int rtpcs_930x_sds_post_config(struct rtpcs_serdes *sds, enum rtpcs_sds_m
 		rtpcs_930x_sds_do_rx_calibration(sds, hw_mode);
 		calib_tries++;
 		msleep(50);
-	} while (rtpcs_930x_sds_check_calibration(sds, hw_mode) && calib_tries < 3);
-	if (calib_tries >= 3)
+		calib_ok = !rtpcs_930x_sds_check_calibration(sds, hw_mode);
+	} while (!calib_ok && calib_tries < 3);
+
+	if (!calib_ok) {
 		dev_warn(sds->ctrl->dev, "SerDes %u: RX calibration failed\n", sds->id);
+		return -EIO;
+	}
 
 	return 0;
 }
@@ -4325,6 +4336,14 @@ static void rtpcs_pcs_an_restart(struct phylink_pcs *pcs)
 	mutex_unlock(&ctrl->lock);
 }
 
+/* A failed setup restores the previous mode so the next call retries it. */
+static void rtpcs_sds_record_mode(struct rtpcs_serdes *sds, enum rtpcs_sds_mode hw_mode,
+				  enum rtpcs_sds_usxgmii_submode submode)
+{
+	sds->hw_mode = hw_mode;
+	sds->usxgmii_submode = submode;
+}
+
 static int rtpcs_pcs_config(struct phylink_pcs *pcs, unsigned int neg_mode,
 			    phy_interface_t interface, const unsigned long *advertising,
 			    bool permit_pause_to_mac)
@@ -4333,8 +4352,8 @@ static int rtpcs_pcs_config(struct phylink_pcs *pcs, unsigned int neg_mode,
 	struct rtpcs_ctrl *ctrl = link->ctrl;
 	struct rtpcs_serdes *sds = link->sds;
 	enum rtpcs_sds_attachment attachment;
-	enum rtpcs_sds_usxgmii_submode submode;
-	enum rtpcs_sds_mode hw_mode;
+	enum rtpcs_sds_usxgmii_submode submode, old_submode;
+	enum rtpcs_sds_mode hw_mode, old_mode;
 	bool mode_changed;
 	int changed, ret;
 
@@ -4346,7 +4365,9 @@ static int rtpcs_pcs_config(struct phylink_pcs *pcs, unsigned int neg_mode,
 	}
 
 	scoped_guard(mutex, &ctrl->lock) {
-		mode_changed = sds->hw_mode != hw_mode || sds->usxgmii_submode != submode;
+		old_mode = sds->hw_mode;
+		old_submode = sds->usxgmii_submode;
+		mode_changed = old_mode != hw_mode || old_submode != submode;
 		if (mode_changed) {
 			ret = rtpcs_sds_config_polarity(sds, interface);
 			if (ret < 0) {
@@ -4379,26 +4400,31 @@ static int rtpcs_pcs_config(struct phylink_pcs *pcs, unsigned int neg_mode,
 			if (ret < 0)
 				return ret;
 
-			sds->hw_mode = hw_mode;
-			sds->usxgmii_submode = submode;
+			rtpcs_sds_record_mode(sds, hw_mode, submode);
 
 			ret = sds->ops->activate(sds);
-			if (ret < 0)
+			if (ret < 0) {
+				rtpcs_sds_record_mode(sds, old_mode, old_submode);
 				return ret;
+			}
 		} else {
 			dev_dbg(ctrl->dev, "SerDes %u already in mode %s, no change\n",
 				sds->id, phy_modes(interface));
 		}
 
 		changed = sds->ops->set_autoneg(sds, neg_mode, advertising);
-		if (changed < 0)
+		if (changed < 0) {
+			rtpcs_sds_record_mode(sds, old_mode, old_submode);
 			return changed;
+		}
 
 		if (mode_changed) {
 			if (sds->ops->post_config) {
 				ret = sds->ops->post_config(sds, hw_mode);
-				if (ret < 0)
+				if (ret < 0) {
+					rtpcs_sds_record_mode(sds, old_mode, old_submode);
 					return ret;
+				}
 			}
 
 			sds->first_start = false;
