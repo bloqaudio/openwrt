@@ -1989,6 +1989,13 @@ static void rteth_remove(struct platform_device *pdev)
 	}
 }
 
+static void rteth_shutdown(struct platform_device *pdev)
+{
+	struct net_device *dev = platform_get_drvdata(pdev);
+
+	rteth_hw_stop(netdev_priv(dev));
+}
+
 static const struct of_device_id rteth_of_ids[] = {
 	{ .compatible = "realtek,rtl8380-eth", .data = &rteth_838x_cfg, },
 	{ .compatible = "realtek,rtl8392-eth", .data = &rteth_839x_cfg, },
@@ -2001,6 +2008,7 @@ MODULE_DEVICE_TABLE(of, rteth_of_ids);
 static struct platform_driver rtl838x_eth_driver = {
 	.probe  = rteth_probe,
 	.remove = rteth_remove,
+	.shutdown = rteth_shutdown,
 	.driver = {
 		.name = KBUILD_MODNAME,
 		.pm = NULL,
