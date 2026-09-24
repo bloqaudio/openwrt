@@ -1,0 +1,77 @@
+From: OpenWrt
+Subject: [PATCH] net: phy: sfp: add quirk for QSFPTEK QT-SFP+-T
+
+The QSFPTEK QT-SFP+-T 10GBASE-T module implements the SFF-8472
+diagnostic page at A2h, but its A0h EEPROM reports SFF-8472 compliance
+0x00 and diagnostic monitoring type 0x00. The driver therefore treats
+it as SFF-8079: the A2h page is not exposed through the module EEPROM
+interface and no hwmon device is registered.
+
+Only the temperature on that page is a measurement. It follows PHY
+load, rising by about 20 C within minutes of a 10G link coming up.
+Supply voltage reads the same value under every load, bias and TX
+power are constants, and RX power switches between two fixed values
+with copper link state.
+
+Force SFF-8472 rev 10.2 compliance with DDM so the A2h page and hwmon
+become available, and restrict hwmon to the temperature channel so the
+emulated values are not presented as measurements. The fixup runs after
+sfp_module_parse_sff8472(), so it also sets have_a2, which the module
+EEPROM and hwmon paths check.
+---
+--- a/drivers/net/phy/sfp.c
++++ b/drivers/net/phy/sfp.c
+@@ -282,6 +282,7 @@
+ 	unsigned int rs_state_mask;
+ 
+ 	bool have_a2;
++	bool diag_temp_only;
+ 
+ 	const struct sfp_quirk *quirk;
+ 
+@@ -371,6 +372,15 @@
+ 	sfp->state_hw_mask &= ~mask;
+ }
+ 
++static void sfp_fixup_temp_only_ddm(struct sfp *sfp)
++{
++	/* sfp_module_parse_sff8472() has already run, set have_a2 here */
++	sfp->id.ext.sff8472_compliance = SFP_SFF8472_COMPLIANCE_REV10_2;
++	sfp->id.ext.diagmon |= SFP_DIAGMON_DDM;
++	sfp->have_a2 = true;
++	sfp->diag_temp_only = true;
++}
++
+ static void sfp_fixup_nokia(struct sfp *sfp)
+ {
+ 	sfp_fixup_long_startup(sfp);
+@@ -560,6 +570,11 @@
+ 	SFP_QUIRK("Lantech", "8330-265D", sfp_quirk_2500basex,
+ 		  sfp_fixup_ignore_los),
+ 
++	// QSFPTEK QT-SFP+-T implements SFF-8472 diagnostics at A2h without
++	// advertising them; only the temperature is measured, the rest are
++	// constants
++	SFP_QUIRK_F("QSFPTEK", "QT-SFP+-T", sfp_fixup_temp_only_ddm),
++
+ 	SFP_QUIRK_S("UBNT", "UF-INSTANT", sfp_quirk_ubnt_uf_instant),
+ 
+ 	// Walsun HXSX-ATR[CI]-1 don't identify as copper, and use the
+@@ -1033,6 +1048,9 @@
+ {
+ 	const struct sfp *sfp = data;
+ 
++	if (sfp->diag_temp_only && type != hwmon_temp)
++		return 0;
++
+ 	switch (type) {
+ 	case hwmon_temp:
+ 		switch (attr) {
+@@ -2496,6 +2514,7 @@
+ 	sfp->phy_t_retry = T_PHY_RETRY;
+ 
+ 	sfp->state_ignore_mask = 0;
++	sfp->diag_temp_only = false;
+ 
+ 	if (sfp->id.base.extended_cc == SFF8024_ECC_10GBASE_T_SFI ||
+ 	    sfp->id.base.extended_cc == SFF8024_ECC_10GBASE_T_SR ||
