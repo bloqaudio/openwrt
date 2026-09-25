@@ -13,6 +13,7 @@
 #include <linux/platform_device.h>
 #include <linux/property.h>
 #include <linux/regmap.h>
+#include <linux/workqueue.h>
 
 #define RTPCS_SDS_CNT				14
 #define RTPCS_MAX_LINKS_PER_SDS			8
@@ -496,6 +497,12 @@ struct rtpcs_link {
 	struct phylink_pcs pcs;
 	struct rtpcs_serdes *sds;
 	int port;
+
+	struct delayed_work retry_work;
+	unsigned int retries;
+	unsigned int neg_mode;
+	phy_interface_t interface;
+	__ETHTOOL_DECLARE_LINK_MODE_MASK(advertising);
 };
 
 struct rtpcs_config {
@@ -4354,9 +4361,9 @@ static void rtpcs_sds_record_mode(struct rtpcs_serdes *sds, enum rtpcs_sds_mode 
 	sds->usxgmii_submode = submode;
 }
 
-static int rtpcs_pcs_config(struct phylink_pcs *pcs, unsigned int neg_mode,
-			    phy_interface_t interface, const unsigned long *advertising,
-			    bool permit_pause_to_mac)
+static int __rtpcs_pcs_config(struct phylink_pcs *pcs, unsigned int neg_mode,
+			      phy_interface_t interface, const unsigned long *advertising,
+			      bool force)
 {
 	struct rtpcs_link *link = rtpcs_phylink_pcs_to_link(pcs);
 	struct rtpcs_ctrl *ctrl = link->ctrl;
@@ -4377,7 +4384,7 @@ static int rtpcs_pcs_config(struct phylink_pcs *pcs, unsigned int neg_mode,
 	scoped_guard(mutex, &ctrl->lock) {
 		old_mode = sds->hw_mode;
 		old_submode = sds->usxgmii_submode;
-		mode_changed = old_mode != hw_mode || old_submode != submode;
+		mode_changed = force || old_mode != hw_mode || old_submode != submode;
 		if (mode_changed) {
 			ret = rtpcs_sds_config_polarity(sds, interface);
 			if (ret < 0) {
@@ -4445,6 +4452,78 @@ static int rtpcs_pcs_config(struct phylink_pcs *pcs, unsigned int neg_mode,
 	}
 
 	return changed;
+}
+
+#define RTPCS_RETRY_MAX		10
+#define RTPCS_RETRY_DELAY_MAX	(30 * HZ)
+
+static unsigned long rtpcs_retry_delay(unsigned int retries)
+{
+	return min_t(unsigned long, (5 * HZ) << min(retries, 3U), RTPCS_RETRY_DELAY_MAX);
+}
+
+/* Phylink selects 10GBASE-R only after reading a module, so the cage is populated. */
+static void rtpcs_retry_work(struct work_struct *work)
+{
+	struct rtpcs_link *link = container_of(to_delayed_work(work),
+					       struct rtpcs_link, retry_work);
+	struct phylink_link_state state = { .link = 0 };
+
+	scoped_guard(mutex, &link->ctrl->lock)
+		rtpcs_pcs_get_state_mac(link, &state);
+	if (state.link)
+		return;
+
+	if (link->retries >= RTPCS_RETRY_MAX) {
+		dev_warn(link->ctrl->dev, "SerDes %u: no link after %u setup retries\n",
+			 link->sds->id, link->retries);
+		return;
+	}
+
+	link->retries++;
+	dev_info(link->ctrl->dev, "SerDes %u: no link, retrying setup (%u/%u)\n",
+		 link->sds->id, link->retries, RTPCS_RETRY_MAX);
+	__rtpcs_pcs_config(&link->pcs, link->neg_mode, link->interface,
+			   link->advertising, true);
+
+	schedule_delayed_work(&link->retry_work, rtpcs_retry_delay(link->retries));
+}
+
+static int rtpcs_pcs_config(struct phylink_pcs *pcs, unsigned int neg_mode,
+			    phy_interface_t interface, const unsigned long *advertising,
+			    bool permit_pause_to_mac)
+{
+	struct rtpcs_link *link = rtpcs_phylink_pcs_to_link(pcs);
+	int ret;
+
+	ret = __rtpcs_pcs_config(pcs, neg_mode, interface, advertising, false);
+
+	if (interface == PHY_INTERFACE_MODE_10GBASER) {
+		link->neg_mode = neg_mode;
+		link->interface = interface;
+		linkmode_copy(link->advertising, advertising);
+		link->retries = 0;
+		schedule_delayed_work(&link->retry_work, rtpcs_retry_delay(0));
+
+		/* a failed pcs_config holds the link down until phylink's next major config */
+		if (ret < 0) {
+			dev_warn(link->ctrl->dev, "SerDes %u: setup failed (%pe), retrying\n",
+				 link->sds->id, ERR_PTR(ret));
+			ret = 0;
+		}
+	}
+
+	return ret;
+}
+
+static void rtpcs_93xx_pcs_pre_config(struct phylink_pcs *pcs, phy_interface_t interface)
+{
+	cancel_delayed_work_sync(&rtpcs_phylink_pcs_to_link(pcs)->retry_work);
+}
+
+static void rtpcs_93xx_pcs_disable(struct phylink_pcs *pcs)
+{
+	cancel_delayed_work_sync(&rtpcs_phylink_pcs_to_link(pcs)->retry_work);
 }
 
 static void rtpcs_mdio_bus_put(void *data)
@@ -4601,6 +4680,7 @@ static struct phylink_pcs *rtpcs_pcs_get(struct fwnode_reference_args *pcsspec, 
 		link->port = sds->link_port[link_idx];
 		link->sds = sds;
 		link->pcs.ops = sds->ctrl->cfg->pcs_ops;
+		INIT_DELAYED_WORK(&link->retry_work, rtpcs_retry_work);
 
 		sds->link[link_idx] = link;
 	}
@@ -4697,7 +4777,9 @@ static int rtpcs_probe(struct platform_device *pdev)
 static const struct phylink_pcs_ops rtpcs_pcs_ops = {
 	.pcs_an_restart		= rtpcs_pcs_an_restart,
 	.pcs_config		= rtpcs_pcs_config,
+	.pcs_disable		= rtpcs_93xx_pcs_disable,
 	.pcs_get_state		= rtpcs_pcs_get_state,
+	.pcs_pre_config		= rtpcs_93xx_pcs_pre_config,
 };
 
 static const struct rtpcs_sds_ops rtpcs_838x_sds_ops = {
@@ -4853,12 +4935,23 @@ static const struct of_device_id rtpcs_of_match[] = {
 };
 MODULE_DEVICE_TABLE(of, rtpcs_of_match);
 
+static void rtpcs_shutdown(struct platform_device *pdev)
+{
+	struct rtpcs_ctrl *ctrl = platform_get_drvdata(pdev);
+
+	for (int i = 0; i < RTPCS_SDS_CNT; i++)
+		for (int j = 0; j < RTPCS_MAX_LINKS_PER_SDS; j++)
+			if (ctrl->serdes[i].link[j])
+				cancel_delayed_work_sync(&ctrl->serdes[i].link[j]->retry_work);
+}
+
 static struct platform_driver rtpcs_driver = {
 	.driver = {
 		.name = "realtek-otto-pcs",
 		.of_match_table = rtpcs_of_match
 	},
 	.probe = rtpcs_probe,
+	.shutdown = rtpcs_shutdown,
 };
 module_platform_driver(rtpcs_driver);
 
