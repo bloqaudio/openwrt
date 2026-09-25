@@ -1,0 +1,30 @@
+From: OpenWrt
+Subject: [PATCH] watchdog: realtek_otto: do not sleep in the restart handler
+
+otto_wdt_restart() masks the phase 1 interrupt with disable_irq(), which
+waits for running handlers through synchronize_irq() and, on current
+kernels, for an RCU grace period. The restart handler runs after
+machine_restart() has stopped the other CPUs. If the RCU grace period
+kthread last ran on a stopped CPU, the grace period never completes,
+disable_irq() never returns and the reset register is never written.
+The system then hangs at "reboot: Restarting system" with RCU stall
+reports instead of resetting.
+
+On a dual core RTL9303 this hung 3 of 22 and 1 of 18 warm reboots, with
+the reboot task blocked in otto_wdt_restart -> __synchronize_irq ->
+synchronize_rcu_normal.
+
+Use disable_irq_nosync(). Only masking the interrupt is needed: the
+handler cannot usefully run once the reset has been requested.
+---
+--- a/drivers/watchdog/realtek_otto_wdt.c
++++ b/drivers/watchdog/realtek_otto_wdt.c
+@@ -167,7 +167,7 @@
+ 	u32 reset_mode;
+ 	u32 v;
+ 
+-	disable_irq(ctrl->irq_phase1);
++	disable_irq_nosync(ctrl->irq_phase1);
+ 
+ 	switch (reboot_mode) {
+ 	case REBOOT_SOFT:
