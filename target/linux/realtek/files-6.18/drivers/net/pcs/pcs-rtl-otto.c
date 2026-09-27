@@ -4504,6 +4504,13 @@ static int rtpcs_pcs_config(struct phylink_pcs *pcs, unsigned int neg_mode,
 		linkmode_copy(link->advertising, advertising);
 		link->retries = 0;
 		schedule_delayed_work(&link->retry_work, rtpcs_retry_delay(0));
+
+		/* a failed pcs_config holds the link down until phylink's next major config */
+		if (ret < 0) {
+			dev_warn(link->ctrl->dev, "SerDes %u: setup failed (%pe), retrying\n",
+				 link->sds->id, ERR_PTR(ret));
+			ret = 0;
+		}
 	}
 
 	return ret;
