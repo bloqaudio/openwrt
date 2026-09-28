@@ -104,8 +104,12 @@
 #define RTPCS_931X_MAC_GROUP5_CTRL		(0x13b0)
 #define RTPCS_931X_MAC_GROUP6_7_CTRL		(0x13b4)
 #define RTPCS_931X_MAC_GROUP8_11_CTRL		(0x13b8)
+#define RTPCS_931X_SERDES_MUX_CTRL_0		(0x13bc)
+#define RTPCS_931X_SERDES_MUX_CTRL_1		(0x13c0)
 #define RTPCS_931X_SERDES_MODE_CTRL		(0x13cc)
 #define RTPCS_931X_SDS_USXGMII_SUBMODE		(0x13e8)
+#define RTPCS_931X_FRC_RXDV_H			(0x0f6c)
+#define RTPCS_931X_FRC_RXDV_L			(0x0f70)
 #define RTPCS_931X_PS_SERDES_OFF_MODE_CTRL_ADDR	(0x13F4)
 #define RTPCS_931X_ISR_SERDES_RXIDLE		(0x12f8)
 
@@ -3601,6 +3605,63 @@ static int rtpcs_931x_sds_apply_ip_mode(struct rtpcs_serdes *sds,
 	return rtpcs_93xx_sds_set_ip_mode(sds, hw_mode);
 }
 
+/* channels 2 and 3 of a 10G-QXGMII SerDes serve MAC ports base+4 and base+5 through this mux */
+static const struct {
+	u8 port[2];
+	u8 port_lsb[2];
+	u8 sds_lsb[2];
+	u8 width;
+	u8 val;
+} rtpcs_931x_qxgmii_mux[] = {
+	{ { 4, 5 },   { 4, 6 },   { 3, 5 },   2, 2 },
+	{ { 12, 13 }, { 14, 16 }, { 9, 11 },  2, 2 },
+	{ { 20, 21 }, { 20, 21 }, { 13, 14 }, 1, 1 },
+	{ { 28, 29 }, { 22, 23 }, { 15, 16 }, 1, 1 },
+	{ { 36, 37 }, { 24, 25 }, { 17, 18 }, 1, 1 },
+	{ { 44, 45 }, { 28, 29 }, { 19, 20 }, 1, 1 },
+};
+
+static bool rtpcs_sds_has_port(struct rtpcs_serdes *sds, int port)
+{
+	for (int i = 0; i < RTPCS_MAX_LINKS_PER_SDS; i++)
+		if (sds->link_port[i] == port)
+			return true;
+
+	return false;
+}
+
+static int rtpcs_931x_sds_config_qxgmii_mux(struct rtpcs_serdes *sds)
+{
+	u32 mask0 = 0, val0 = 0, mask1 = 0, val1 = 0;
+	unsigned int idx = sds->id - 2;
+	int ret;
+
+	if (sds->id < 2 || idx >= ARRAY_SIZE(rtpcs_931x_qxgmii_mux))
+		return 0;
+
+	if (!rtpcs_sds_has_port(sds, rtpcs_931x_qxgmii_mux[idx].port[0]) &&
+	    !rtpcs_sds_has_port(sds, rtpcs_931x_qxgmii_mux[idx].port[1]))
+		return 0;
+
+	for (int i = 0; i < 2; i++) {
+		u8 width = rtpcs_931x_qxgmii_mux[idx].width;
+		u8 val = rtpcs_931x_qxgmii_mux[idx].val;
+		u8 plsb = rtpcs_931x_qxgmii_mux[idx].port_lsb[i];
+		u8 slsb = rtpcs_931x_qxgmii_mux[idx].sds_lsb[i];
+
+		mask0 |= GENMASK(plsb + width - 1, plsb);
+		val0 |= val << plsb;
+		mask1 |= GENMASK(slsb + width - 1, slsb);
+		val1 |= val << slsb;
+	}
+
+	ret = regmap_update_bits(sds->ctrl->map, RTPCS_931X_SERDES_MUX_CTRL_0, mask0, val0);
+	if (ret)
+		return ret;
+
+	return regmap_update_bits(sds->ctrl->map, RTPCS_931X_SERDES_MUX_CTRL_1, mask1, val1);
+}
+
 static int rtpcs_931x_sds_set_mode(struct rtpcs_serdes *sds,
 				   enum rtpcs_sds_mode hw_mode,
 				   enum rtpcs_sds_usxgmii_submode submode)
@@ -3613,6 +3674,12 @@ static int rtpcs_931x_sds_set_mode(struct rtpcs_serdes *sds,
 	ret = rtpcs_931x_sds_apply_ip_mode(sds, hw_mode);
 	if (ret)
 		return ret;
+
+	if (hw_mode == RTPCS_SDS_MODE_USXGMII && submode == RTPCS_SDS_USXGMII_SM_10GQXGMII) {
+		ret = rtpcs_931x_sds_config_qxgmii_mux(sds);
+		if (ret)
+			return ret;
+	}
 
 	return rtpcs_93xx_sds_apply_usxgmii_submode(sds, submode);
 }
@@ -4435,6 +4502,14 @@ static int rtpcs_931x_init(struct rtpcs_ctrl *ctrl)
 
 	ret = rtpcs_931x_init_mac_groups(ctrl);
 	if (ret < 0)
+		return ret;
+
+	ret = regmap_write(ctrl->map, RTPCS_931X_FRC_RXDV_H, 0xffffffff);
+	if (ret)
+		return ret;
+
+	ret = regmap_write(ctrl->map, RTPCS_931X_FRC_RXDV_L, 0xffffffff);
+	if (ret)
 		return ret;
 
 	return rtpcs_93xx_init(ctrl);
