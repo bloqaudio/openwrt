@@ -325,6 +325,9 @@ static int rtsds_rt93xx_io(struct rtsds_ctrl *ctrl, int sds, int page, int regnu
 		return -ETIMEDOUT;
 	}
 
+	/* BUSY clears before read data is valid; reading early returns the last written value */
+	udelay(10);
+
 	return 0;
 }
 
