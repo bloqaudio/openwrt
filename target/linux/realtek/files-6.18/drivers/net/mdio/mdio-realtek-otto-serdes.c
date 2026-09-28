@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <linux/debugfs.h>
+#include <linux/delay.h>
 #include <linux/mfd/core.h>
 #include <linux/mfd/syscon.h>
 #include <linux/module.h>
@@ -322,6 +323,9 @@ static int rtsds_rt93xx_io(struct rtsds_ctrl *ctrl, int sds, int page, int regnu
 		dev_err(ctrl->dev, "SerDes I/O timed out\n");
 		return -ETIMEDOUT;
 	}
+
+	/* BUSY clears before read data is valid; reading early returns the last written value */
+	udelay(10);
 
 	return 0;
 }
