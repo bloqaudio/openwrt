@@ -4065,9 +4065,247 @@ static int rtpcs_931x_sds_post_config(struct rtpcs_serdes *sds, enum rtpcs_sds_m
 	return 0;
 }
 
+static const struct rtpcs_sds_config rtpcs_931x_sds_cfg_ana_com[] = {
+	{PAGE_ANA_COM, 0x00, 0x1800}, {PAGE_ANA_COM, 0x01, 0x0060},
+	{PAGE_ANA_COM, 0x02, 0x3000}, {PAGE_ANA_COM, 0x03, 0xFFFF},
+	{PAGE_ANA_COM, 0x04, 0x0603}, {PAGE_ANA_COM, 0x05, 0x1104},
+	{PAGE_ANA_COM, 0x06, 0x4444}, {PAGE_ANA_COM, 0x07, 0x7044},
+	{PAGE_ANA_COM, 0x08, 0xF104}, {PAGE_ANA_COM, 0x09, 0xF104},
+	{PAGE_ANA_COM, 0x0A, 0xF104}, {PAGE_ANA_COM, 0x0B, 0x0003},
+	{PAGE_ANA_COM, 0x0C, 0x007F}, {PAGE_ANA_COM, 0x0D, 0x3FE4},
+	{PAGE_ANA_COM, 0x0E, 0x31F9}, {PAGE_ANA_COM, 0x0F, 0x0618},
+	{PAGE_ANA_COM, 0x10, 0x1FF8}, {PAGE_ANA_COM, 0x11, 0x7C9F},
+	{PAGE_ANA_COM, 0x12, 0x7C9F}, {PAGE_ANA_COM, 0x13, 0x13FF},
+	{PAGE_ANA_COM, 0x14, 0x001F}, {PAGE_ANA_COM, 0x15, 0x01F0},
+	{PAGE_ANA_COM, 0x16, 0x1067}, {PAGE_ANA_COM, 0x17, 0x8AF1},
+	{PAGE_ANA_COM, 0x18, 0x210A}, {PAGE_ANA_COM, 0x19, 0xF0F0}
+};
+
+static const struct rtpcs_sds_config rtpcs_931x_sds_cfg_10g[] = {
+	{PAGE_ANA_10G, 0x00, 0x0107}, {PAGE_ANA_10G, 0x01, 0x0200},
+	{PAGE_ANA_10G, 0x02, 0x6A24}, {PAGE_ANA_10G, 0x03, 0xD10D},
+	{PAGE_ANA_10G, 0x04, 0xD550}, {PAGE_ANA_10G, 0x05, 0xA95E},
+	{PAGE_ANA_10G, 0x06, 0xE31D}, {PAGE_ANA_10G, 0x07, 0x000E},
+	{PAGE_ANA_10G, 0x08, 0x0294}, {PAGE_ANA_10G, 0x09, 0x0CE4},
+	{PAGE_ANA_10G, 0x0A, 0x7FC8}, {PAGE_ANA_10G, 0x0B, 0xE0E7},
+	{PAGE_ANA_10G, 0x0C, 0x0200}, {PAGE_ANA_10G, 0x0D, 0xDF80},
+	{PAGE_ANA_10G, 0x0E, 0x0000}, {PAGE_ANA_10G, 0x0F, 0x1FC4},
+	{PAGE_ANA_10G, 0x10, 0x0C3F}, {PAGE_ANA_10G, 0x11, 0x0000},
+	{PAGE_ANA_10G, 0x12, 0x27C0}, {PAGE_ANA_10G, 0x13, 0x7F1C},
+	{PAGE_ANA_10G, 0x14, 0x1300}, {PAGE_ANA_10G, 0x15, 0x003F},
+	{PAGE_ANA_10G, 0x16, 0xBE7F}, {PAGE_ANA_10G, 0x17, 0x0090},
+	{PAGE_ANA_10G, 0x18, 0x0000}, {PAGE_ANA_10G, 0x19, 0x4000},
+	{PAGE_ANA_10G, 0x1A, 0x0000}, {PAGE_ANA_10G, 0x1B, 0x8000},
+	{PAGE_ANA_10G, 0x1C, 0x011E}, {PAGE_ANA_10G, 0x1D, 0x0000},
+	{PAGE_ANA_10G, 0x1E, 0xC8FF}, {PAGE_ANA_10G, 0x1F, 0x0000},
+	{PAGE_ANA_10G_EXT, 0x00, 0xC000}, {PAGE_ANA_10G_EXT, 0x01, 0xF000},
+	{PAGE_ANA_10G_EXT, 0x02, 0x6010}, {PAGE_ANA_10G_EXT, 0x12, 0x0EEE},
+	{PAGE_ANA_10G_EXT, 0x13, 0x0000}, {PAGE_TGR_PRO_0, 0x00, 0x0000}
+};
+
+static const struct rtpcs_sds_config rtpcs_931x_sds_cfg_10g_cmu[] = {
+	{PAGE_ANA_10G_EXT, 0x03, 0x4210}, {PAGE_ANA_10G_EXT, 0x04, 0x0000},
+	{PAGE_ANA_10G_EXT, 0x05, 0x3FD9}, {PAGE_ANA_10G_EXT, 0x06, 0x58A6},
+	{PAGE_ANA_10G_EXT, 0x07, 0x2990}, {PAGE_ANA_10G_EXT, 0x08, 0xFFF4},
+	{PAGE_ANA_10G_EXT, 0x09, 0x1F08}, {PAGE_ANA_10G_EXT, 0x0A, 0x0000},
+	{PAGE_ANA_10G_EXT, 0x0B, 0x8000}, {PAGE_ANA_10G_EXT, 0x0C, 0x4224},
+	{PAGE_ANA_10G_EXT, 0x0D, 0x0000}, {PAGE_ANA_10G_EXT, 0x0E, 0x0400},
+	{PAGE_ANA_10G_EXT, 0x0F, 0xA464}, {PAGE_ANA_10G_EXT, 0x10, 0x8000},
+	{PAGE_ANA_10G_EXT, 0x11, 0x0165}, {PAGE_ANA_MISC, 0x11, 0x000D},
+	{PAGE_ANA_MISC, 0x12, 0x510F}, {PAGE_ANA_MISC, 0x00, 0x0030}
+};
+
+static const struct rtpcs_sds_config rtpcs_931x_sds_cfg_5g[] = {
+	{PAGE_ANA_5G0, 0x00, 0x0104}, {PAGE_ANA_5G0, 0x01, 0x0200},
+	{PAGE_ANA_5G0, 0x02, 0x2A24}, {PAGE_ANA_5G0, 0x03, 0xD10D},
+	{PAGE_ANA_5G0, 0x04, 0xD550}, {PAGE_ANA_5G0, 0x05, 0xA95E},
+	{PAGE_ANA_5G0, 0x06, 0xE31D}, {PAGE_ANA_5G0, 0x07, 0x800E},
+	{PAGE_ANA_5G0, 0x08, 0x0294}, {PAGE_ANA_5G0, 0x09, 0x28E4},
+	{PAGE_ANA_5G0, 0x0A, 0x7FC8}, {PAGE_ANA_5G0, 0x0B, 0xE0E7},
+	{PAGE_ANA_5G0, 0x0C, 0x0200}, {PAGE_ANA_5G0, 0x0D, 0x9F80},
+	{PAGE_ANA_5G0, 0x0E, 0x0800}, {PAGE_ANA_5G0, 0x0F, 0x1FC8},
+	{PAGE_ANA_5G0, 0x10, 0x0C3F}, {PAGE_ANA_5G0, 0x11, 0x0000},
+	{PAGE_ANA_5G0, 0x12, 0x27C0}, {PAGE_ANA_5G0, 0x13, 0x7F1C},
+	{PAGE_ANA_5G0, 0x14, 0x1300}, {PAGE_ANA_5G0, 0x15, 0x003F},
+	{PAGE_ANA_5G0, 0x16, 0xBE7F}, {PAGE_ANA_5G0, 0x17, 0x0090},
+	{PAGE_ANA_5G0, 0x18, 0x0000}, {PAGE_ANA_5G0, 0x19, 0x407F},
+	{PAGE_ANA_5G0, 0x1A, 0x0000}, {PAGE_ANA_5G0, 0x1B, 0x8000},
+	{PAGE_ANA_5G0, 0x1C, 0x011E}, {PAGE_ANA_5G0, 0x1D, 0x0000},
+	{PAGE_ANA_5G0, 0x1E, 0xC8FF}, {PAGE_ANA_5G0, 0x1F, 0x0000},
+	{PAGE_ANA_5G0_EXT, 0x00, 0xC000}, {PAGE_ANA_5G0_EXT, 0x01, 0xF000},
+	{PAGE_ANA_5G0_EXT, 0x02, 0x6010}, {PAGE_ANA_5G0_EXT, 0x12, 0x0EEE},
+	{PAGE_ANA_5G0_EXT, 0x13, 0x0000}
+};
+
+static const struct rtpcs_sds_config rtpcs_931x_sds_cfg_5g_cmu[] = {
+	{PAGE_ANA_5G0_EXT, 0x03, 0x5010}, {PAGE_ANA_5G0_EXT, 0x04, 0x0000},
+	{PAGE_ANA_5G0_EXT, 0x05, 0x27D9}, {PAGE_ANA_5G0_EXT, 0x06, 0x58A6},
+	{PAGE_ANA_5G0_EXT, 0x07, 0x2990}, {PAGE_ANA_5G0_EXT, 0x08, 0xFFF4},
+	{PAGE_ANA_5G0_EXT, 0x09, 0x2682}, {PAGE_ANA_5G0_EXT, 0x0A, 0x0000},
+	{PAGE_ANA_5G0_EXT, 0x0B, 0x8000}, {PAGE_ANA_5G0_EXT, 0x0C, 0x5024},
+	{PAGE_ANA_5G0_EXT, 0x0D, 0x0000}, {PAGE_ANA_5G0_EXT, 0x0E, 0x0000},
+	{PAGE_ANA_5G0_EXT, 0x0F, 0xA470}, {PAGE_ANA_5G0_EXT, 0x10, 0x8000},
+	{PAGE_ANA_5G0_EXT, 0x11, 0x0362}
+};
+
+static const struct rtpcs_sds_config rtpcs_931x_sds_cfg_3g[] = {
+	{PAGE_ANA_3G1, 0x00, 0x0104}, {PAGE_ANA_3G1, 0x01, 0x0200},
+	{PAGE_ANA_3G1, 0x02, 0x2A24}, {PAGE_ANA_3G1, 0x03, 0xD10D},
+	{PAGE_ANA_3G1, 0x04, 0xD550}, {PAGE_ANA_3G1, 0x05, 0xA95E},
+	{PAGE_ANA_3G1, 0x06, 0xE31D}, {PAGE_ANA_3G1, 0x07, 0x000E},
+	{PAGE_ANA_3G1, 0x08, 0x0294}, {PAGE_ANA_3G1, 0x09, 0x04E4},
+	{PAGE_ANA_3G1, 0x0A, 0x7FC8}, {PAGE_ANA_3G1, 0x0B, 0xE0E7},
+	{PAGE_ANA_3G1, 0x0C, 0x0200}, {PAGE_ANA_3G1, 0x0D, 0xDF80},
+	{PAGE_ANA_3G1, 0x0E, 0x0800}, {PAGE_ANA_3G1, 0x0F, 0x1FD8},
+	{PAGE_ANA_3G1, 0x10, 0x0C3F}, {PAGE_ANA_3G1, 0x11, 0x0000},
+	{PAGE_ANA_3G1, 0x12, 0x27C0}, {PAGE_ANA_3G1, 0x13, 0x7F1C},
+	{PAGE_ANA_3G1, 0x14, 0x1300}, {PAGE_ANA_3G1, 0x15, 0x003F},
+	{PAGE_ANA_3G1, 0x16, 0xBE7F}, {PAGE_ANA_3G1, 0x17, 0x0090},
+	{PAGE_ANA_3G1, 0x18, 0x0000}, {PAGE_ANA_3G1, 0x19, 0x407F},
+	{PAGE_ANA_3G1, 0x1A, 0x0000}, {PAGE_ANA_3G1, 0x1B, 0x8000},
+	{PAGE_ANA_3G1, 0x1C, 0x011E}, {PAGE_ANA_3G1, 0x1D, 0x0000},
+	{PAGE_ANA_3G1, 0x1E, 0xC8FF}, {PAGE_ANA_3G1, 0x1F, 0x0000},
+	{PAGE_ANA_3G1_EXT, 0x00, 0xC000}, {PAGE_ANA_3G1_EXT, 0x01, 0xF000},
+	{PAGE_ANA_3G1_EXT, 0x02, 0x6010}, {PAGE_ANA_3G1_EXT, 0x12, 0x0EEE},
+	{PAGE_ANA_3G1_EXT, 0x13, 0x0000}
+};
+
+static const struct rtpcs_sds_config rtpcs_931x_sds_cfg_3g_cmu[] = {
+	{PAGE_ANA_6G2_EXT, 0x03, 0x6410}, {PAGE_ANA_6G2_EXT, 0x04, 0x0000},
+	{PAGE_ANA_6G2_EXT, 0x05, 0x27D9}, {PAGE_ANA_6G2_EXT, 0x06, 0x58A6},
+	{PAGE_ANA_6G2_EXT, 0x07, 0x2990}, {PAGE_ANA_6G2_EXT, 0x08, 0xFFF4},
+	{PAGE_ANA_6G2_EXT, 0x09, 0x3082}, {PAGE_ANA_6G2_EXT, 0x0A, 0x0000},
+	{PAGE_ANA_6G2_EXT, 0x0B, 0x8000}, {PAGE_ANA_6G2_EXT, 0x0C, 0x6424},
+	{PAGE_ANA_6G2_EXT, 0x0D, 0x0000}, {PAGE_ANA_6G2_EXT, 0x0E, 0x0000},
+	{PAGE_ANA_6G2_EXT, 0x0F, 0xA470}, {PAGE_ANA_6G2_EXT, 0x10, 0x8000},
+	{PAGE_ANA_6G2_EXT, 0x11, 0x037B}
+};
+
+static const struct rtpcs_sds_config rtpcs_931x_sds_cfg_2g5[] = {
+	{PAGE_ANA_2G5, 0x00, 0x0104}, {PAGE_ANA_2G5, 0x01, 0x0200},
+	{PAGE_ANA_2G5, 0x02, 0x2A24}, {PAGE_ANA_2G5, 0x03, 0xD10D},
+	{PAGE_ANA_2G5, 0x04, 0xD550}, {PAGE_ANA_2G5, 0x05, 0xA95E},
+	{PAGE_ANA_2G5, 0x06, 0xE31D}, {PAGE_ANA_2G5, 0x07, 0x000E},
+	{PAGE_ANA_2G5, 0x08, 0x0294}, {PAGE_ANA_2G5, 0x09, 0x04E4},
+	{PAGE_ANA_2G5, 0x0A, 0x7FC8}, {PAGE_ANA_2G5, 0x0B, 0xE0E7},
+	{PAGE_ANA_2G5, 0x0C, 0x0200}, {PAGE_ANA_2G5, 0x0D, 0xDF80},
+	{PAGE_ANA_2G5, 0x0E, 0x0800}, {PAGE_ANA_2G5, 0x0F, 0x1FD8},
+	{PAGE_ANA_2G5, 0x10, 0x0C3F}, {PAGE_ANA_2G5, 0x11, 0x0000},
+	{PAGE_ANA_2G5, 0x12, 0x27C0}, {PAGE_ANA_2G5, 0x13, 0x7F1C},
+	{PAGE_ANA_2G5, 0x14, 0x1300}, {PAGE_ANA_2G5, 0x15, 0x003F},
+	{PAGE_ANA_2G5, 0x16, 0xBE7F}, {PAGE_ANA_2G5, 0x17, 0x0090},
+	{PAGE_ANA_2G5, 0x18, 0x0000}, {PAGE_ANA_2G5, 0x19, 0x407F},
+	{PAGE_ANA_2G5, 0x1A, 0x0000}, {PAGE_ANA_2G5, 0x1B, 0x8000},
+	{PAGE_ANA_2G5, 0x1C, 0x011E}, {PAGE_ANA_2G5, 0x1D, 0x0000},
+	{PAGE_ANA_2G5, 0x1E, 0xC8FF}, {PAGE_ANA_2G5, 0x1F, 0x0000},
+	{PAGE_ANA_2G5_EXT, 0x00, 0xC000}, {PAGE_ANA_2G5_EXT, 0x01, 0xF000},
+	{PAGE_ANA_2G5_EXT, 0x02, 0x6010}, {PAGE_ANA_2G5_EXT, 0x03, 0x6410},
+	{PAGE_ANA_2G5_EXT, 0x05, 0x27D9}, {PAGE_ANA_2G5_EXT, 0x07, 0x2990},
+	{PAGE_ANA_2G5_EXT, 0x08, 0xFFF4}, {PAGE_ANA_2G5_EXT, 0x09, 0x3082},
+	{PAGE_ANA_2G5_EXT, 0x0C, 0x6424}, {PAGE_ANA_2G5_EXT, 0x11, 0x037B},
+	{PAGE_ANA_2G5_EXT, 0x12, 0x0EEE}, {PAGE_ANA_2G5_EXT, 0x13, 0x0000}
+};
+
+static const struct rtpcs_sds_config rtpcs_931x_sds_cfg_1g[] = {
+	{PAGE_ANA_1G2, 0x00, 0x0104}, {PAGE_ANA_1G2, 0x01, 0x0200},
+	{PAGE_ANA_1G2, 0x02, 0x2A24}, {PAGE_ANA_1G2, 0x03, 0xD10D},
+	{PAGE_ANA_1G2, 0x04, 0xD550}, {PAGE_ANA_1G2, 0x05, 0xA95E},
+	{PAGE_ANA_1G2, 0x06, 0xE31D}, {PAGE_ANA_1G2, 0x07, 0x800E},
+	{PAGE_ANA_1G2, 0x08, 0x0294}, {PAGE_ANA_1G2, 0x09, 0x04E4},
+	{PAGE_ANA_1G2, 0x0A, 0x7FC8}, {PAGE_ANA_1G2, 0x0B, 0xE0E7},
+	{PAGE_ANA_1G2, 0x0C, 0x0200}, {PAGE_ANA_1G2, 0x0D, 0x9F80},
+	{PAGE_ANA_1G2, 0x0E, 0x0000}, {PAGE_ANA_1G2, 0x0F, 0x1FF0},
+	{PAGE_ANA_1G2, 0x10, 0x0C3F}, {PAGE_ANA_1G2, 0x11, 0x0000},
+	{PAGE_ANA_1G2, 0x12, 0x27C0}, {PAGE_ANA_1G2, 0x13, 0x7F1C},
+	{PAGE_ANA_1G2, 0x14, 0x1300}, {PAGE_ANA_1G2, 0x15, 0x003F},
+	{PAGE_ANA_1G2, 0x16, 0xBE7F}, {PAGE_ANA_1G2, 0x17, 0x0090},
+	{PAGE_ANA_1G2, 0x18, 0x0000}, {PAGE_ANA_1G2, 0x19, 0x407F},
+	{PAGE_ANA_1G2, 0x1A, 0x0000}, {PAGE_ANA_1G2, 0x1B, 0x8000},
+	{PAGE_ANA_1G2, 0x1C, 0x011E}, {PAGE_ANA_1G2, 0x1D, 0x0000},
+	{PAGE_ANA_1G2, 0x1E, 0xC8FF}, {PAGE_ANA_1G2, 0x1F, 0x0000},
+	{PAGE_ANA_1G2_EXT, 0x00, 0xC000}, {PAGE_ANA_1G2_EXT, 0x01, 0xF000},
+	{PAGE_ANA_1G2_EXT, 0x02, 0x6010}, {PAGE_ANA_1G2_EXT, 0x12, 0x0EEE},
+	{PAGE_ANA_1G2_EXT, 0x13, 0x0000}
+};
+
+static const struct rtpcs_sds_config rtpcs_931x_sds_cfg_ana_v2[] = {
+	{PAGE_ANA_MISC, 0x12, 0x150F}, {PAGE_ANA_10G, 0x07, 0x800E},
+	{PAGE_ANA_5G0, 0x07, 0x800E}, {PAGE_ANA_1G2, 0x07, 0x000E},
+	{PAGE_ANA_2G5, 0x07, 0x000E}, {PAGE_ANA_3G1, 0x07, 0x000E},
+	{PAGE_ANA_10G_EXT, 0x12, 0x0AAA}, {PAGE_ANA_5G0, 0x12, 0x2740},
+	{PAGE_ANA_5G0_EXT, 0x00, 0x0000}, {PAGE_ANA_5G0_EXT, 0x02, 0x2010},
+	{PAGE_ANA_10G_EXT, 0x03, 0x84A0}, {PAGE_ANA_10G_EXT, 0x0C, 0x84A4},
+	{PAGE_ANA_1G2, 0x0D, 0xDF80}, {PAGE_ANA_5G0, 0x0D, 0xDF80},
+	{PAGE_ANA_10G_EXT, 0x05, 0x2FD9}, {PAGE_ANA_10G_EXT, 0x05, 0x3FD9},
+	{PAGE_ANA_COM, 0x16, 0x1065}, {PAGE_ANA_COM, 0x16, 0x1067},
+	{PAGE_ANA_COM, 0x19, 0xF0A5}
+};
+
+static int rtpcs_931x_sds_apply_ana_baseline(struct rtpcs_serdes *sds)
+{
+	static const enum rtpcs_page cmu_pages[] = {
+		PAGE_ANA_10G_EXT, PAGE_ANA_6G2_EXT, PAGE_ANA_5G0_EXT,
+		PAGE_ANA_1G2_EXT, PAGE_ANA_2G5_EXT, PAGE_ANA_3G1_EXT
+	};
+	static const struct {
+		const struct rtpcs_sds_config *cfg;
+		size_t count;
+	} tables[] = {
+		{ rtpcs_931x_sds_cfg_ana_com, ARRAY_SIZE(rtpcs_931x_sds_cfg_ana_com) },
+		{ rtpcs_931x_sds_cfg_10g, ARRAY_SIZE(rtpcs_931x_sds_cfg_10g) },
+		{ rtpcs_931x_sds_cfg_10g_cmu, ARRAY_SIZE(rtpcs_931x_sds_cfg_10g_cmu) },
+		{ rtpcs_931x_sds_cfg_5g, ARRAY_SIZE(rtpcs_931x_sds_cfg_5g) },
+		{ rtpcs_931x_sds_cfg_5g_cmu, ARRAY_SIZE(rtpcs_931x_sds_cfg_5g_cmu) },
+		{ rtpcs_931x_sds_cfg_3g, ARRAY_SIZE(rtpcs_931x_sds_cfg_3g) },
+		{ rtpcs_931x_sds_cfg_3g_cmu, ARRAY_SIZE(rtpcs_931x_sds_cfg_3g_cmu) },
+		{ rtpcs_931x_sds_cfg_2g5, ARRAY_SIZE(rtpcs_931x_sds_cfg_2g5) },
+		{ rtpcs_931x_sds_cfg_1g, ARRAY_SIZE(rtpcs_931x_sds_cfg_1g) },
+	};
+	int ret;
+
+	for (size_t i = 0; i < ARRAY_SIZE(tables); i++) {
+		ret = rtpcs_sds_apply_config(sds, tables[i].cfg, tables[i].count);
+		if (ret)
+			return ret;
+	}
+
+	if (sds->ctrl->chip_version == RTPCS_CHIP_V2) {
+		ret = rtpcs_sds_apply_config(sds, rtpcs_931x_sds_cfg_ana_v2,
+					     ARRAY_SIZE(rtpcs_931x_sds_cfg_ana_v2));
+		if (ret)
+			return ret;
+	}
+
+	if (sds->id & 1)
+		return 0;
+
+	for (size_t i = 0; i < ARRAY_SIZE(cmu_pages); i++) {
+		ret = rtpcs_sds_write(sds, cmu_pages[i], 0x6, 0x5826);
+		if (ret)
+			return ret;
+		if (sds->id == 2)
+			continue;
+		ret = rtpcs_sds_write(sds, cmu_pages[i], 0x5,
+				      cmu_pages[i] == PAGE_ANA_10G_EXT ? 0x3FD7 : 0x27D7);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+
 static int rtpcs_931x_sds_config_hw_mode(struct rtpcs_serdes *sds,
 					 enum rtpcs_sds_mode hw_mode)
 {
+	int ret;
+
+	/* the ANA_* pages keep reset defaults unless the bootloader ran the vendor switch init */
+	if (sds->first_start && sds->type == RTPCS_SDS_TYPE_10G) {
+		ret = rtpcs_931x_sds_apply_ana_baseline(sds);
+		if (ret)
+			return ret;
+	}
+
 	switch (hw_mode) {
 	case RTPCS_SDS_MODE_OFF:
 		break;
