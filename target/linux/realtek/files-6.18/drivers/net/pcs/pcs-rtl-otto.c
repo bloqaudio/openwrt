@@ -192,6 +192,9 @@ enum rtpcs_page {
 /* PAGE_TGR_STD_1 */
 
 #define TGR_STD_1_REG00			0x00
+#define TGR_STD_1_REG01			0x01
+#define   RTPCS_10GR_STS2_BLOCK_LOCK	BIT(15)
+#define   RTPCS_10GR_STS2_HI_BER	BIT(14)
 #define  RTL93XX_10GBASE_R_T_RX_LINK	BIT(12)
 
 /* PAGE_TGR_PRO_0 */
@@ -507,6 +510,8 @@ struct rtpcs_link {
 
 	struct delayed_work scan_work;
 	bool setup_failed;
+	bool up_seen;
+	unsigned int bad_windows;
 	unsigned int retries;
 	unsigned int cal_attempts;
 	unsigned int neg_mode;
@@ -4706,6 +4711,17 @@ static int rtpcs_sds_signal_present(struct rtpcs_serdes *sds)
 	return sds->ops->signal_present ? sds->ops->signal_present(sds) : 1;
 }
 
+/* latched 802.3 status: lock held and no high BER since the previous read */
+static bool rtpcs_sds_10gr_link_healthy(struct rtpcs_serdes *sds)
+{
+	int sts = rtpcs_sds_read(sds, PAGE_TGR_STD_1, TGR_STD_1_REG01);
+
+	if (sts < 0)
+		return true;
+
+	return (sts & RTPCS_10GR_STS2_BLOCK_LOCK) && !(sts & RTPCS_10GR_STS2_HI_BER);
+}
+
 /* calibrating the receiver without a signal tunes it to noise */
 static bool rtpcs_sds_rx_calibrate(struct rtpcs_serdes *sds)
 {
@@ -4856,16 +4872,35 @@ static void rtpcs_scan_work(struct work_struct *work)
 		if (!rtpcs_sds_signal_present(sds)) {
 			if (!state.link)
 				sds->rx_cal_pending = true;
+			link->up_seen = false;
 			link->cal_attempts = 0;
 			next = RTPCS_SCAN_FAST;
-		} else if (sds->rx_cal_pending || !state.link) {
+		} else if (!state.link) {
+			link->up_seen = false;
 			sds->rx_cal_pending = !rtpcs_sds_rx_calibrate(sds);
-			dev_info(link->ctrl->dev, "SerDes %u: signal present, RX calibration %s\n",
+			dev_info(link->ctrl->dev, "SerDes %u: signal without link, RX calibration %s\n",
 				 sds->id, sds->rx_cal_pending ? "failed" : "done");
 			next = rtpcs_backoff(link->cal_attempts++);
-		} else {
+		} else if (!link->up_seen) {
+			link->bad_windows = 0;
+			/* the first read after link-up still holds the latched pre-link state */
+			rtpcs_sds_10gr_link_healthy(sds);
+			link->up_seen = true;
+			next = RTPCS_SCAN_FAST;
+		} else if (rtpcs_sds_10gr_link_healthy(sds)) {
+			sds->rx_cal_pending = false;
+			link->bad_windows = 0;
 			link->cal_attempts = 0;
 			next = RTPCS_SCAN_SLOW;
+		} else if (++link->bad_windows < 2) {
+			next = RTPCS_SCAN_FAST;
+		} else {
+			link->bad_windows = 0;
+			link->up_seen = false;
+			sds->rx_cal_pending = !rtpcs_sds_rx_calibrate(sds);
+			dev_info(link->ctrl->dev, "SerDes %u: link unstable, RX calibration %s\n",
+				 sds->id, sds->rx_cal_pending ? "failed" : "done");
+			next = rtpcs_backoff(link->cal_attempts++);
 		}
 	}
 
@@ -4887,6 +4922,7 @@ static int rtpcs_pcs_config(struct phylink_pcs *pcs, unsigned int neg_mode,
 		linkmode_copy(link->advertising, advertising);
 		link->retries = 0;
 		link->cal_attempts = 0;
+		link->up_seen = false;
 		link->setup_failed = ret < 0;
 		schedule_delayed_work(&link->scan_work, RTPCS_SCAN_FAST);
 
