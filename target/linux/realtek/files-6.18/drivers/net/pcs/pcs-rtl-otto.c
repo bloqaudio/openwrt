@@ -460,6 +460,8 @@ struct rtpcs_sds_ops {
 				 enum rtpcs_sds_mode hw_mode);
 	/* optional: finalization that must follow power-up, e.g. RX calibration */
 	int (*post_config)(struct rtpcs_serdes *sds, enum rtpcs_sds_mode hw_mode);
+	/* optional: 1 if the receiver sees a signal, 0 if idle */
+	int (*signal_present)(struct rtpcs_serdes *sds);
 };
 
 struct rtpcs_serdes {
@@ -482,6 +484,7 @@ struct rtpcs_serdes {
 	u8 id;
 	u8 num_of_links;
 	bool first_start;
+	bool rx_cal_pending;
 };
 
 struct rtpcs_ctrl {
@@ -502,8 +505,10 @@ struct rtpcs_link {
 	struct rtpcs_serdes *sds;
 	int port;
 
-	struct delayed_work retry_work;
+	struct delayed_work scan_work;
+	bool setup_failed;
 	unsigned int retries;
+	unsigned int cal_attempts;
 	unsigned int neg_mode;
 	phy_interface_t interface;
 	__ETHTOOL_DECLARE_LINK_MODE_MASK(advertising);
@@ -2981,6 +2986,28 @@ static int rtpcs_930x_sds_10g_idle(struct rtpcs_serdes *sds)
 	return -ETIMEDOUT;
 }
 
+/* the debug selector is shared with the paired SerDes' calibration, so restore it */
+static int rtpcs_93xx_sds_signal_present(struct rtpcs_serdes *sds)
+{
+	struct rtpcs_serdes *even_sds = rtpcs_sds_get_even(sds);
+	int bit = (sds == even_sds) ? 0 : 1;
+	int saved, idle, ret;
+
+	saved = rtpcs_sds_read(even_sds, PAGE_WDIG, WDIG_REG02);
+	if (saved < 0)
+		return saved;
+
+	ret = rtpcs_sds_write(even_sds, PAGE_WDIG, WDIG_REG02, RTL930X_DBGO_SEL_0_RX_STATUS);
+	idle = ret ? ret : rtpcs_sds_read_bits(even_sds, PAGE_WDIG, 0x14, bit, bit);
+	ret = rtpcs_sds_write(even_sds, PAGE_WDIG, WDIG_REG02, saved);
+	if (ret)
+		return ret;
+	if (idle < 0)
+		return idle;
+
+	return !idle;
+}
+
 static int rtpcs_930x_sds_config_polarity(struct rtpcs_serdes *sds, unsigned int tx_pol,
 					  unsigned int rx_pol)
 {
@@ -4674,6 +4701,22 @@ static void rtpcs_sds_record_mode(struct rtpcs_serdes *sds, enum rtpcs_sds_mode 
 	sds->usxgmii_submode = submode;
 }
 
+static int rtpcs_sds_signal_present(struct rtpcs_serdes *sds)
+{
+	return sds->ops->signal_present ? sds->ops->signal_present(sds) : 1;
+}
+
+/* calibrating the receiver without a signal tunes it to noise */
+static bool rtpcs_sds_rx_calibrate(struct rtpcs_serdes *sds)
+{
+	if (!sds->ops->post_config)
+		return true;
+	if (!rtpcs_sds_signal_present(sds))
+		return false;
+
+	return !sds->ops->post_config(sds, sds->hw_mode);
+}
+
 static int __rtpcs_pcs_config(struct phylink_pcs *pcs, unsigned int neg_mode,
 			      phy_interface_t interface, const unsigned long *advertising,
 			      bool force)
@@ -4749,7 +4792,9 @@ static int __rtpcs_pcs_config(struct phylink_pcs *pcs, unsigned int neg_mode,
 		}
 
 		if (mode_changed) {
-			if (sds->ops->post_config) {
+			if (hw_mode == RTPCS_SDS_MODE_10GBASER) {
+				sds->rx_cal_pending = !rtpcs_sds_rx_calibrate(sds);
+			} else if (sds->ops->post_config) {
 				ret = sds->ops->post_config(sds, hw_mode);
 				if (ret < 0) {
 					rtpcs_sds_record_mode(sds, old_mode, old_submode);
@@ -4767,39 +4812,64 @@ static int __rtpcs_pcs_config(struct phylink_pcs *pcs, unsigned int neg_mode,
 	return changed;
 }
 
-#define RTPCS_RETRY_MAX		10
-#define RTPCS_RETRY_DELAY_MAX	(30 * HZ)
+#define RTPCS_SETUP_RETRY_MAX	10
+#define RTPCS_SCAN_FAST		msecs_to_jiffies(250)
+#define RTPCS_SCAN_SLOW		HZ
+#define RTPCS_BACKOFF_MAX	(30 * HZ)
 
-static unsigned long rtpcs_retry_delay(unsigned int retries)
+static unsigned long rtpcs_backoff(unsigned int attempts)
 {
-	return min_t(unsigned long, (5 * HZ) << min(retries, 3U), RTPCS_RETRY_DELAY_MAX);
+	return min_t(unsigned long, HZ << min(attempts, 5U), RTPCS_BACKOFF_MAX);
 }
 
-/* Phylink selects 10GBASE-R only after reading a module, so the cage is populated. */
-static void rtpcs_retry_work(struct work_struct *work)
+static void rtpcs_scan_work(struct work_struct *work)
 {
 	struct rtpcs_link *link = container_of(to_delayed_work(work),
-					       struct rtpcs_link, retry_work);
+					       struct rtpcs_link, scan_work);
 	struct phylink_link_state state = { .link = 0 };
+	struct rtpcs_serdes *sds = link->sds;
+	unsigned long next;
+	int ret;
 
-	scoped_guard(mutex, &link->ctrl->lock)
-		rtpcs_pcs_get_state_mac(link, &state);
-	if (state.link)
-		return;
+	if (link->setup_failed) {
+		if (link->retries >= RTPCS_SETUP_RETRY_MAX) {
+			dev_warn(link->ctrl->dev, "SerDes %u: setup failed %u times, giving up\n",
+				 sds->id, link->retries);
+			return;
+		}
 
-	if (link->retries >= RTPCS_RETRY_MAX) {
-		dev_warn(link->ctrl->dev, "SerDes %u: no link after %u setup retries\n",
-			 link->sds->id, link->retries);
+		link->retries++;
+		ret = __rtpcs_pcs_config(&link->pcs, link->neg_mode, link->interface,
+					 link->advertising, true);
+		link->setup_failed = ret < 0;
+		dev_warn(link->ctrl->dev, "SerDes %u: setup retry %u/%u %s\n", sds->id,
+			 link->retries, RTPCS_SETUP_RETRY_MAX,
+			 link->setup_failed ? "failed" : "succeeded");
+		schedule_delayed_work(&link->scan_work, link->setup_failed ?
+				      rtpcs_backoff(link->retries) : RTPCS_SCAN_FAST);
 		return;
 	}
 
-	link->retries++;
-	dev_info(link->ctrl->dev, "SerDes %u: no link, retrying setup (%u/%u)\n",
-		 link->sds->id, link->retries, RTPCS_RETRY_MAX);
-	__rtpcs_pcs_config(&link->pcs, link->neg_mode, link->interface,
-			   link->advertising, true);
+	scoped_guard(mutex, &link->ctrl->lock) {
+		rtpcs_pcs_get_state_mac(link, &state);
 
-	schedule_delayed_work(&link->retry_work, rtpcs_retry_delay(link->retries));
+		if (!rtpcs_sds_signal_present(sds)) {
+			if (!state.link)
+				sds->rx_cal_pending = true;
+			link->cal_attempts = 0;
+			next = RTPCS_SCAN_FAST;
+		} else if (sds->rx_cal_pending || !state.link) {
+			sds->rx_cal_pending = !rtpcs_sds_rx_calibrate(sds);
+			dev_info(link->ctrl->dev, "SerDes %u: signal present, RX calibration %s\n",
+				 sds->id, sds->rx_cal_pending ? "failed" : "done");
+			next = rtpcs_backoff(link->cal_attempts++);
+		} else {
+			link->cal_attempts = 0;
+			next = RTPCS_SCAN_SLOW;
+		}
+	}
+
+	schedule_delayed_work(&link->scan_work, next);
 }
 
 static int rtpcs_pcs_config(struct phylink_pcs *pcs, unsigned int neg_mode,
@@ -4816,7 +4886,9 @@ static int rtpcs_pcs_config(struct phylink_pcs *pcs, unsigned int neg_mode,
 		link->interface = interface;
 		linkmode_copy(link->advertising, advertising);
 		link->retries = 0;
-		schedule_delayed_work(&link->retry_work, rtpcs_retry_delay(0));
+		link->cal_attempts = 0;
+		link->setup_failed = ret < 0;
+		schedule_delayed_work(&link->scan_work, RTPCS_SCAN_FAST);
 
 		/* a failed pcs_config holds the link down until phylink's next major config */
 		if (ret < 0) {
@@ -4831,12 +4903,12 @@ static int rtpcs_pcs_config(struct phylink_pcs *pcs, unsigned int neg_mode,
 
 static void rtpcs_93xx_pcs_pre_config(struct phylink_pcs *pcs, phy_interface_t interface)
 {
-	cancel_delayed_work_sync(&rtpcs_phylink_pcs_to_link(pcs)->retry_work);
+	cancel_delayed_work_sync(&rtpcs_phylink_pcs_to_link(pcs)->scan_work);
 }
 
 static void rtpcs_93xx_pcs_disable(struct phylink_pcs *pcs)
 {
-	cancel_delayed_work_sync(&rtpcs_phylink_pcs_to_link(pcs)->retry_work);
+	cancel_delayed_work_sync(&rtpcs_phylink_pcs_to_link(pcs)->scan_work);
 }
 
 static void rtpcs_mdio_bus_put(void *data)
@@ -4993,7 +5065,7 @@ static struct phylink_pcs *rtpcs_pcs_get(struct fwnode_reference_args *pcsspec, 
 		link->port = sds->link_port[link_idx];
 		link->sds = sds;
 		link->pcs.ops = sds->ctrl->cfg->pcs_ops;
-		INIT_DELAYED_WORK(&link->retry_work, rtpcs_retry_work);
+		INIT_DELAYED_WORK(&link->scan_work, rtpcs_scan_work);
 
 		sds->link[link_idx] = link;
 	}
@@ -5172,6 +5244,7 @@ static const struct rtpcs_sds_ops rtpcs_930x_sds_ops = {
 	.set_hw_mode		= rtpcs_930x_sds_set_mode,
 	.config_attachment	= rtpcs_930x_sds_config_attachment,
 	.post_config		= rtpcs_930x_sds_post_config,
+	.signal_present		= rtpcs_93xx_sds_signal_present,
 };
 
 static const struct rtpcs_config rtpcs_930x_cfg = {
@@ -5208,6 +5281,7 @@ static const struct rtpcs_sds_ops rtpcs_931x_sds_ops = {
 	.set_hw_mode		= rtpcs_931x_sds_set_mode,
 	.config_attachment	= rtpcs_931x_sds_config_attachment,
 	.post_config		= rtpcs_931x_sds_post_config,
+	.signal_present		= rtpcs_93xx_sds_signal_present,
 };
 
 static const struct rtpcs_config rtpcs_931x_cfg = {
@@ -5255,7 +5329,7 @@ static void rtpcs_shutdown(struct platform_device *pdev)
 	for (int i = 0; i < RTPCS_SDS_CNT; i++)
 		for (int j = 0; j < RTPCS_MAX_LINKS_PER_SDS; j++)
 			if (ctrl->serdes[i].link[j])
-				cancel_delayed_work_sync(&ctrl->serdes[i].link[j]->retry_work);
+				cancel_delayed_work_sync(&ctrl->serdes[i].link[j]->scan_work);
 }
 
 static struct platform_driver rtpcs_driver = {
