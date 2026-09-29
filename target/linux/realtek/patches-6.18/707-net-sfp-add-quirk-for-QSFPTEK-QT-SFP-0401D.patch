@@ -1,0 +1,24 @@
+From: Quinn O'Shea <qoshea@gmail.com>
+Subject: net: sfp: add quirk for QSFPTEK QT-SFP-0401D
+
+The QSFPTEK QT-SFP-0401D is a 2.5G 850 nm multimode optic. Its EEPROM
+declares only SONET OC-48 and 1/2/4G Fibre Channel compliance with a
+nominal rate of 2500 MBd, so the bit-rate check derives 1000BASE-X only
+and the module never runs at 2.5G. Like the other modules that report
+2500 MBd, it operates at 2500BASE-X.
+
+Measured between two RTL9303 switches: a pair links at 2500BASE-X and
+passes 20000 back-to-back 1400-byte pings each way with no loss.
+
+Signed-off-by: Quinn O'Shea <qoshea@gmail.com>
+---
+--- a/drivers/net/phy/sfp.c
++++ b/drivers/net/phy/sfp.c
+@@ -634,6 +634,7 @@ static const struct sfp_quirk sfp_quirks
+ 	SFP_QUIRK_F("OEM", "RTSFP-10", sfp_fixup_rollball_cc),
+ 	SFP_QUIRK_F("OEM", "RTSFP-10G", sfp_fixup_rollball_cc),
+ 	SFP_QUIRK_F("QINIYEK", "BJ-SFP-10G-T", sfp_fixup_fs_10gt),
++	SFP_QUIRK_S("QSFPTEK", "QT-SFP-0401D", sfp_quirk_2500basex),
+ 	SFP_QUIRK_F("Turris", "RTSFP-2.5G", sfp_fixup_rollball),
+ 	SFP_QUIRK_F("Turris", "RTSFP-10", sfp_fixup_rollball),
+ 	SFP_QUIRK_F("Turris", "RTSFP-10G", sfp_fixup_rollball),
