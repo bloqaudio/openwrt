@@ -11,6 +11,7 @@
 #include <linux/phy.h>
 #include <linux/platform_device.h>
 #include <linux/regmap.h>
+#include <linux/stop_machine.h>
 
 #define RTSDS_REG_CNT			32
 #define RTSDS_VAL_MASK			GENMASK(15, 0)
@@ -34,6 +35,8 @@
 #define RTSDS_931X_SDS_CNT		14
 #define RTSDS_931X_PAGE_CNT		192
 #define RTSDS_931X_BASE			0x5638
+#define RTSDS_931X_MODE_PAGE		0x1f
+#define RTSDS_931X_MODE_REG		9
 
 #define RTSDS_93XX_CMD_READ		0
 #define RTSDS_93XX_CMD_WRITE		BIT(1)
@@ -556,6 +559,48 @@ static const struct rtsds_config rtsds_839x_cfg = {
 	.write			= rtsds_839x_write,
 };
 
+struct rtsds_931x_mode_write {
+	struct rtsds_ctrl *ctrl;
+	int backsds;
+	u16 value;
+	int ret;
+};
+
+static int rtsds_931x_mode_write_stopped(void *data)
+{
+	struct rtsds_931x_mode_write *w = data;
+	struct rtsds_ctrl *ctrl = w->ctrl;
+	int op, value;
+
+	op = FIELD_PREP(RTSDS_93XX_CMD_SDS_MASK, w->backsds) |
+	     FIELD_PREP(RTSDS_93XX_CMD_PAGE_MASK, RTSDS_931X_MODE_PAGE) |
+	     FIELD_PREP(RTSDS_93XX_CMD_REG_MASK, RTSDS_931X_MODE_REG) |
+	     RTSDS_93XX_CMD_BUSY | RTSDS_93XX_CMD_WRITE;
+
+	regmap_write(ctrl->map, ctrl->cfg->base + 4, w->value);
+	regmap_write(ctrl->map, ctrl->cfg->base, op);
+	w->ret = regmap_read_poll_timeout_atomic(ctrl->map, ctrl->cfg->base, value,
+						 !(value & RTSDS_93XX_CMD_BUSY), 1, 100000);
+
+	return 0;
+}
+
+/* a mode change through this register corrupts memory traffic of the other CPUs */
+static int rtsds_931x_write(struct rtsds_ctrl *ctrl, int sds, int page, int regnum, u16 value)
+{
+	struct rtsds_931x_mode_write w = { .ctrl = ctrl, .value = value };
+
+	if (page != RTSDS_931X_MODE_PAGE || regnum != RTSDS_931X_MODE_REG)
+		return rtsds_93xx_write(ctrl, sds, page, regnum, value);
+
+	w.backsds = ctrl->cfg->get_backing_sds(sds, page);
+	stop_machine(rtsds_931x_mode_write_stopped, &w, NULL);
+	if (w.ret)
+		dev_err(ctrl->dev, "SerDes I/O timed out\n");
+
+	return w.ret;
+}
+
 static const struct rtsds_config rtsds_930x_cfg = {
 	.sds_cnt		= RTSDS_930X_SDS_CNT,
 	.page_cnt		= RTSDS_930X_PAGE_CNT,
@@ -571,7 +616,7 @@ static const struct rtsds_config rtsds_931x_cfg = {
 	.base			= RTSDS_931X_BASE,
 	.get_backing_sds	= rtsds_931x_get_backing_sds,
 	.read			= rtsds_93xx_read,
-	.write			= rtsds_93xx_write,
+	.write			= rtsds_931x_write,
 };
 
 static const struct rtsds_config rtsds_960x_cfg = {
