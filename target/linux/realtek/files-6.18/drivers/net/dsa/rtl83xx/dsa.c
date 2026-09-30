@@ -983,9 +983,9 @@ static bool rtldsa_mac_is_unsnoop(const unsigned char *addr)
 	return false;
 }
 
-static int rtldsa_83xx_port_mdb_add(struct dsa_switch *ds, int port,
-				    const struct switchdev_obj_port_mdb *mdb,
-				    const struct dsa_db db)
+static int rtldsa_port_mdb_add(struct dsa_switch *ds, int port,
+			       const struct switchdev_obj_port_mdb *mdb,
+			       const struct dsa_db db)
 {
 	struct rtl838x_switch_priv *priv = ds->priv;
 	u64 mac = ether_addr_to_u64(mdb->addr);
@@ -1062,13 +1062,6 @@ out:
 
 	return err;
 }
-static int rtldsa_93xx_port_mdb_add(struct dsa_switch *ds, int port,
-				    const struct switchdev_obj_port_mdb *mdb,
-				    const struct dsa_db db)
-{
-	return -EOPNOTSUPP;
-}
-
 static int rtldsa_port_mdb_del(struct dsa_switch *ds, int port,
 			       const struct switchdev_obj_port_mdb *mdb,
 			       const struct dsa_db db)
@@ -1286,7 +1279,7 @@ const struct dsa_switch_ops rtldsa_83xx_switch_ops = {
 	.port_fdb_del		= rtldsa_port_fdb_del,
 	.port_fdb_dump		= rtldsa_port_fdb_dump,
 
-	.port_mdb_add		= rtldsa_83xx_port_mdb_add,
+	.port_mdb_add		= rtldsa_port_mdb_add,
 	.port_mdb_del		= rtldsa_port_mdb_del,
 
 	.port_mirror_add	= rtldsa_port_mirror_add,
@@ -1348,7 +1341,7 @@ const struct dsa_switch_ops rtldsa_93xx_switch_ops = {
 	.port_fdb_del		= rtldsa_port_fdb_del,
 	.port_fdb_dump		= rtldsa_port_fdb_dump,
 
-	.port_mdb_add		= rtldsa_93xx_port_mdb_add,
+	.port_mdb_add		= rtldsa_port_mdb_add,
 	.port_mdb_del		= rtldsa_port_mdb_del,
 
 	.port_mirror_add	= rtldsa_port_mirror_add,
