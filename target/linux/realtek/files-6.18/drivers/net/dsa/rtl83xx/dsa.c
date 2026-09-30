@@ -435,6 +435,7 @@ static void rtldsa_setup_l2_mc_entry(struct otto_l2_entry *e, int vid, u64 mac, 
 
 	e->type = L2_MULTICAST;
 	e->valid = true;
+	e->is_local_forward = true;
 
 	e->mc_portmask_index = mc_group;
 
