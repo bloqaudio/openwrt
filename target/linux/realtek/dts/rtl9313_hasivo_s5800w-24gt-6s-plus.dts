@@ -36,7 +36,7 @@
 			     RTL93XX_LED_SET_ACT)>;
 	};
 
-	/* No LOS or TX disable lines are wired to the cages. */
+	/* LOS and TX disable lines, if wired, have not been identified. */
 	sfp1: sfp-p25 {
 		compatible = "sff,sfp";
 		i2c-bus = <&i2c_sfp25>;
