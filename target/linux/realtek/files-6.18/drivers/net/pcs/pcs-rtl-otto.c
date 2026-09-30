@@ -488,6 +488,7 @@ struct rtpcs_serdes {
 	u8 num_of_links;
 	bool first_start;
 	bool rx_cal_pending;
+	bool cal_abort;
 };
 
 struct rtpcs_ctrl {
@@ -550,6 +551,12 @@ struct rtpcs_sds_tx_config {
 	u8 post_amp;
 	u8 impedance;
 };
+
+/* set by phylink reconfiguration: a running calibration must give up the lane */
+static bool rtpcs_sds_cal_aborted(struct rtpcs_serdes *sds)
+{
+	return READ_ONCE(sds->cal_abort);
+}
 
 /* Calculation helpers */
 
@@ -3288,6 +3295,8 @@ static int rtpcs_930x_sds_post_config(struct rtpcs_serdes *sds, enum rtpcs_sds_m
 
 	rtpcs_930x_sds_10g_idle(sds);
 	do {
+		if (rtpcs_sds_cal_aborted(sds))
+			return -ECANCELED;
 		rtpcs_930x_sds_do_rx_calibration(sds, hw_mode);
 		calib_tries++;
 		msleep(50);
@@ -3831,7 +3840,7 @@ static void rtpcs_931x_sds_rxcal_leq_adapt(struct rtpcs_serdes *sds)
  * and tolerate a small nonzero symbol-error count rather than requiring
  * exactly 0.
  */
-static void rtpcs_931x_sds_rxcal_fiber_adapt(struct rtpcs_serdes *sds)
+static int rtpcs_931x_sds_rxcal_fiber_adapt(struct rtpcs_serdes *sds)
 {
 	unsigned int vth_p = 0, vth_n = 0, sum_p = 0, sum_n = 0;
 	struct device *dev = sds->ctrl->dev;
@@ -3848,6 +3857,8 @@ static void rtpcs_931x_sds_rxcal_fiber_adapt(struct rtpcs_serdes *sds)
 	rtpcs_931x_sds_rxeq_tap_set_adapt(sds, 0, true);
 	rtpcs_931x_sds_rxeq_vth_set_adapt(sds, true);
 	msleep(200);
+	if (rtpcs_sds_cal_aborted(sds))
+		return -ECANCELED;
 
 	/* average several samples instead of trusting one possibly-noisy read */
 	for (i = 0; i < 10; i++) {
@@ -3884,6 +3895,8 @@ static void rtpcs_931x_sds_rxcal_fiber_adapt(struct rtpcs_serdes *sds)
 		rtpcs_931x_sds_rxeq_tap_set_adapt(sds, i, true);
 
 	for (i = 0; i < 8; i++) {
+		if (rtpcs_sds_cal_aborted(sds))
+			return -ECANCELED;
 		rtpcs_931x_sds_clear_symerr(sds, RTPCS_SDS_MODE_10GBASER);
 		msleep(300);
 		symerr = rtpcs_931x_sds_fiber_get_symerr(sds, RTPCS_SDS_MODE_10GBASER);
@@ -3899,7 +3912,7 @@ static void rtpcs_931x_sds_rxcal_fiber_adapt(struct rtpcs_serdes *sds)
 		if (link_up && symerr >= 0 && symerr <= 5) {
 			dev_dbg(dev, "SerDes %u fiber RX calibration OK (check %d)\n",
 				sds->id, i + 1);
-			return;
+			return 0;
 		}
 	}
 
@@ -3909,6 +3922,8 @@ static void rtpcs_931x_sds_rxcal_fiber_adapt(struct rtpcs_serdes *sds)
 	else
 		dev_warn(dev, "SerDes %u fiber RX calibration failed after %d symErr checks\n",
 			 sds->id, i);
+
+	return 0;
 }
 
 static int rtpcs_931x_sds_get_pll_select(struct rtpcs_serdes *sds, enum rtpcs_sds_pll_type *pll)
@@ -4154,7 +4169,7 @@ static int rtpcs_931x_sds_post_config(struct rtpcs_serdes *sds, enum rtpcs_sds_m
 
 	case RTPCS_SDS_ATTACH_FIBER:
 		if (hw_mode == RTPCS_SDS_MODE_10GBASER)
-			rtpcs_931x_sds_rxcal_fiber_adapt(sds);
+			return rtpcs_931x_sds_rxcal_fiber_adapt(sds);
 		break;
 
 	default:
@@ -4879,6 +4894,8 @@ static void rtpcs_scan_work(struct work_struct *work)
 		} else if (!state.link) {
 			link->up_seen = false;
 			sds->rx_cal_pending = !rtpcs_sds_rx_calibrate(sds);
+			if (rtpcs_sds_cal_aborted(sds))
+				return;
 			dev_info(link->ctrl->dev, "SerDes %u: signal without link, RX calibration %s\n",
 				 sds->id, sds->rx_cal_pending ? "failed" : "done");
 			next = rtpcs_backoff(link->cal_attempts++);
@@ -4899,6 +4916,8 @@ static void rtpcs_scan_work(struct work_struct *work)
 			link->bad_windows = 0;
 			link->up_seen = false;
 			sds->rx_cal_pending = !rtpcs_sds_rx_calibrate(sds);
+			if (rtpcs_sds_cal_aborted(sds))
+				return;
 			dev_info(link->ctrl->dev, "SerDes %u: link unstable, RX calibration %s\n",
 				 sds->id, sds->rx_cal_pending ? "failed" : "done");
 			next = rtpcs_backoff(link->cal_attempts++);
@@ -4915,6 +4934,7 @@ static int rtpcs_pcs_config(struct phylink_pcs *pcs, unsigned int neg_mode,
 	struct rtpcs_link *link = rtpcs_phylink_pcs_to_link(pcs);
 	int ret;
 
+	WRITE_ONCE(link->sds->cal_abort, false);
 	ret = __rtpcs_pcs_config(pcs, neg_mode, interface, advertising, false);
 
 	if (interface == PHY_INTERFACE_MODE_10GBASER) {
@@ -4938,14 +4958,22 @@ static int rtpcs_pcs_config(struct phylink_pcs *pcs, unsigned int neg_mode,
 	return ret;
 }
 
+static void rtpcs_93xx_pcs_stop_scan(struct phylink_pcs *pcs)
+{
+	struct rtpcs_link *link = rtpcs_phylink_pcs_to_link(pcs);
+
+	WRITE_ONCE(link->sds->cal_abort, true);
+	cancel_delayed_work_sync(&link->scan_work);
+}
+
 static void rtpcs_93xx_pcs_pre_config(struct phylink_pcs *pcs, phy_interface_t interface)
 {
-	cancel_delayed_work_sync(&rtpcs_phylink_pcs_to_link(pcs)->scan_work);
+	rtpcs_93xx_pcs_stop_scan(pcs);
 }
 
 static void rtpcs_93xx_pcs_disable(struct phylink_pcs *pcs)
 {
-	cancel_delayed_work_sync(&rtpcs_phylink_pcs_to_link(pcs)->scan_work);
+	rtpcs_93xx_pcs_stop_scan(pcs);
 }
 
 static void rtpcs_mdio_bus_put(void *data)
@@ -5366,7 +5394,7 @@ static void rtpcs_shutdown(struct platform_device *pdev)
 	for (int i = 0; i < RTPCS_SDS_CNT; i++)
 		for (int j = 0; j < RTPCS_MAX_LINKS_PER_SDS; j++)
 			if (ctrl->serdes[i].link[j])
-				cancel_delayed_work_sync(&ctrl->serdes[i].link[j]->scan_work);
+				rtpcs_93xx_pcs_stop_scan(&ctrl->serdes[i].link[j]->pcs);
 }
 
 static struct platform_driver rtpcs_driver = {
