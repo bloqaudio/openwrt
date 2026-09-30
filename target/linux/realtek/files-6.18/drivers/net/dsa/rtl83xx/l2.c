@@ -1234,6 +1234,7 @@ static void rtl931x_fill_l2_row(u32 r[], struct rtl838x_l2_entry *e)
 			r[3] |= (e->l2_tunnel_id & 0xf) << 28;
 		}
 	} else { /* L2_MULTICAST */
+		r[2] |= e->is_local_forward ? BIT(31) : 0;
 		r[2] |= (e->mc_portmask_index & 0xfff) << 18;
 	}
 }
