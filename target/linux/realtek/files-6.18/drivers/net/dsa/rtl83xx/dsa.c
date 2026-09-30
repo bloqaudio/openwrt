@@ -1071,7 +1071,7 @@ static int rtldsa_83xx_port_mdb_add(struct dsa_switch *ds, int port,
 
 	pr_debug("In %s port %d, mac %llx, vid: %d\n", __func__, port, mac, vid);
 
-	if (priv->lag_non_primary & BIT_ULL(port)) {
+	if (!priv->r->prepare_lag_fdb && (priv->lag_non_primary & BIT_ULL(port))) {
 		pr_debug("%s: %d is lag slave. ignore\n", __func__, port);
 		return -EINVAL;
 	}
@@ -1157,7 +1157,7 @@ static int rtldsa_port_mdb_del(struct dsa_switch *ds, int port,
 
 	pr_debug("In %s, port %d, mac %llx, vid: %d\n", __func__, port, mac, vid);
 
-	if (priv->lag_non_primary & BIT_ULL(port)) {
+	if (!priv->r->prepare_lag_fdb && (priv->lag_non_primary & BIT_ULL(port))) {
 		pr_info("%s: %d is lag slave. ignore\n", __func__, port);
 		return 0;
 	}
