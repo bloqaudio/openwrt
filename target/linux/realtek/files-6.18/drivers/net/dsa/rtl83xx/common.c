@@ -797,6 +797,22 @@ static void rtl83xx_sw_remove(struct platform_device *pdev)
 	dev_set_drvdata(&pdev->dev, NULL);
 }
 
+static void rtl83xx_sw_shutdown(struct platform_device *pdev)
+{
+	struct rtl838x_switch_priv *priv = platform_get_drvdata(pdev);
+
+	if (!priv)
+		return;
+
+	otto_l3_remove(priv);
+	cancel_delayed_work_sync(&priv->counters_work);
+	flush_workqueue(priv->wq);
+
+	dsa_switch_shutdown(priv->ds);
+
+	platform_set_drvdata(pdev, NULL);
+}
+
 static const struct of_device_id rtl83xx_switch_of_ids[] = {
 	{
 		.compatible = "realtek,rtl8380-switch",
@@ -822,6 +838,7 @@ MODULE_DEVICE_TABLE(of, rtl83xx_switch_of_ids);
 static struct platform_driver rtl83xx_switch_driver = {
 	.probe  = rtl83xx_sw_probe,
 	.remove = rtl83xx_sw_remove,
+	.shutdown = rtl83xx_sw_shutdown,
 	.driver = {
 		.name = "rtl83xx-switch",
 		.pm = NULL,
