@@ -103,6 +103,15 @@
 #define RTL930X_VLAN_PORT_TAG_STS_CTRL_IGR_P_OTAG_KEEP_MASK	GENMASK(1, 1)
 #define RTL930X_VLAN_PORT_TAG_STS_CTRL_IGR_P_ITAG_KEEP_MASK	GENMASK(0, 0)
 
+#define RTL930X_VLAN_TAG_TPID_CTRL(idx)				(0xC7AC + ((idx) << 2))
+#define RTL930X_VLAN_PORT_ITAG_TPID_CMP_MSK(port)		(0x327C + ((port) << 6))
+#define RTL930X_VLAN_PORT_OTAG_TPID_CMP_MSK(port)		(0x3280 + ((port) << 6))
+#define RTL930X_VLAN_PORT_AFT(port)				(0x8260 + ((port) << 2))
+#define RTL930X_VLAN_PORT_AFT_ACCEPT_ALL			GENMASK(3, 0)
+#define RTL930X_VLAN_PORT_EGR_TPID_CTRL(port)			(0xCE98 + ((port) << 2))
+#define RTL930X_VLAN_PORT_EGR_TPID_OTPID_IDX			GENMASK(5, 4)
+#define RTL930X_VLAN_PORT_EGR_TPID_OTPID_KEEP			BIT(3)
+
 #define RTL931X_VLAN_PORT_TAG_STS_INTERNAL			0x0
 #define RTL931X_VLAN_PORT_TAG_STS_UNTAG				0x1
 #define RTL931X_VLAN_PORT_TAG_STS_TAGGED			0x2
@@ -148,6 +157,9 @@ void rtldsa_vlan_setup(struct rtl838x_switch_priv *priv)
 
 	priv->r->vlan_profile_setup(0);
 	priv->r->vlan_profile_dump(priv, 0);
+
+	if (priv->r->vlan_qinq_setup)
+		priv->r->vlan_qinq_setup(priv);
 
 	/* Initialize normal VLANs 1-4095 */
 	for (int i = 1; i < MAX_VLANS; i++)
@@ -579,6 +591,46 @@ void rtl930x_vlan_profile_setup(int profile)
 	sw_w32(p[2], RTL930X_VLAN_PROFILE_SET(profile) + 8);
 	sw_w32(p[3], RTL930X_VLAN_PROFILE_SET(profile) + 12);
 	sw_w32(p[4], RTL930X_VLAN_PROFILE_SET(profile) + 16);
+}
+
+void rtl930x_vlan_qinq_setup(struct rtl838x_switch_priv *priv)
+{
+	int cpu_port = priv->r->cpu_port;
+
+	for (int i = 0; i < 4; i++)
+		sw_w32((ETH_P_8021AD << 16) | ETH_P_8021Q, RTL930X_VLAN_TAG_TPID_CTRL(i));
+
+	/* the CPU port parses S-TAGs too, so injected S-tagged frames select the outer VID */
+	for (int port = 0; port <= cpu_port; port++) {
+		sw_w32(BIT(0), RTL930X_VLAN_PORT_ITAG_TPID_CMP_MSK(port));
+		sw_w32(port == cpu_port ? BIT(0) : 0, RTL930X_VLAN_PORT_OTAG_TPID_CMP_MSK(port));
+		sw_w32(RTL930X_VLAN_PORT_AFT_ACCEPT_ALL, RTL930X_VLAN_PORT_AFT(port));
+	}
+
+	sw_w32_mask(GENMASK(3, 0), BIT(3) | BIT(2), RTL930X_VLAN_PORT_FWD + (cpu_port << 2));
+}
+
+void rtl930x_vlan_port_qinq_set(int port, bool enable)
+{
+	rtl930x_vlan_fwd_on_inner(port, !enable);
+
+	sw_w32(BIT(0), RTL930X_VLAN_PORT_ITAG_TPID_CMP_MSK(port));
+	sw_w32(enable ? BIT(0) : 0, RTL930X_VLAN_PORT_OTAG_TPID_CMP_MSK(port));
+	sw_w32_mask(RTL930X_VLAN_PORT_EGR_TPID_OTPID_IDX | RTL930X_VLAN_PORT_EGR_TPID_OTPID_KEEP, 0,
+		    RTL930X_VLAN_PORT_EGR_TPID_CTRL(port));
+
+	if (!enable) {
+		rtl930x_vlan_port_keep_tag_set(port, false, true);
+		return;
+	}
+
+	sw_w32(FIELD_PREP(RTL930X_VLAN_PORT_TAG_STS_CTRL_EGR_OTAG_STS_MASK,
+			  RTL930X_VLAN_PORT_TAG_STS_TAGGED) |
+	       FIELD_PREP(RTL930X_VLAN_PORT_TAG_STS_CTRL_EGR_ITAG_STS_MASK,
+			  RTL930X_VLAN_PORT_TAG_STS_INTERNAL) |
+	       RTL930X_VLAN_PORT_TAG_STS_CTRL_EGR_P_ITAG_KEEP_MASK |
+	       RTL930X_VLAN_PORT_TAG_STS_CTRL_IGR_P_ITAG_KEEP_MASK,
+	       RTL930X_VLAN_PORT_TAG_STS_CTRL(port));
 }
 
 void rtl930x_vlan_port_keep_tag_set(int port, bool keep_outer, bool keep_inner)
