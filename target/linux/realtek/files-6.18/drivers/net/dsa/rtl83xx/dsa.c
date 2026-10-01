@@ -9,6 +9,7 @@
 
 #include "lag.h"
 #include "mirror.h"
+#include "qos.h"
 #include "rtl-otto.h"
 #include "stats.h"
 #include "tc.h"
@@ -1602,6 +1603,7 @@ const struct dsa_switch_ops rtldsa_93xx_switch_ops = {
 	.port_pre_bridge_flags	= rtldsa_port_pre_bridge_flags,
 	.port_bridge_flags	= rtldsa_port_bridge_flags,
 
+	.port_setup_tc		= rtldsa_port_setup_tc,
 	.cls_flower_add		= rtldsa_cls_flower_add,
 	.cls_flower_del		= rtldsa_cls_flower_del,
 	.cls_flower_stats	= rtldsa_cls_flower_stats,
