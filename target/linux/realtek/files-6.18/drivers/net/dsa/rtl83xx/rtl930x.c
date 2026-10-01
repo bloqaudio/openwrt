@@ -4,6 +4,7 @@
 #include <linux/etherdevice.h>
 #include <linux/inetdevice.h>
 
+#include "flowctrl.h"
 #include "lag.h"
 #include "l2.h"
 #include "l3.h"
@@ -642,6 +643,7 @@ const struct rtldsa_config rtldsa_930x_cfg = {
 	.enable_flood = rtldsa_930x_enable_flood,
 	.enable_bcast_flood = rtldsa_930x_enable_bcast_flood,
 	.set_receive_management_action = rtldsa_930x_set_receive_management_action,
+	.flowctrl_init = rtldsa_930x_flowctrl_init,
 	.qos_init = rtldsa_930x_qos_init,
 	.trk_ctrl = RTL930X_TRK_CTRL,
 	.trk_hash_ctrl = RTL930X_TRK_HASH_CTRL,

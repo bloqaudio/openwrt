@@ -1233,6 +1233,7 @@ struct rtldsa_config {
 	void (*led_init)(struct rtl838x_switch_priv *priv);
 	u32 (*get_egress_rate)(struct rtl838x_switch_priv *priv, int port);
 	int (*set_egress_rate)(struct rtl838x_switch_priv *priv, int port, u32 rate);
+	void (*flowctrl_init)(struct rtl838x_switch_priv *priv);
 	void (*qos_init)(struct rtl838x_switch_priv *priv);
 	int (*trk_mbr_ctr)(int group);
 	void (*lag_switch_init)(struct rtl838x_switch_priv *priv);
