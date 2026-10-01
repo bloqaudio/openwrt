@@ -132,6 +132,8 @@ void rtl931x_vlan_set_untagged(u32 vlan, u64 portmask);
 void rtl931x_vlan_fwd_on_inner(int port, bool is_set);
 void rtl931x_vlan_profile_setup(int profile);
 void rtl931x_vlan_port_keep_tag_set(int port, bool keep_outer, bool keep_inner);
+void rtl931x_vlan_qinq_setup(struct rtl838x_switch_priv *priv);
+void rtl931x_vlan_port_qinq_set(int port, bool enable);
 void rtl931x_vlan_port_pvidmode_set(int port, enum pbvlan_type type, enum pbvlan_mode mode);
 void rtl931x_vlan_port_pvid_set(int port, enum pbvlan_type type, int pvid);
 
