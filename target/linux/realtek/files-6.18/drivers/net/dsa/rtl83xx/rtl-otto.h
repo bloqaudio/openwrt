@@ -478,6 +478,7 @@ struct rtldsa_config {
 	void (*led_init)(struct otto_dsa_priv *priv);
 	u32 (*get_egress_rate)(struct otto_dsa_priv *priv, int port);
 	int (*set_egress_rate)(struct otto_dsa_priv *priv, int port, u32 rate);
+	void (*flowctrl_init)(struct otto_dsa_priv *priv);
 	void (*qos_init)(struct otto_dsa_priv *priv);
 	int (*trk_mbr_ctr)(int group);
 	void (*lag_switch_init)(struct otto_dsa_priv *priv);
