@@ -454,6 +454,8 @@ struct rtldsa_config {
 	u64 (*read_mcast_pmask)(int idx);
 	void (*write_mcast_pmask)(int idx, u64 portmask);
 	void (*vlan_fwd_on_inner)(int port, bool is_set);
+	void (*vlan_qinq_setup)(struct rtl838x_switch_priv *priv);
+	void (*vlan_port_qinq_set)(int port, bool enable);
 	void (*pie_init)(struct rtl838x_switch_priv *priv);
 	int (*pie_rule_read)(struct rtl838x_switch_priv *priv, int idx, struct  pie_rule *pr);
 	int (*pie_rule_write)(struct rtl838x_switch_priv *priv, int idx, struct pie_rule *pr);
