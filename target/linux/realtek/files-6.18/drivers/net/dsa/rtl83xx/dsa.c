@@ -52,6 +52,11 @@
 #define RTL930X_SPEED_MASK			(15 << RTL930X_SPEED_SHIFT)
 #define RTL930X_TX_PAUSE_EN			BIT(7)
 #define RTL930X_RX_PAUSE_EN			BIT(8)
+#define RTL930X_MAC_FORCE_FC_EN			BIT(9)
+
+#define RTL931X_MAC_FORCE_FC_EN			BIT(4)
+#define RTL931X_TX_PAUSE_EN			BIT(16)
+#define RTL931X_RX_PAUSE_EN			BIT(17)
 
 #define RTL930X_PORT_IGNORE 0x3f
 
@@ -440,6 +445,7 @@ static void rtldsa_93xx_phylink_mac_link_up(struct phylink_config *config,
 		mcr &= ~RTL930X_DUPLEX_MODE;
 		mcr &= ~RTL930X_SPEED_MASK;
 		mcr |= RTL930X_FORCE_LINK_EN;
+		mcr |= RTL930X_MAC_FORCE_FC_EN;
 		mcr |= spdsel << RTL930X_SPEED_SHIFT;
 
 		if (tx_pause)
@@ -450,6 +456,15 @@ static void rtldsa_93xx_phylink_mac_link_up(struct phylink_config *config,
 			mcr |= RTL930X_DUPLEX_MODE;
 		if (dsa_port_is_cpu(dp) || priv->ports[port].phy)
 			mcr |= RTL930X_FORCE_EN;
+	} else {
+		mcr &= ~RTL931X_RX_PAUSE_EN;
+		mcr &= ~RTL931X_TX_PAUSE_EN;
+		mcr |= RTL931X_MAC_FORCE_FC_EN;
+
+		if (tx_pause)
+			mcr |= RTL931X_TX_PAUSE_EN;
+		if (rx_pause)
+			mcr |= RTL931X_RX_PAUSE_EN;
 	}
 
 	pr_debug("%s port %d, mode %x, speed %d, duplex %d, txpause %d, rxpause %d: set mcr=%08x\n",
