@@ -132,6 +132,12 @@
 #define RTL931X_VLAN_PORT_TAG_ITPID_IDX_MASK			GENMASK(2, 1)
 #define RTL931X_VLAN_PORT_TAG_ITPID_KEEP_MASK			GENMASK(0, 0)
 
+#define RTL931X_VLAN_TAG_TPID_CTRL(idx)				(0x13FC + ((idx) << 2))
+#define RTL931X_VLAN_PORT_OTAG_TPID_CMP_MSK(port)		(0x600C + ((port) << 7))
+#define RTL931X_VLAN_PORT_ITAG_TPID_CMP_MSK(port)		(0x6010 + ((port) << 7))
+#define RTL931X_PKT_ENCAP_MISC_CTRL				(0x4FCC)
+#define RTL931X_PKT_ENCAP_MISC_CTRL_EVC_TCAM_EN			BIT(0)
+
 static void rtldsa_vlan_set_pvid(struct rtl838x_switch_priv *priv,
 				  int port, int pvid)
 {
@@ -801,6 +807,46 @@ void rtl931x_vlan_port_keep_tag_set(int port, bool keep_outer, bool keep_inner)
 			  keep_outer ? RTL931X_VLAN_PORT_TAG_STS_TAGGED : RTL931X_VLAN_PORT_TAG_STS_UNTAG) |
 	       FIELD_PREP(RTL931X_VLAN_PORT_TAG_EGR_ITAG_STS_MASK,
 			  keep_inner ? RTL931X_VLAN_PORT_TAG_STS_TAGGED : RTL931X_VLAN_PORT_TAG_STS_UNTAG),
+	       RTL931X_VLAN_PORT_TAG_CTRL(port));
+}
+
+void rtl931x_vlan_qinq_setup(struct rtl838x_switch_priv *priv)
+{
+	int cpu_port = priv->r->cpu_port;
+
+	for (int i = 0; i < 4; i++)
+		sw_w32((ETH_P_8021AD << 16) | ETH_P_8021Q, RTL931X_VLAN_TAG_TPID_CTRL(i));
+
+	/* without egress VLAN conversion the outer tag status of a port has no effect */
+	sw_w32_mask(0, RTL931X_PKT_ENCAP_MISC_CTRL_EVC_TCAM_EN, RTL931X_PKT_ENCAP_MISC_CTRL);
+
+	/* the CPU port parses S-TAGs too, so injected S-tagged frames select the outer VID */
+	for (int port = 0; port <= cpu_port; port++) {
+		sw_w32(BIT(0), RTL931X_VLAN_PORT_ITAG_TPID_CMP_MSK(port));
+		sw_w32(port == cpu_port ? BIT(0) : 0, RTL931X_VLAN_PORT_OTAG_TPID_CMP_MSK(port));
+	}
+
+	sw_w32_mask(GENMASK(3, 0), BIT(3) | BIT(2), RTL931X_VLAN_PORT_FWD + (cpu_port << 2));
+}
+
+void rtl931x_vlan_port_qinq_set(int port, bool enable)
+{
+	rtl931x_vlan_fwd_on_inner(port, !enable);
+
+	sw_w32(BIT(0), RTL931X_VLAN_PORT_ITAG_TPID_CMP_MSK(port));
+	sw_w32(enable ? BIT(0) : 0, RTL931X_VLAN_PORT_OTAG_TPID_CMP_MSK(port));
+
+	if (!enable) {
+		rtl931x_vlan_port_keep_tag_set(port, false, true);
+		return;
+	}
+
+	sw_w32(FIELD_PREP(RTL931X_VLAN_PORT_TAG_EGR_OTAG_STS_MASK,
+			  RTL931X_VLAN_PORT_TAG_STS_TAGGED) |
+	       FIELD_PREP(RTL931X_VLAN_PORT_TAG_EGR_ITAG_STS_MASK,
+			  RTL931X_VLAN_PORT_TAG_STS_INTERNAL) |
+	       RTL931X_VLAN_PORT_TAG_EGR_ITAG_KEEP_MASK |
+	       RTL931X_VLAN_PORT_TAG_IGR_ITAG_KEEP_MASK,
 	       RTL931X_VLAN_PORT_TAG_CTRL(port));
 }
 
