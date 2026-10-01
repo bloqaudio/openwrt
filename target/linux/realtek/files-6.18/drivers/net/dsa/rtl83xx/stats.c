@@ -106,6 +106,7 @@ static void rtldsa_update_link_stat(struct rtnl_link_stats64 *s,
 		      4 * s->tx_packets -
 		      64 * counters->tx_pause_frames.val;
 
+	s->multicast = counters->if_in_mcast_pkts.val;
 	s->collisions = counters->collisions.val;
 
 	s->rx_dropped = counters->drop_events.val;
@@ -388,6 +389,11 @@ void rtldsa_get_eth_mac_stats(struct dsa_switch *ds, int port,
 	mac_stats->OctetsTransmittedOK = counters->if_out_octets.val -
 					 18 * mac_stats->FramesTransmittedOK;
 
+	mac_stats->MulticastFramesXmittedOK = counters->if_out_mcast_pkts.val;
+	mac_stats->BroadcastFramesXmittedOK = counters->if_out_bcast_pkts.val;
+	mac_stats->MulticastFramesReceivedOK = counters->if_in_mcast_pkts.val;
+	mac_stats->BroadcastFramesReceivedOK = counters->if_in_bcast_pkts.val;
+
 	mac_stats->SingleCollisionFrames = counters->single_collisions.val;
 	mac_stats->MultipleCollisionFrames = counters->multiple_collisions.val;
 	mac_stats->FramesWithDeferredXmissions = counters->deferred_transmissions.val;
@@ -412,6 +418,8 @@ void rtldsa_get_eth_ctrl_stats(struct dsa_switch *ds, int port,
 
 	rtldsa_update_port_counters(priv, port);
 
+	ctrl_stats->MACControlFramesTransmitted = counters->tx_pause_frames.val;
+	ctrl_stats->MACControlFramesReceived = counters->rx_pause_frames.val;
 	ctrl_stats->UnsupportedOpcodesReceived = counters->unsupported_opcodes.val;
 
 	rtldsa_counters_unlock(priv, port);
