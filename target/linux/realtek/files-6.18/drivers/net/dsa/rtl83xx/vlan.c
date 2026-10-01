@@ -116,6 +116,12 @@
 #define RTL930X_VLAN_PORT_EGR_TPID_OTPID_IDX			GENMASK(5, 4)
 #define RTL930X_VLAN_PORT_EGR_TPID_OTPID_KEEP			BIT(3)
 
+#define RTL931X_VLAN_TAG_TPID_CTRL(idx)				(0x13FC + ((idx) << 2))
+#define RTL931X_VLAN_PORT_OTAG_TPID_CMP_MSK(port)		(0x600C + ((port) << 7))
+#define RTL931X_VLAN_PORT_ITAG_TPID_CMP_MSK(port)		(0x6010 + ((port) << 7))
+#define RTL931X_PKT_ENCAP_MISC_CTRL				(0x4FCC)
+#define RTL931X_PKT_ENCAP_MISC_CTRL_EVC_TCAM_EN			BIT(0)
+
 #define RTL931X_VLAN_PORT_TAG_STS_INTERNAL			0x0
 #define RTL931X_VLAN_PORT_TAG_STS_UNTAG				0x1
 #define RTL931X_VLAN_PORT_TAG_STS_TAGGED			0x2
@@ -901,6 +907,51 @@ void otto_vlan_931x_profile_setup(struct otto_dsa_priv *priv, int profile)
 	for (int i = 0; i < 7; i++)
 		regmap_write(priv->map, RTL931X_VLAN_PROFILE_SET(profile) + i * 4, p[i]);
 	pr_debug("Leaving %s\n", __func__);
+}
+
+void otto_vlan_931x_qinq_setup(struct otto_dsa_priv *priv)
+{
+	int cpu_port = priv->r->cpu_port;
+
+	for (int i = 0; i < 4; i++)
+		regmap_write(priv->map, RTL931X_VLAN_TAG_TPID_CTRL(i),
+			     (ETH_P_8021AD << 16) | ETH_P_8021Q);
+
+	/* without egress VLAN conversion the outer tag status of a port has no effect */
+	regmap_write_bits(priv->map, RTL931X_PKT_ENCAP_MISC_CTRL,
+			  RTL931X_PKT_ENCAP_MISC_CTRL_EVC_TCAM_EN,
+			  RTL931X_PKT_ENCAP_MISC_CTRL_EVC_TCAM_EN);
+
+	/* the CPU port parses S-TAGs too, so injected S-tagged frames select the outer VID */
+	for (int port = 0; port <= cpu_port; port++) {
+		regmap_write(priv->map, RTL931X_VLAN_PORT_ITAG_TPID_CMP_MSK(port), BIT(0));
+		regmap_write(priv->map, RTL931X_VLAN_PORT_OTAG_TPID_CMP_MSK(port),
+			     port == cpu_port ? BIT(0) : 0);
+	}
+
+	regmap_write_bits(priv->map, RTL931X_VLAN_PORT_FWD + (cpu_port << 2), GENMASK(3, 0),
+			  BIT(3) | BIT(2));
+}
+
+void otto_vlan_931x_port_qinq_set(struct otto_dsa_priv *priv, int port, bool enable)
+{
+	otto_vlan_931x_port_forward_on_inner(priv, port, !enable);
+
+	regmap_write(priv->map, RTL931X_VLAN_PORT_ITAG_TPID_CMP_MSK(port), BIT(0));
+	regmap_write(priv->map, RTL931X_VLAN_PORT_OTAG_TPID_CMP_MSK(port), enable ? BIT(0) : 0);
+
+	if (!enable) {
+		otto_vlan_931x_port_keep_tag_set(priv, port, false, true);
+		return;
+	}
+
+	regmap_write(priv->map, RTL931X_VLAN_PORT_TAG_CTRL(port),
+		     FIELD_PREP(RTL931X_VLAN_PORT_TAG_EGR_OTAG_STS_MASK,
+				RTL931X_VLAN_PORT_TAG_STS_TAGGED) |
+		     FIELD_PREP(RTL931X_VLAN_PORT_TAG_EGR_ITAG_STS_MASK,
+				RTL931X_VLAN_PORT_TAG_STS_INTERNAL) |
+		     RTL931X_VLAN_PORT_TAG_EGR_ITAG_KEEP_MASK |
+		     RTL931X_VLAN_PORT_TAG_IGR_ITAG_KEEP_MASK);
 }
 
 void otto_vlan_931x_port_keep_tag_set(struct otto_dsa_priv *priv, int port, bool keep_outer,
