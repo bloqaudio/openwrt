@@ -787,10 +787,6 @@ void otto_vlan_931x_profile_setup(int profile)
 
 	p[0] = sw_r32(RTL931X_VLAN_PROFILE_SET(profile));
 
-	/* Enable routing of Ipv4/6 Unicast and IPv4/6 Multicast traffic */
-	/* p[0] |= BIT(17) | BIT(16) | BIT(13) | BIT(12); */
-	p[0] |= 0x3 << 11; /* COPY2CPU */
-
 	p[1] = RTL931X_VLAN_L2_UNKN_MC_FLD_H(RTL931X_MC_PMASK_ALL_PORTS);
 	p[2] = RTL931X_VLAN_L2_UNKN_MC_FLD_L(RTL931X_MC_PMASK_ALL_PORTS);
 	p[3] = RTL931X_VLAN_IP4_UNKN_MC_FLD_H(RTL931X_MC_PMASK_ALL_PORTS);
