@@ -467,8 +467,10 @@ static int rtldsa_port_enable(struct dsa_switch *ds, int port, struct phy_device
 	pr_debug("%s: %x %d", __func__, (u32)priv, port);
 	priv->ports[port].enable = true;
 
-	/* enable inner tagging on egress, do not keep any tags */
-	priv->r->vlan_port_keep_tag_set(port, 0, 1);
+	if (priv->ports[port].qinq)
+		priv->r->vlan_port_qinq_set(port, true);
+	else
+		priv->r->vlan_port_keep_tag_set(port, 0, 1);
 
 	if (dsa_is_cpu_port(ds, port))
 		return 0;
@@ -662,14 +664,26 @@ static int rtldsa_port_bridge_join(struct dsa_switch *ds, int port, struct dsa_b
 				   bool *tx_fwd_offload, struct netlink_ext_ack *extack)
 {
 	struct rtl838x_switch_priv *priv = ds->priv;
+	u16 proto = ETH_P_8021Q;
 
 	pr_debug("%s %x: %d", __func__, (u32)priv, port);
+
+	br_vlan_get_proto(bridge.dev, &proto);
+	if (proto != ETH_P_8021Q && (proto != ETH_P_8021AD || !priv->r->vlan_port_qinq_set)) {
+		NL_SET_ERR_MSG_MOD(extack, "802.1ad bridges are not supported");
+		return -EINVAL;
+	}
 
 	/* reset to default flags for new net_bridge_port */
 	priv->ports[port].isolated = false;
 	priv->ports[port].cached_flags = 0;
 
 	mutex_lock(&priv->reg_mutex);
+
+	if (proto == ETH_P_8021AD) {
+		priv->r->vlan_port_qinq_set(port, true);
+		priv->ports[port].qinq = true;
+	}
 
 	rtldsa_update_port_member(priv, port, bridge.dev, true);
 
@@ -694,6 +708,11 @@ static void rtldsa_port_bridge_leave(struct dsa_switch *ds, int port, struct dsa
 
 	rtldsa_update_port_member(priv, port, bridge.dev, false);
 
+	if (priv->ports[port].qinq) {
+		priv->r->vlan_port_qinq_set(port, false);
+		priv->ports[port].qinq = false;
+	}
+
 	if (priv->r->set_static_move_action)
 		priv->r->set_static_move_action(port, true);
 
@@ -701,6 +720,18 @@ static void rtldsa_port_bridge_leave(struct dsa_switch *ds, int port, struct dsa
 	rtldsa_port_non_cist_states_set(priv, port, BR_STATE_FORWARDING);
 
 	mutex_unlock(&priv->reg_mutex);
+}
+
+static int rtldsa_port_vlan_protocol(struct dsa_switch *ds, int port, u16 proto,
+				     struct netlink_ext_ack *extack)
+{
+	struct rtl838x_switch_priv *priv = ds->priv;
+
+	if (proto == (priv->ports[port].qinq ? ETH_P_8021AD : ETH_P_8021Q))
+		return 0;
+
+	NL_SET_ERR_MSG_MOD(extack, "VLAN protocol can't be changed on a bridge with switch ports");
+	return -EINVAL;
 }
 
 void rtldsa_port_fast_age(struct dsa_switch *ds, int port)
@@ -1651,6 +1682,7 @@ const struct dsa_switch_ops rtldsa_93xx_switch_ops = {
 	.port_mst_state_set	= rtldsa_port_mst_state_set,
 
 	.port_vlan_filtering	= rtldsa_vlan_filtering,
+	.port_vlan_protocol	= rtldsa_port_vlan_protocol,
 	.port_vlan_add		= rtldsa_vlan_add,
 	.port_vlan_del		= rtldsa_vlan_del,
 	.port_vlan_fast_age	= rtldsa_port_vlan_fast_age,
