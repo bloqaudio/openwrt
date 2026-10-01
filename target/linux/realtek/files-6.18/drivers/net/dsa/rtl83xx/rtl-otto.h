@@ -1076,6 +1076,7 @@ struct pie_rule {
 };
 
 struct rtl838x_switch_priv;
+struct tc_red_qopt_offload_params;
 
 struct rtldsa_config {
 	const struct dsa_switch_ops *switch_ops;
@@ -1234,6 +1235,9 @@ struct rtldsa_config {
 	u32 (*get_egress_rate)(struct rtl838x_switch_priv *priv, int port);
 	int (*set_egress_rate)(struct rtl838x_switch_priv *priv, int port, u32 rate);
 	void (*flowctrl_init)(struct rtl838x_switch_priv *priv);
+	int (*red_enable)(struct rtl838x_switch_priv *priv, int port,
+			  const struct tc_red_qopt_offload_params *p);
+	void (*red_disable)(struct rtl838x_switch_priv *priv, int port);
 	void (*qos_init)(struct rtl838x_switch_priv *priv);
 	int (*trk_mbr_ctr)(int group);
 	void (*lag_switch_init)(struct rtl838x_switch_priv *priv);
@@ -1288,6 +1292,12 @@ struct rtl838x_switch_priv {
 
 	/** @lagmembers: Port (bit) is part of any LAG */
 	u64 lagmembers;
+
+	/** @red_ports: Port (bit) has RED offloaded */
+	u64 red_ports;
+
+	/** @red_cfg: RED thresholds and drop rate shared by all ports in @red_ports */
+	u32 red_cfg;
 	struct workqueue_struct *wq;
 	bool eee_enabled;
 	unsigned long mc_group_bm[MAX_MC_GROUPS >> 5];
