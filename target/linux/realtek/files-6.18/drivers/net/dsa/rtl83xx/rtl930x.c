@@ -5,6 +5,7 @@
 #include <linux/inetdevice.h>
 #include <linux/regmap.h>
 
+#include "flowctrl.h"
 #include "lag.h"
 #include "l2.h"
 #include "l3.h"
@@ -693,6 +694,7 @@ const struct rtldsa_config rtldsa_930x_cfg = {
 	.enable_bcast_flood = otto_l2_930x_enable_bcast_flood,
 	.set_receive_management_action = rtldsa_930x_set_receive_management_action,
 	.queue_sched_set = otto_qos_930x_queue_sched_set,
+	.flowctrl_init = rtldsa_930x_flowctrl_init,
 	.egress_shaper_set = otto_tc_930x_egress_shaper_set,
 	.qos_init = otto_qos_930x_init,
 	.trk_ctrl = RTL930X_TRK_CTRL,
