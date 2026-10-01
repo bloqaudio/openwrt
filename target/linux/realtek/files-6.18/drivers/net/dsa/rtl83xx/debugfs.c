@@ -825,6 +825,30 @@ err:
 	rtl838x_dbgfs_cleanup(priv);
 }
 
+static u32 rtldsa_dbg_reg_addr;
+
+static int rtldsa_dbg_reg_val_get(void *data, u64 *val)
+{
+	if (rtldsa_dbg_reg_addr >= 0x10000)
+		return -EINVAL;
+
+	*val = sw_r32((rtldsa_dbg_reg_addr & ~0x3u));
+
+	return 0;
+}
+
+static int rtldsa_dbg_reg_val_set(void *data, u64 val)
+{
+	if (rtldsa_dbg_reg_addr >= 0x10000)
+		return -EINVAL;
+
+	sw_w32(val, (rtldsa_dbg_reg_addr & ~0x3u));
+
+	return 0;
+}
+DEFINE_DEBUGFS_ATTRIBUTE(rtldsa_dbg_reg_val_fops, rtldsa_dbg_reg_val_get,
+			 rtldsa_dbg_reg_val_set, "0x%08llx\n");
+
 void rtl930x_dbgfs_init(struct rtl838x_switch_priv *priv)
 {
 	struct dentry *dbg_dir;
@@ -835,6 +859,9 @@ void rtl930x_dbgfs_init(struct rtl838x_switch_priv *priv)
 		dbg_dir = debugfs_create_dir(RTL838X_DRIVER_NAME, NULL);
 
 	priv->dbgfs_dir = dbg_dir;
+
+	debugfs_create_x32("reg_addr", 0600, dbg_dir, &rtldsa_dbg_reg_addr);
+	debugfs_create_file("reg_val", 0600, dbg_dir, NULL, &rtldsa_dbg_reg_val_fops);
 
 	debugfs_create_file("drop_counters", 0400, dbg_dir, priv, &drop_counter_fops);
 
