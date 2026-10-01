@@ -132,6 +132,8 @@ void otto_vlan_931x_set_untagged(u32 vlan, u64 portmask);
 void otto_vlan_931x_port_forward_on_inner(int port, bool is_set);
 void otto_vlan_931x_profile_setup(int profile);
 void otto_vlan_931x_port_keep_tag_set(int port, bool keep_outer, bool keep_inner);
+void rtl931x_vlan_qinq_setup(struct rtl838x_switch_priv *priv);
+void rtl931x_vlan_port_qinq_set(int port, bool enable);
 void otto_vlan_931x_port_pvid_mode_set(int port, enum pbvlan_type type, enum pbvlan_mode mode);
 void otto_vlan_931x_port_pvid_set(int port, enum pbvlan_type type, int pvid);
 
