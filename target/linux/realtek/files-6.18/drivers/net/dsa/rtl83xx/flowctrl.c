@@ -4,6 +4,7 @@
 #include <linux/of.h>
 #include <linux/phy.h>
 #include <net/dsa.h>
+#include <net/pkt_cls.h>
 #include <asm/mach-rtl-otto/mach-rtl-otto.h>
 
 #include "flowctrl.h"
@@ -33,12 +34,20 @@
 #define RTL930X_FC_CPU_Q_EGR_DROP_THR(q)	(0x7dc0 + ((q) << 2))
 #define RTL930X_FC_PORT_EGR_DROP_THR_SET_SEL	0x79dc
 #define RTL930X_FC_LB_PORT_Q_EGR_DROP_THR	0x79e4
+#define RTL930X_SWRED_PORT_CTRL			0x7a04
+#define RTL930X_SWRED_QUEUE_DROP_CTRL(q, dp)	(0x7a08 + ((q) * 12) + ((dp) << 2))
 #define RTL930X_SC_P_CTRL			0x7a98
 
 #define RTL930X_FC_THR				GENMASK(11, 0)
 #define RTL930X_FC_ON				GENMASK(27, 16)
 #define RTL930X_FC_OFF				GENMASK(11, 0)
 #define RTL930X_FC_REF_RXCNGST			BIT(1)
+#define RTL930X_SWRED_RATE			GENMASK(31, 24)
+#define RTL930X_SWRED_MAX			GENMASK(23, 12)
+#define RTL930X_SWRED_MIN			GENMASK(11, 0)
+#define RTL930X_SWRED_PAGE_SIZE			256
+#define RTL930X_SWRED_RATE_SCALE		1023
+#define RTL930X_SWRED_DROP_PRECEDENCES		3
 
 #define RTL930X_FC_THR_SETS			4
 #define RTL930X_FC_QUEUES			12
@@ -236,4 +245,53 @@ void rtldsa_930x_flowctrl_init(struct rtl838x_switch_priv *priv)
 	sw_w32_mask(RTL930X_FC_THR, 1, RTL930X_FC_GLB_SYS_UTIL_THR);
 
 	mutex_unlock(&priv->reg_mutex);
+}
+
+/* The thresholds are one table for the whole switch. Between the two thresholds the
+ * hardware drops with one fixed probability of rate / 1023, above the upper one it
+ * drops everything.
+ */
+int rtldsa_930x_red_enable(struct rtl838x_switch_priv *priv, int port,
+			   const struct tc_red_qopt_offload_params *p)
+{
+	u32 min = DIV_ROUND_UP(p->min, RTL930X_SWRED_PAGE_SIZE);
+	u32 max = p->max / RTL930X_SWRED_PAGE_SIZE;
+	u64 rate = ((u64)p->probability * RTL930X_SWRED_RATE_SCALE + U32_MAX) >> 32;
+	u32 cfg;
+
+	if (!min || min >= max || max > FIELD_MAX(RTL930X_SWRED_MAX) ||
+	    !rate || rate > FIELD_MAX(RTL930X_SWRED_RATE))
+		return -EINVAL;
+
+	cfg = FIELD_PREP(RTL930X_SWRED_RATE, rate) | FIELD_PREP(RTL930X_SWRED_MAX, max) |
+	      FIELD_PREP(RTL930X_SWRED_MIN, min);
+
+	if ((priv->red_ports & ~BIT_ULL(port)) && cfg != priv->red_cfg) {
+		dev_warn(priv->dev, "port %d: RED parameters differ from the ones in use\n", port);
+		return -EBUSY;
+	}
+
+	for (int queue = 0; queue < RTL930X_FC_QUEUES; queue++)
+		for (int dp = 0; dp < RTL930X_SWRED_DROP_PRECEDENCES; dp++)
+			sw_w32(cfg, RTL930X_SWRED_QUEUE_DROP_CTRL(queue, dp));
+
+	/* the egress drop stage has to look at the egress queue, not at the ingress port */
+	sw_w32_mask(RTL930X_FC_REF_RXCNGST, 0, RTL930X_FC_PORT_EGR_DROP_CTRL(port));
+	sw_w32_mask(0, BIT(port), RTL930X_SWRED_PORT_CTRL);
+
+	priv->red_cfg = cfg;
+	priv->red_ports |= BIT_ULL(port);
+
+	return 0;
+}
+
+void rtldsa_930x_red_disable(struct rtl838x_switch_priv *priv, int port)
+{
+	if (!(priv->red_ports & BIT_ULL(port)))
+		return;
+
+	sw_w32_mask(BIT(port), 0, RTL930X_SWRED_PORT_CTRL);
+	sw_w32_mask(0, RTL930X_FC_REF_RXCNGST, RTL930X_FC_PORT_EGR_DROP_CTRL(port));
+
+	priv->red_ports &= ~BIT_ULL(port);
 }
