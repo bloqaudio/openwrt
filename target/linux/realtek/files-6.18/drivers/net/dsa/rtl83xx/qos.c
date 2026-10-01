@@ -2,6 +2,8 @@
 
 #include <net/dsa.h>
 #include <linux/delay.h>
+#include <net/pkt_cls.h>
+#include <net/pkt_sched.h>
 #include <asm/mach-rtl-otto/mach-rtl-otto.h>
 
 #include "qos.h"
@@ -585,4 +587,65 @@ void rtldsa_931x_qos_init(struct rtl838x_switch_priv *priv)
 
 	rtldsa_931x_qos_setup_default_dscp2queue_map();
 	rtldsa_931x_qos_set_scheduling_queue_weights(priv);
+}
+
+/* A qdisc that replaces another one is set up before the old one is destroyed, so the
+ * offload remembers the handle of its qdisc and only that qdisc can take it away again.
+ */
+static int rtldsa_setup_qdisc_red(struct rtl838x_switch_priv *priv, int port,
+				  struct tc_red_qopt_offload *qopt)
+{
+	struct rtldsa_port *p = &priv->ports[port];
+	int ret = 0;
+
+	if (!priv->r->red_enable || qopt->parent != TC_H_ROOT)
+		return -EOPNOTSUPP;
+
+	mutex_lock(&priv->reg_mutex);
+
+	switch (qopt->command) {
+	case TC_RED_REPLACE:
+		if (qopt->set.is_ecn)
+			ret = -EOPNOTSUPP;
+		else
+			ret = priv->r->red_enable(priv, port, &qopt->set);
+
+		if (ret)
+			priv->r->red_disable(priv, port);
+
+		p->red_handle = ret ? 0 : qopt->handle;
+		break;
+	case TC_RED_DESTROY:
+		if (p->red_handle != qopt->handle)
+			break;
+
+		priv->r->red_disable(priv, port);
+		p->red_handle = 0;
+		break;
+	case TC_RED_STATS:
+	case TC_RED_XSTATS:
+		if (!(priv->red_ports & BIT_ULL(port)) || p->red_handle != qopt->handle)
+			ret = -EOPNOTSUPP;
+		break;
+	default:
+		ret = -EOPNOTSUPP;
+		break;
+	}
+
+	mutex_unlock(&priv->reg_mutex);
+
+	return ret;
+}
+
+int rtldsa_port_setup_tc(struct dsa_switch *ds, int port, enum tc_setup_type type,
+			 void *type_data)
+{
+	struct rtl838x_switch_priv *priv = ds->priv;
+
+	switch (type) {
+	case TC_SETUP_QDISC_RED:
+		return rtldsa_setup_qdisc_red(priv, port, type_data);
+	default:
+		return -EOPNOTSUPP;
+	}
 }
