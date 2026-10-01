@@ -552,7 +552,7 @@ static void rtldsa_931x_qos_set_scheduling_queue_weights(struct rtl838x_switch_p
 
 	dsa_switch_for_each_user_port(dp, priv->ds) {
 		for (int q = 0; q < 8; q++) {
-			if (dp->index < 51)
+			if (dp->index < 52)
 				addr = RTL931X_SCHED_PORT_Q_CTRL_SET0(dp->index, q);
 			else
 				addr = RTL931X_SCHED_PORT_Q_CTRL_SET1(dp->index, q);
