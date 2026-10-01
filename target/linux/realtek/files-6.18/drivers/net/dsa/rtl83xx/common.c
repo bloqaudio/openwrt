@@ -725,6 +725,9 @@ static int rtl83xx_sw_probe(struct platform_device *pdev)
 
 	rtl83xx_get_l2aging(priv);
 
+	if (priv->r->flowctrl_init)
+		priv->r->flowctrl_init(priv);
+
 	if (priv->r->qos_init)
 		priv->r->qos_init(priv);
 
