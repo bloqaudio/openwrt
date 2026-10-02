@@ -229,8 +229,19 @@ struct rteth_dsa_tag {
 	u16			port;
 	u8			l2_offloaded;
 	u8			prio;
+	u8			sflow;
 	bool			crc_error;
 };
+
+struct rteth_skb_cb {
+	u8			sflow;
+	u16			port;
+};
+
+#define RTETH_SKB_CB(skb)	((struct rteth_skb_cb *)(skb)->cb)
+#define RTETH_930X_SFLOW_RX	1
+
+void rtldsa_sample_rx(struct net_device *conduit, int port, struct sk_buff *skb);
 
 struct rteth_frag {
 	/* hardware header part as required by SoC */
