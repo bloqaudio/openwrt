@@ -847,6 +847,8 @@ struct rtldsa_port {
 	bool qinq:1;
 	bool rate_police_egress:1;
 	bool rate_police_ingress:1;
+	bool tbf_root:1;
+	u8 tbf_queues;
 	unsigned long cached_flags;
 	u64 pm;
 	u16 pvid;
@@ -1239,6 +1241,8 @@ struct rtldsa_config {
 			  const struct tc_red_qopt_offload_params *p);
 	void (*red_disable)(struct rtl838x_switch_priv *priv, int port);
 	void (*queue_sched_set)(int port, int queue, u32 weight, bool strict);
+	int (*egress_shaper_set)(struct rtl838x_switch_priv *priv, int port, int queue,
+				 u64 rate_bytes_ps, u32 burst);
 	void (*qos_init)(struct rtl838x_switch_priv *priv);
 	int (*trk_mbr_ctr)(int group);
 	void (*lag_switch_init)(struct rtl838x_switch_priv *priv);
