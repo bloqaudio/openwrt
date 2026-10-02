@@ -29,6 +29,8 @@
  *      value/mask = 3 << ((port & 0xF) << 1)
  */
 
+#define MAX_PRIOS 8
+
 typedef enum {
 	BPDU = 0,
 	PTP,
@@ -87,6 +89,7 @@ struct rtldsa_port {
 	bool rate_police_ingress:1;
 	u32 ets_handle;
 	u32 red_handle;
+	u32 tbf_handle[MAX_PRIOS + 1];
 	unsigned long cached_flags;
 	u64 pm;
 	u16 pvid;
@@ -477,6 +480,8 @@ struct rtldsa_config {
 			  const struct tc_red_qopt_offload_params *p);
 	void (*red_disable)(struct rtl838x_switch_priv *priv, int port);
 	void (*queue_sched_set)(int port, int queue, u32 weight, bool strict);
+	int (*egress_shaper_set)(struct rtl838x_switch_priv *priv, int port, int queue,
+				 u64 rate_bytes_ps, u32 burst);
 	void (*qos_init)(struct rtl838x_switch_priv *priv);
 	int (*trk_mbr_ctr)(int group);
 	void (*lag_switch_init)(struct rtl838x_switch_priv *priv);
