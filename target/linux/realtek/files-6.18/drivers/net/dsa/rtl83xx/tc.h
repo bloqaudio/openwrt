@@ -26,6 +26,8 @@ int rtldsa_930x_port_rate_police_add(struct dsa_switch *ds, int port,
 int rtldsa_930x_port_rate_police_del(struct dsa_switch *ds, int port,
 				     struct flow_cls_offload *cls,
 				     bool ingress);
+int rtldsa_930x_egress_shaper_set(struct rtl838x_switch_priv *priv, int port, int queue,
+				  u64 rate_bytes_ps, u32 burst);
 int rtldsa_931x_port_rate_police_add(struct dsa_switch *ds, int port,
 				     const struct flow_action_entry *act,
 				     bool ingress);
