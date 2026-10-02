@@ -225,20 +225,12 @@ static bool rteth_839x_decode_tag(struct rteth_frag *frag, struct rteth_dsa_tag 
 	return t->l2_offloaded;
 }
 
-static bool rteth_93xx_decode_tag(struct rteth_frag *frag, struct rteth_dsa_tag *t);
-
-static bool rteth_930x_decode_tag(struct rteth_frag *frag, struct rteth_dsa_tag *t)
-{
-	t->sflow = (frag->cpu_tag[4] >> 10) & 0x3;
-
-	return rteth_93xx_decode_tag(frag, t);
-}
-
 static bool rteth_93xx_decode_tag(struct rteth_frag *frag, struct rteth_dsa_tag *t)
 {
 	t->port = (frag->cpu_tag[0] >> 8) & 0x3f;
 	t->queue = (frag->cpu_tag[2] >> 11) & 0x1f;
 	t->reason = frag->cpu_tag[7] & 0x3f;
+	t->sflow = (frag->cpu_tag[4] >> 10) & 0x3;
 	t->crc_error = frag->cpu_tag[1] & BIT(6);
 	t->l2_offloaded = (t->reason >= 19 && t->reason <= 28) || t->reason == 55 ? 0 : 1;
 
@@ -1329,7 +1321,7 @@ static int rteth_hw_receive(struct net_device *dev, int ring, int budget)
 				pskb_trim(skb, skb->len - ETH_FCS_LEN);
 				if (IS_BUILTIN(CONFIG_PSAMPLE) &&
 				    IS_ENABLED(CONFIG_NET_DSA_RTL83XX) &&
-				    RTETH_SKB_CB(skb)->sflow == RTETH_930X_SFLOW_RX)
+				    RTETH_SKB_CB(skb)->sflow == RTETH_93XX_SFLOW_RX)
 					rtldsa_sample_rx(dev, RTETH_SKB_CB(skb)->port, skb);
 				rteth_free_skb(&skb);
 			} else {
@@ -1696,7 +1688,7 @@ static const struct rteth_cfg rteth_930x_cfg = {
 	.enable_rx_irq		= rteth_93xx_enable_rx_irq,
 	.update_counter		= rteth_93xx_update_counter,
 	.create_tx_header	= rteth_93xx_create_tx_header,
-	.decode_tag		= rteth_930x_decode_tag,
+	.decode_tag		= rteth_93xx_decode_tag,
 	.hw_en_rxtx		= rteth_930x_hw_en_rxtx,
 	.hw_init		= rteth_930x_hw_init,
 	.hw_stop		= rteth_930x_hw_stop,
