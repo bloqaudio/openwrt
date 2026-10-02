@@ -18,6 +18,7 @@ void rtldsa_838x_qos_init(struct rtl838x_switch_priv *priv);
 void rtldsa_839x_qos_init(struct rtl838x_switch_priv *priv);
 void rtldsa_930x_qos_init(struct rtl838x_switch_priv *priv);
 void rtldsa_931x_qos_init(struct rtl838x_switch_priv *priv);
+void rtldsa_930x_queue_sched_set(int port, int queue, u32 weight, bool strict);
 
 int rtldsa_port_setup_tc(struct dsa_switch *ds, int port, enum tc_setup_type type,
 			 void *type_data);
