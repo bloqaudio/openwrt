@@ -11,7 +11,8 @@
 #include "rtl-otto.h"
 
 #define RTL930X_SCHED_Q_STRICT			BIT(7)
-#define RTL930X_SCHED_Q_WEIGHT			GENMASK(6, 0)
+#define RTL931X_SCHED_Q_STRICT			BIT(8)
+#define RTL93XX_SCHED_Q_WEIGHT			GENMASK(6, 0)
 
 enum scheduler_type {
 	WEIGHTED_FAIR_QUEUE = 0,
@@ -427,7 +428,7 @@ static void rtldsa_930x_qos_prio2queue_matrix(int *min_queues)
 
 void rtldsa_930x_queue_sched_set(int port, int queue, u32 weight, bool strict)
 {
-	u32 v = FIELD_PREP(RTL930X_SCHED_Q_WEIGHT, weight) | (strict ? RTL930X_SCHED_Q_STRICT : 0);
+	u32 v = FIELD_PREP(RTL93XX_SCHED_Q_WEIGHT, weight) | (strict ? RTL930X_SCHED_Q_STRICT : 0);
 
 	if (port < 24)
 		sw_w32(v, RTL930X_SCHED_PORT_Q_CTRL_SET0(port, queue));
@@ -499,21 +500,24 @@ static void rtldsa_931x_qos_prio2queue_matrix(int *min_queues)
 	sw_w32(v, RTL931X_QM_INTPRI2QID_CTRL);
 }
 
+void rtldsa_931x_queue_sched_set(int port, int queue, u32 weight, bool strict)
+{
+	u32 v = FIELD_PREP(RTL93XX_SCHED_Q_WEIGHT, weight) | (strict ? RTL931X_SCHED_Q_STRICT : 0);
+
+	if (port < 52)
+		sw_w32(v, RTL931X_SCHED_PORT_Q_CTRL_SET0(port, queue));
+	else
+		sw_w32(v, RTL931X_SCHED_PORT_Q_CTRL_SET1(port, queue));
+}
+
 static void rtldsa_931x_qos_set_scheduling_queue_weights(struct rtl838x_switch_priv *priv)
 {
 	struct dsa_port *dp;
-	u32 addr;
 
-	dsa_switch_for_each_user_port(dp, priv->ds) {
-		for (int q = 0; q < 8; q++) {
-			if (dp->index < 52)
-				addr = RTL931X_SCHED_PORT_Q_CTRL_SET0(dp->index, q);
-			else
-				addr = RTL931X_SCHED_PORT_Q_CTRL_SET1(dp->index, q);
-
-			sw_w32(rtldsa_default_queue_weights[q], addr);
-		}
-	}
+	dsa_switch_for_each_user_port(dp, priv->ds)
+		for (int q = 0; q < MAX_PRIOS; q++)
+			rtldsa_931x_queue_sched_set(dp->index, q, rtldsa_default_queue_weights[q],
+						    false);
 }
 
 void rtldsa_931x_qos_init(struct rtl838x_switch_priv *priv)
@@ -792,7 +796,7 @@ static int rtldsa_setup_qdisc_ets(struct rtl838x_switch_priv *priv, int port,
 			offload = p->priomap[MAX_PRIOS - 1 - band] == band &&
 				  (!p->quanta[band] ||
 				   (p->weights[band] &&
-				    p->weights[band] <= FIELD_MAX(RTL930X_SCHED_Q_WEIGHT)));
+				    p->weights[band] <= FIELD_MAX(RTL93XX_SCHED_Q_WEIGHT)));
 		break;
 	case TC_ETS_DESTROY:
 		if (pp->ets_handle != qopt->handle)
