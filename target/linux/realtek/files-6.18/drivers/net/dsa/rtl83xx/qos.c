@@ -749,6 +749,7 @@ static int rtldsa_setup_qdisc_ets(struct rtl838x_switch_priv *priv, int port,
 	struct tc_ets_qopt_offload_replace_params *p = &qopt->replace_params;
 	struct rtldsa_port *pp = &priv->ports[port];
 	bool offload = false;
+	int queue;
 
 	if (!priv->r->queue_sched_set || qopt->parent != TC_H_ROOT)
 		return -EOPNOTSUPP;
@@ -766,6 +767,17 @@ static int rtldsa_setup_qdisc_ets(struct rtl838x_switch_priv *priv, int port,
 		break;
 	case TC_ETS_STATS:
 		return (priv->ets_ports & BIT_ULL(port)) ? 0 : -EOPNOTSUPP;
+	case TC_ETS_GRAFT:
+		queue = MAX_PRIOS - 1 - qopt->graft_params.band;
+		if (!pp->ets_handle || queue < 0)
+			return -EOPNOTSUPP;
+
+		/* the default child, or one that took the queue when it was created */
+		if (!qopt->graft_params.child_handle || pp->tbf_queues & BIT(queue) ||
+		    (priv->red_ports & BIT_ULL(port) && pp->red_cfg[queue]))
+			return 0;
+
+		return -EOPNOTSUPP;
 	default:
 		return -EOPNOTSUPP;
 	}
@@ -773,7 +785,7 @@ static int rtldsa_setup_qdisc_ets(struct rtl838x_switch_priv *priv, int port,
 	mutex_lock(&priv->reg_mutex);
 
 	for (int band = 0; band < MAX_PRIOS; band++) {
-		int queue = MAX_PRIOS - 1 - band;
+		queue = MAX_PRIOS - 1 - band;
 
 		if (!offload)
 			priv->r->queue_sched_set(port, queue, rtldsa_default_queue_weights[queue],
