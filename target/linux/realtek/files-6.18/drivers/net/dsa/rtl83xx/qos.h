@@ -26,6 +26,8 @@ int rtldsa_port_set_default_prio(struct dsa_switch *ds, int port, u8 prio);
 int rtldsa_port_get_dscp_prio(struct dsa_switch *ds, int port, u8 dscp);
 int rtldsa_port_add_dscp_prio(struct dsa_switch *ds, int port, u8 dscp, u8 prio);
 int rtldsa_port_del_dscp_prio(struct dsa_switch *ds, int port, u8 dscp, u8 prio);
+int rtldsa_port_get_apptrust(struct dsa_switch *ds, int port, u8 *sel, int *nsel);
+int rtldsa_port_set_apptrust(struct dsa_switch *ds, int port, const u8 *sel, int nsel);
 
 int rtldsa_port_setup_tc(struct dsa_switch *ds, int port, enum tc_setup_type type,
 			 void *type_data);

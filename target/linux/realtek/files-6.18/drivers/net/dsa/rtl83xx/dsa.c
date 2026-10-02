@@ -1615,4 +1615,6 @@ const struct dsa_switch_ops rtldsa_93xx_switch_ops = {
 	.port_get_dscp_prio	= rtldsa_port_get_dscp_prio,
 	.port_add_dscp_prio	= rtldsa_port_add_dscp_prio,
 	.port_del_dscp_prio	= rtldsa_port_del_dscp_prio,
+	.port_get_apptrust	= rtldsa_port_get_apptrust,
+	.port_set_apptrust	= rtldsa_port_set_apptrust,
 };
