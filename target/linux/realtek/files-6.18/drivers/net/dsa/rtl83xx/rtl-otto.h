@@ -97,6 +97,8 @@ struct rtldsa_red {
 	bool offloaded;
 };
 
+struct psample_group;
+
 enum rtldsa_storm_type {
 	RTLDSA_STORM_BROADCAST,
 	RTLDSA_STORM_MULTICAST,
@@ -114,6 +116,10 @@ struct rtldsa_port {
 	unsigned long rate_police_egress;
 	unsigned long rate_police_ingress;
 	unsigned long storm_police[RTLDSA_STORM_TYPES];
+	unsigned long sample_cookie;
+	struct psample_group __rcu *sample_group;
+	u32 sample_rate;
+	u32 sample_trunc;
 	u32 ets_handle;
 	u16 ets_children;
 	bool ets_offloadable;
@@ -534,6 +540,7 @@ struct rtldsa_config {
 	int (*egress_shaper_set)(struct otto_dsa_priv *priv, int port, int queue,
 				 u64 rate_bytes_ps, u32 burst);
 	int (*storm_set)(int port, enum rtldsa_storm_type type, u64 rate_pkt_ps, u32 burst_pkt);
+	int (*sample_set)(int port, u32 rate);
 	void (*qos_init)(struct otto_dsa_priv *priv);
 	int (*trk_mbr_ctr)(int group);
 	void (*lag_switch_init)(struct otto_dsa_priv *priv);

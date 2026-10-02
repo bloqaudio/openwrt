@@ -700,6 +700,7 @@ const struct rtldsa_config rtldsa_930x_cfg = {
 	.red_set = rtldsa_930x_red_set,
 	.egress_shaper_set = otto_tc_930x_egress_shaper_set,
 	.storm_set = otto_tc_930x_storm_set,
+	.sample_set = otto_tc_930x_sample_set,
 	.qos_init = otto_qos_930x_init,
 	.pri_sel_port_pri = RTL930X_PRI_SEL_PORT_PRI(0),
 	.pri_sel_remap_dscp = RTL930X_REMAP_DSCP(0),
