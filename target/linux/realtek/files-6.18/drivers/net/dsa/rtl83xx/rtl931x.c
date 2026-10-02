@@ -40,6 +40,8 @@
 #define RTL931X_FORCE_EN			BIT(9)
 #define RTL931X_FORCE_LINK_EN			BIT(0)
 
+#define RTL931X_PRI_SEL_PORT_PRI(p)		(0x900C + (((p) / 10) * 4))
+
 #define RTL931X_TRK_HASH_CTRL			(0xBA70)
 #define RTL931X_TRK_CTRL			(0xBA78)
 
@@ -514,6 +516,9 @@ const struct rtldsa_config rtldsa_931x_cfg = {
 	.queue_sched_set = rtldsa_931x_queue_sched_set,
 	.egress_shaper_set = rtldsa_931x_egress_shaper_set,
 	.qos_init = rtldsa_931x_qos_init,
+	.pri_sel_port_pri = RTL931X_PRI_SEL_PORT_PRI(0),
+	.pri_sel_remap_dscp = RTL931X_REMAP_DSCP(0),
+	.pri_sel_port_tbl_idx = RTL931X_PORT_TBL_IDX_CTRL(0),
 	.trk_ctrl = RTL931X_TRK_CTRL,
 	.trk_hash_ctrl = RTL931X_TRK_HASH_CTRL,
 	.prepare_lag_fdb = rtldsa_93xx_prepare_lag_fdb,
