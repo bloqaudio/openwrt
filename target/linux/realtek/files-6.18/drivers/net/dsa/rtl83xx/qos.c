@@ -382,20 +382,6 @@ static void rtldsa_930x_qos_set_group_selector(int port, int group)
 		    RTL930X_PORT_TBL_IDX_CTRL(port));
 }
 
-static void rtldsa_930x_qos_setup_default_dscp2queue_map(void)
-{
-	u32 queue;
-
-	/* The default mapping between dscp and queue is based on
-	 * the first 3 bits indicate the precedence (prio = dscp >> 3).
-	 */
-	for (int i = 0; i < DSCP_MAP_MAX; i++) {
-		queue = (i >> 3) << RTL93XX_REMAP_DSCP_INTPRI_DSCP_OFFSET(i);
-		sw_w32_mask(RTL93XX_REMAP_DSCP_INTPRI_DSCP_MASK(i),
-			    queue, RTL930X_REMAP_DSCP(i));
-	}
-}
-
 static void rtldsa_930x_qos_prio2queue_matrix(int *min_queues)
 {
 	u32 v = 0;
@@ -446,7 +432,6 @@ void rtldsa_930x_qos_init(struct rtl838x_switch_priv *priv)
 
 	sw_w32(v, RTL930X_PRI_SEL_TBL_CTRL(0));
 
-	rtldsa_930x_qos_setup_default_dscp2queue_map();
 	rtldsa_930x_qos_set_scheduling_queue_weights(priv);
 
 	/* queue n of a frame from the CPU is queue n of the port, which has 8 or 12 queues */
@@ -526,6 +511,101 @@ void rtldsa_931x_qos_init(struct rtl838x_switch_priv *priv)
 
 	rtldsa_931x_qos_setup_default_dscp2queue_map();
 	rtldsa_931x_qos_set_scheduling_queue_weights(priv);
+}
+
+static u32 rtldsa_qos_prio_get(int base, int index)
+{
+	return (sw_r32(base + (index / 10) * 4) >> ((index % 10) * 3)) & 0x7;
+}
+
+static void rtldsa_qos_prio_set(int base, int index, u8 prio)
+{
+	sw_w32_mask(0x7 << ((index % 10) * 3), prio << ((index % 10) * 3),
+		    base + (index / 10) * 4);
+}
+
+/* DSA reads the DSCP map when it creates the user ports, which is before qos_init() */
+void rtldsa_qos_setup(struct dsa_switch *ds)
+{
+	struct rtl838x_switch_priv *priv = ds->priv;
+
+	if (!priv->r->pri_sel_remap_dscp)
+		return;
+
+	for (int dscp = 0; dscp < DSCP_MAP_MAX; dscp++)
+		rtldsa_qos_prio_set(priv->r->pri_sel_remap_dscp, dscp, dscp >> 3);
+
+	ds->dscp_prio_mapping_is_global = true;
+}
+
+int rtldsa_port_get_default_prio(struct dsa_switch *ds, int port)
+{
+	struct rtl838x_switch_priv *priv = ds->priv;
+
+	if (!priv->r->pri_sel_port_pri)
+		return 0;
+
+	return rtldsa_qos_prio_get(priv->r->pri_sel_port_pri, port);
+}
+
+int rtldsa_port_set_default_prio(struct dsa_switch *ds, int port, u8 prio)
+{
+	struct rtl838x_switch_priv *priv = ds->priv;
+
+	if (!priv->r->pri_sel_port_pri)
+		return -EOPNOTSUPP;
+
+	if (prio >= MAX_PRIOS)
+		return -EINVAL;
+
+	mutex_lock(&priv->reg_mutex);
+	rtldsa_qos_prio_set(priv->r->pri_sel_port_pri, port, prio);
+	mutex_unlock(&priv->reg_mutex);
+
+	return 0;
+}
+
+int rtldsa_port_get_dscp_prio(struct dsa_switch *ds, int port, u8 dscp)
+{
+	struct rtl838x_switch_priv *priv = ds->priv;
+
+	if (!priv->r->pri_sel_remap_dscp)
+		return -EOPNOTSUPP;
+
+	return rtldsa_qos_prio_get(priv->r->pri_sel_remap_dscp, dscp);
+}
+
+int rtldsa_port_add_dscp_prio(struct dsa_switch *ds, int port, u8 dscp, u8 prio)
+{
+	struct rtl838x_switch_priv *priv = ds->priv;
+
+	if (!priv->r->pri_sel_remap_dscp)
+		return -EOPNOTSUPP;
+
+	if (prio >= MAX_PRIOS)
+		return -EINVAL;
+
+	mutex_lock(&priv->reg_mutex);
+	rtldsa_qos_prio_set(priv->r->pri_sel_remap_dscp, dscp, prio);
+	mutex_unlock(&priv->reg_mutex);
+
+	return 0;
+}
+
+/* The map is shared by all ports: only an entry that still holds @prio goes back to default */
+int rtldsa_port_del_dscp_prio(struct dsa_switch *ds, int port, u8 dscp, u8 prio)
+{
+	struct rtl838x_switch_priv *priv = ds->priv;
+
+	if (!priv->r->pri_sel_remap_dscp)
+		return -EOPNOTSUPP;
+
+	mutex_lock(&priv->reg_mutex);
+	if (rtldsa_qos_prio_get(priv->r->pri_sel_remap_dscp, dscp) == prio)
+		rtldsa_qos_prio_set(priv->r->pri_sel_remap_dscp, dscp, dscp >> 3);
+	mutex_unlock(&priv->reg_mutex);
+
+	return 0;
 }
 
 static int rtldsa_setup_qdisc_red(struct rtl838x_switch_priv *priv, int port,
