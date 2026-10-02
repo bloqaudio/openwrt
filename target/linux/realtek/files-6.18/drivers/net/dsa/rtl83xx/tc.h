@@ -33,6 +33,7 @@ int rtldsa_930x_egress_shaper_set(struct rtl838x_switch_priv *priv, int port, in
 int rtldsa_930x_storm_set(int port, enum rtldsa_storm_type type, u64 rate_pkt_ps, u32 burst_pkt);
 int rtldsa_930x_sample_set(int port, u32 rate);
 int rtldsa_931x_storm_set(int port, enum rtldsa_storm_type type, u64 rate_pkt_ps, u32 burst_pkt);
+int rtldsa_931x_sample_set(int port, u32 rate);
 void rtldsa_sample_rx(struct net_device *conduit, int port, struct sk_buff *skb);
 int rtldsa_931x_egress_shaper_set(struct rtl838x_switch_priv *priv, int port, int queue,
 				  u64 rate_bytes_ps, u32 burst);
