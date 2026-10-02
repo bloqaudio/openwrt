@@ -1331,9 +1331,9 @@ static void otto_tc_red_apply(struct otto_dsa_priv *priv, int port, int queue, b
 	bool offload = allowed && red->handle && !red->params.is_ecn && !red->child;
 
 	if (offload)
-		offload = !priv->r->red_set(priv, port, queue, &red->params);
+		offload = !rtldsa_red_set(priv, port, queue, &red->params);
 	if (!offload && red->offloaded && (queue < 0 || !pp->red.handle))
-		priv->r->red_set(priv, port, queue, NULL);
+		rtldsa_red_set(priv, port, queue, NULL);
 
 	red->offloaded = offload;
 }
@@ -1456,7 +1456,7 @@ static int otto_tc_setup_qdisc_red(struct otto_dsa_priv *priv, int port,
 	struct rtldsa_red *red;
 	int queue = -1;
 
-	if (!priv->r->red_set)
+	if (!priv->r->red_port_set)
 		return -EOPNOTSUPP;
 
 	if (qopt->parent == TC_H_ROOT) {

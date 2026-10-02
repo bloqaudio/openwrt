@@ -76,6 +76,10 @@
 #define RTL930X_FC_GLB_THR_OFF_MASK		GENMASK(11, 0)
 
 #define DSCP_MAP_MAX 64
+#define RTLDSA_RED_PAGE_SIZE			256
+#define RTLDSA_RED_RATE_SCALE			1023
+#define RTLDSA_RED_RATE_MAX			255
+#define RTLDSA_RED_QUEUES			12
 
 enum scheduler_type {
 	WEIGHTED_FAIR_QUEUE = 0,
@@ -804,4 +808,81 @@ int rtldsa_port_set_apptrust(struct dsa_switch *ds, int port, const u8 *sel, int
 	}
 
 	return -EOPNOTSUPP;
+}
+
+/* The thresholds are one table of queues for the whole switch and a port has RED on all
+ * its queues or on none, so the ports with RED must all want the same table.
+ */
+static int rtldsa_red_apply(struct otto_dsa_priv *priv, int port)
+{
+	struct rtldsa_red_cfg *wanted = priv->ports[port].red_cfg;
+	bool any = false;
+	int ret = 0;
+
+	for (int queue = 0; queue < MAX_PRIOS; queue++)
+		any |= wanted[queue].max;
+
+	if (!any)
+		goto disable;
+
+	if (priv->red_ports & ~BIT_ULL(port)) {
+		if (memcmp(wanted, priv->red_cfg, sizeof(priv->red_cfg))) {
+			dev_warn(priv->dev, "port %d: RED differs from the one in use\n", port);
+			ret = -EBUSY;
+			goto disable;
+		}
+	} else {
+		for (int queue = 0; queue < RTLDSA_RED_QUEUES; queue++)
+			priv->r->red_queue_set(queue, queue < MAX_PRIOS && wanted[queue].max ?
+						      &wanted[queue] : NULL);
+
+		memcpy(priv->red_cfg, wanted, sizeof(priv->red_cfg));
+	}
+
+	priv->r->red_port_set(port, true);
+	priv->red_ports |= BIT_ULL(port);
+
+	return 0;
+
+disable:
+	if (priv->red_ports & BIT_ULL(port)) {
+		priv->r->red_port_set(port, false);
+		priv->red_ports &= ~BIT_ULL(port);
+	}
+
+	return ret;
+}
+
+/* A negative @queue stands for all queues of the port, no @p for no RED */
+int rtldsa_red_set(struct otto_dsa_priv *priv, int port, int queue,
+		   const struct tc_red_qopt_offload_params *p)
+{
+	struct rtldsa_red_cfg *wanted = priv->ports[port].red_cfg;
+	struct rtldsa_red_cfg cfg = {};
+	int ret, err = 0;
+
+	if (p) {
+		u32 min = DIV_ROUND_UP(p->min, RTLDSA_RED_PAGE_SIZE);
+		u32 max = p->max / RTLDSA_RED_PAGE_SIZE;
+		u64 rate = ((u64)p->probability * RTLDSA_RED_RATE_SCALE + U32_MAX) >> 32;
+
+		if (!min || min >= max || max > priv->r->red_max_thr ||
+		    !rate || rate > RTLDSA_RED_RATE_MAX) {
+			err = -EINVAL;
+		} else {
+			cfg.min = min;
+			cfg.max = max;
+			cfg.rate = rate;
+		}
+	}
+
+	for (int i = 0; i < MAX_PRIOS; i++)
+		if (queue < 0 || queue == i)
+			wanted[i] = cfg;
+
+	ret = rtldsa_red_apply(priv, port);
+	if (ret && cfg.max)
+		rtldsa_red_set(priv, port, queue, NULL);
+
+	return err ?: ret;
 }
