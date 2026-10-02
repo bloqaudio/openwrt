@@ -67,6 +67,8 @@
 
 #define RTL930X_QM_INTPRI2QID_CTRL		(0xA320)
 #define RTL931X_QM_INTPRI2QID_CTRL		(0xA9D0)
+#define RTL931X_QM_CPUQID2QID_CTRL		(0xA9D4)
+#define RTL931X_QM_CPUQID2XGSQID_CTRL		(0xA9E4)
 
 #define RTL930X_FC_GLB_HI_THR			(0xD880)
 #define RTL930X_FC_GLB_LO_THR			(0xD884)
@@ -663,6 +665,11 @@ void otto_qos_931x_init(struct otto_dsa_priv *priv)
 
 	otto_qos_931x_setup_default_dscp2queue_map(priv);
 	otto_qos_931x_set_scheduling_queue_weights(priv);
+
+	/* queue n of a frame from the CPU is queue n of the port, which has 8 or 12 queues */
+	sw_w32(0x00fac688, RTL931X_QM_CPUQID2QID_CTRL);
+	sw_w32(0x76543210, RTL931X_QM_CPUQID2XGSQID_CTRL);
+	sw_w32(0x0000ba98, RTL931X_QM_CPUQID2XGSQID_CTRL + 4);
 }
 
 static u32 rtldsa_qos_prio_get(int base, int index)
