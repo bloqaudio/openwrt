@@ -45,6 +45,8 @@
 
 #define RTL930X_EEE_CTRL(p)			(0x3274 + ((p) << 6))
 
+#define RTL930X_PRI_SEL_PORT_PRI(p)		(0x9AE8 + (((p) / 10) * 4))
+
 #define RTL930X_TRK_HASH_CTRL			(0x9F80)
 #define RTL930X_TRK_CTRL			(0x9F88)
 
@@ -703,6 +705,8 @@ const struct rtldsa_config rtldsa_930x_cfg = {
 	.queue_sched_set = rtldsa_930x_queue_sched_set,
 	.egress_shaper_set = rtldsa_930x_egress_shaper_set,
 	.qos_init = rtldsa_930x_qos_init,
+	.pri_sel_port_pri = RTL930X_PRI_SEL_PORT_PRI(0),
+	.pri_sel_remap_dscp = RTL930X_REMAP_DSCP(0),
 	.trk_ctrl = RTL930X_TRK_CTRL,
 	.trk_hash_ctrl = RTL930X_TRK_HASH_CTRL,
 	.prepare_lag_fdb = rtldsa_93xx_prepare_lag_fdb,
