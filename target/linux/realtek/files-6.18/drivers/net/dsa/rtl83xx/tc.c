@@ -46,6 +46,19 @@ struct rtl83xx_flow {
 #define RTL930X_INGRESS_FC_CTRL(port)		(0x81CC + ((port / 29) * 4))
 #define RTL930X_INGRESS_FC_CTRL_EN(port)	BIT(port % 29)
 
+#define RTL930X_STORM_PORT_CTRL			0x8A6C
+#define RTL930X_STORM_PORT_UC_CTRL(port)	(0x8A70 + ((port) * 8))
+#define RTL930X_STORM_PORT_UC_LB_RST		0x8B58
+#define RTL930X_STORM_PORT_MC_CTRL(port)	(0x8B60 + ((port) * 8))
+#define RTL930X_STORM_PORT_MC_LB_RST		0x8C48
+#define RTL930X_STORM_PORT_BC_CTRL(port)	(0x8C50 + ((port) * 8))
+#define RTL930X_STORM_PORT_BC_LB_RST		0x8D38
+#define RTL930X_STORM_KNOWN			BIT(25)
+#define RTL930X_STORM_ENABLE			BIT(24)
+#define RTL930X_STORM_RATE			GENMASK(23, 0)
+#define RTL930X_STORM_BURST			GENMASK(15, 0)
+#define RTL930X_STORM_RATE_PKTS			1014
+
 /* Parse the flow rule for the matching conditions */
 static int rtl83xx_parse_flow_rule(struct rtl838x_switch_priv *priv,
 				   struct flow_rule *rule, struct rtl83xx_flow *flow)
@@ -675,6 +688,34 @@ static bool rtldsa_flower_uses_only(struct flow_cls_offload *cls, u64 keys)
 	return true;
 }
 
+static int rtldsa_flower_storm_type(struct flow_cls_offload *cls,
+				    const struct flow_action_entry *act)
+{
+	struct flow_rule *rule = flow_cls_offload_flow_rule(cls);
+	struct flow_match_eth_addrs eth;
+
+	if (!act || !act->police.rate_pkt_ps || act->police.rate_bytes_ps ||
+	    act->police.exceed.act_id != FLOW_ACTION_DROP ||
+	    act->police.notexceed.act_id != FLOW_ACTION_ACCEPT)
+		return -EOPNOTSUPP;
+
+	if (!rtldsa_flower_uses_only(cls, BIT_ULL(FLOW_DISSECTOR_KEY_ETH_ADDRS)) ||
+	    !flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_ETH_ADDRS))
+		return -EOPNOTSUPP;
+
+	flow_rule_match_eth_addrs(rule, &eth);
+	if (!is_zero_ether_addr(eth.mask->src) || !ether_addr_equal(eth.key->dst, eth.mask->dst))
+		return -EOPNOTSUPP;
+
+	if (is_broadcast_ether_addr(eth.mask->dst))
+		return RTLDSA_STORM_BROADCAST;
+
+	if (ether_addr_equal(eth.mask->dst, (const u8 []){ 0x01, 0, 0, 0, 0, 0 }))
+		return RTLDSA_STORM_MULTICAST;
+
+	return -EOPNOTSUPP;
+}
+
 static bool rtldsa_port_rate_police_validate(const struct flow_action_entry *act)
 {
 	if (!act)
@@ -796,6 +837,43 @@ int rtldsa_930x_egress_shaper_set(struct rtl838x_switch_priv *priv, int port, in
 	return 0;
 }
 
+/* A unit of the rate is 1.014 frames per second. Unicast and multicast count only the
+ * frames with an unknown address unless told otherwise.
+ */
+int rtldsa_930x_storm_set(int port, enum rtldsa_storm_type type, u64 rate_pkt_ps, u32 burst_pkt)
+{
+	static const struct {
+		u32 ctrl;
+		u32 reset;
+	} regs[RTLDSA_STORM_TYPES] = {
+		[RTLDSA_STORM_BROADCAST] = { RTL930X_STORM_PORT_BC_CTRL(0),
+					     RTL930X_STORM_PORT_BC_LB_RST },
+		[RTLDSA_STORM_MULTICAST] = { RTL930X_STORM_PORT_MC_CTRL(0),
+					     RTL930X_STORM_PORT_MC_LB_RST },
+		[RTLDSA_STORM_UNICAST] = { RTL930X_STORM_PORT_UC_CTRL(0),
+					   RTL930X_STORM_PORT_UC_LB_RST },
+	};
+	u64 rate = DIV_ROUND_CLOSEST_ULL(rate_pkt_ps * 1000, RTL930X_STORM_RATE_PKTS);
+	u32 ctrl = regs[type].ctrl + port * 8;
+
+	if (!rate_pkt_ps) {
+		sw_w32_mask(RTL930X_STORM_ENABLE, 0, ctrl);
+		return 0;
+	}
+
+	if (!rate || rate > FIELD_MAX(RTL930X_STORM_RATE))
+		return -EINVAL;
+
+	/* count frames, not bytes */
+	sw_w32_mask(BIT(port), 0, RTL930X_STORM_PORT_CTRL);
+	sw_w32(clamp_t(u32, burst_pkt, 1, FIELD_MAX(RTL930X_STORM_BURST)), ctrl + 4);
+	sw_w32(RTL930X_STORM_ENABLE | rate |
+	       (type == RTLDSA_STORM_MULTICAST ? RTL930X_STORM_KNOWN : 0), ctrl);
+	sw_w32(BIT(port), regs[type].reset);
+
+	return 0;
+}
+
 int rtldsa_931x_port_rate_police_add(struct dsa_switch *ds, int port,
 				     const struct flow_action_entry *act,
 				     bool ingress)
@@ -844,10 +922,28 @@ int rtldsa_cls_flower_add(struct dsa_switch *ds, int port,
 	struct rtl838x_switch_priv *priv = ds->priv;
 	struct rtldsa_port *p = &priv->ports[port];
 	const struct flow_action_entry *act;
-	int ret;
+	int ret, storm;
 
 	/* a single rate/bandwidth limiter action on all frames is handled as port policing */
 	act = rtldsa_rate_policy_extract(cls);
+
+	storm = ingress && priv->r->storm_set ? rtldsa_flower_storm_type(cls, act) : -EOPNOTSUPP;
+	if (storm >= 0) {
+		mutex_lock(&priv->reg_mutex);
+
+		if (p->storm_police[storm])
+			ret = -EBUSY;
+		else
+			ret = priv->r->storm_set(port, storm, act->police.rate_pkt_ps,
+						 act->police.burst_pkt);
+
+		if (!ret)
+			p->storm_police[storm] = cls->cookie;
+
+		mutex_unlock(&priv->reg_mutex);
+
+		return ret;
+	}
 
 	/* everything else is offloaded to the PIE engine */
 	if (!rtldsa_port_rate_police_validate(act) || !rtldsa_flower_uses_only(cls, 0))
@@ -900,10 +996,21 @@ int rtldsa_cls_flower_del(struct dsa_switch *ds, int port,
 			return ret;
 	}
 
-	if (!priv->r->port_rate_police_del)
-		return -EOPNOTSUPP;
-
 	mutex_lock(&priv->reg_mutex);
+
+	for (int type = 0; ingress && type < RTLDSA_STORM_TYPES; type++) {
+		if (p->storm_police[type] != cls->cookie)
+			continue;
+
+		ret = priv->r->storm_set(port, type, 0, 0);
+		p->storm_police[type] = 0;
+		goto unlock;
+	}
+
+	if (!priv->r->port_rate_police_del) {
+		ret = -EOPNOTSUPP;
+		goto unlock;
+	}
 
 	if ((ingress ? p->rate_police_ingress : p->rate_police_egress) != cls->cookie) {
 		ret = -ENOENT;

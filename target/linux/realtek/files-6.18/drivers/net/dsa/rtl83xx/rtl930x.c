@@ -745,6 +745,7 @@ const struct rtldsa_config rtldsa_930x_cfg = {
 	.red_set = rtldsa_930x_red_set,
 	.queue_sched_set = rtldsa_930x_queue_sched_set,
 	.egress_shaper_set = rtldsa_930x_egress_shaper_set,
+	.storm_set = rtldsa_930x_storm_set,
 	.qos_init = rtldsa_930x_qos_init,
 	.pri_sel_port_pri = RTL930X_PRI_SEL_PORT_PRI(0),
 	.pri_sel_remap_dscp = RTL930X_REMAP_DSCP(0),
