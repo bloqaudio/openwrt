@@ -599,20 +599,6 @@ static void otto_qos_931x_set_group_selector(struct otto_dsa_priv *priv, int por
 			  RTL93XX_PORT_TBL_IDX_CTRL_IDX_MASK(port) | val, val);
 }
 
-static void otto_qos_931x_setup_default_dscp2queue_map(struct otto_dsa_priv *priv)
-{
-	u32 queue;
-
-	/* The default mapping between dscp and queue is based on
-	 * the first 3 bits indicate the precedence (prio = dscp >> 3).
-	 */
-	for (int i = 0; i < DSCP_MAP_MAX; i++) {
-		queue = (i >> 3) << RTL93XX_REMAP_DSCP_INTPRI_DSCP_OFFSET(i);
-		regmap_write_bits(priv->map, RTL931X_REMAP_DSCP(i),
-				  RTL93XX_REMAP_DSCP_INTPRI_DSCP_MASK(i), queue);
-	}
-}
-
 static void otto_qos_931x_prio2queue_matrix(struct otto_dsa_priv *priv, int *min_queues)
 {
 	u32 v = 0;
@@ -645,7 +631,6 @@ static void otto_qos_931x_set_scheduling_queue_weights(struct otto_dsa_priv *pri
 void otto_qos_931x_init(struct otto_dsa_priv *priv)
 {
 	struct dsa_port *dp;
-	u32 v;
 
 	/* Assign all the ports to the Group-0 */
 	dsa_switch_for_each_user_port(dp, priv->ds)
@@ -654,16 +639,12 @@ void otto_qos_931x_init(struct otto_dsa_priv *priv)
 	otto_qos_931x_prio2queue_matrix(priv, rtldsa_max_available_queue);
 
 	/* configure priority weights */
-	v = 0;
-	v |= FIELD_PREP(RTL93XX_PRI_SEL_TBL_CTRL_PORT_MASK, 3);
-	v |= FIELD_PREP(RTL93XX_PRI_SEL_TBL_CTRL_DSCP_MASK, 5);
-	v |= FIELD_PREP(RTL93XX_PRI_SEL_TBL_CTRL_ITAG_MASK, 6);
-	v |= FIELD_PREP(RTL93XX_PRI_SEL_TBL_CTRL_OTAG_MASK, 7);
+	for (int group = 0; group < ARRAY_SIZE(rtldsa_93xx_trust); group++) {
+		regmap_write(priv->map, RTL931X_PRI_SEL_TBL_CTRL(group) + 4,
+			     rtldsa_93xx_trust_weights(&rtldsa_93xx_trust[group]));
+		regmap_write(priv->map, RTL931X_PRI_SEL_TBL_CTRL(group), 0);
+	}
 
-	regmap_write(priv->map, RTL931X_PRI_SEL_TBL_CTRL(0) + 4, v);
-	regmap_write(priv->map, RTL931X_PRI_SEL_TBL_CTRL(0), 0);
-
-	otto_qos_931x_setup_default_dscp2queue_map(priv);
 	otto_qos_931x_set_scheduling_queue_weights(priv);
 
 	/* queue n of a frame from the CPU is queue n of the port, which has 8 or 12 queues */
