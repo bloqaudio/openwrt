@@ -1763,6 +1763,16 @@ static int otto_l3_fib_add_v4(struct otto_l3_ctrl *ctrl, struct fib_entry_notifi
 	if (otto_l3_fib_check_v4(ctrl, info, FIB_EVENT_ENTRY_ADD))
 		return 0;
 
+	/* Only one next hop would be programmed, so the CPU balances instead */
+	if (fib_info_num_path(info->fi) > 1) {
+		route = otto_l3_route_find(ctrl, info->tb_id, ROUTE_TYPE_IP4UC, info->dst,
+					   NULL, info->dst_len);
+		if (route)
+			otto_l3_route_teardown(ctrl, route);
+		otto_l3_route_trap(ctrl, info);
+		return 0;
+	}
+
 	port = otto_l3_port_dev_lower_find(ndev, ctrl);
 	if (port < 0) {
 		dev_err(ctrl->dev, "lower interface %s not found\n", ndev->name);
@@ -1865,10 +1875,11 @@ static int otto_l3_fib_del_v4(struct otto_l3_ctrl *ctrl, struct fib_entry_notifi
 	struct in6_addr gw;
 	struct fib_nh *nh;
 
-	/* A route through a nexthop object or without a device holds at most a
-	 * trap entry
+	/* A route through a nexthop object, without a device or with more than
+	 * one next hop holds at most a trap entry
 	 */
-	if (info->fi->nh || !fib_info_nh(info->fi, 0)->fib_nh_dev) {
+	if (info->fi->nh || !fib_info_nh(info->fi, 0)->fib_nh_dev ||
+	    fib_info_num_path(info->fi) > 1) {
 		route = otto_l3_route_find(ctrl, info->tb_id, ROUTE_TYPE_IP4UC, info->dst,
 					   NULL, info->dst_len);
 		if (route)
@@ -2003,6 +2014,10 @@ static int otto_l3_fib_notifier(struct notifier_block *this, unsigned long event
 				kfree(fib_work);
 				return notifier_from_errno(-EINVAL);
 			}
+
+			if (event != FIB_EVENT_ENTRY_DEL && fib_info_num_path(fen_info->fi) > 1)
+				NL_SET_ERR_MSG_MOD(info->extack,
+						   "ECMP route offload is not supported");
 
 			memcpy(&fib_work->fen_info, ptr, sizeof(fib_work->fen_info));
 			/* Take referece on fib_info to prevent it from being
