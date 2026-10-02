@@ -744,6 +744,7 @@ const struct rtldsa_config rtldsa_930x_cfg = {
 	.flowctrl_init = rtldsa_930x_flowctrl_init,
 	.red_enable = rtldsa_930x_red_enable,
 	.red_disable = rtldsa_930x_red_disable,
+	.queue_sched_set = rtldsa_930x_queue_sched_set,
 	.qos_init = rtldsa_930x_qos_init,
 	.trk_ctrl = RTL930X_TRK_CTRL,
 	.trk_hash_ctrl = RTL930X_TRK_HASH_CTRL,
