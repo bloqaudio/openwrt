@@ -449,6 +449,7 @@ const struct rtldsa_config rtldsa_931x_cfg = {
 	.queue_sched_set = rtldsa_931x_queue_sched_set,
 	.egress_shaper_set = rtldsa_931x_egress_shaper_set,
 	.storm_set = rtldsa_931x_storm_set,
+	.sample_set = rtldsa_931x_sample_set,
 	.qos_init = rtldsa_931x_qos_init,
 	.pri_sel_port_pri = RTL931X_PRI_SEL_PORT_PRI(0),
 	.pri_sel_remap_dscp = RTL931X_REMAP_DSCP(0),
