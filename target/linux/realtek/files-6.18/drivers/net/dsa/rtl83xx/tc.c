@@ -6,6 +6,7 @@
 #include <linux/math64.h>
 #include <linux/netdevice.h>
 #include <net/flow_offload.h>
+#include <net/psample.h>
 #include <linux/rhashtable.h>
 #include <asm/mach-rtl-otto/mach-rtl-otto.h>
 
@@ -59,6 +60,12 @@ struct rtl83xx_flow {
 #define RTL930X_STORM_RATE			GENMASK(23, 0)
 #define RTL930X_STORM_BURST			GENMASK(15, 0)
 #define RTL930X_STORM_RATE_PKTS			1014
+
+#define RTL930X_SFLOW_CTRL			0xBEA0
+#define RTL930X_SFLOW_CTRL_EGRESS		BIT(0)
+#define RTL930X_SFLOW_CTRL_CPU			BIT(1)
+#define RTL930X_SFLOW_PORT_RATE_CTRL(port)	(0xBEA4 + ((port) * 4))
+#define RTL930X_SFLOW_INGRESS_RATE		GENMASK(15, 0)
 
 /* Parse the flow rule for the matching conditions */
 static int rtl83xx_parse_flow_rule(struct rtl838x_switch_priv *priv,
@@ -875,6 +882,18 @@ int rtldsa_930x_storm_set(int port, enum rtldsa_storm_type type, u64 rate_pkt_ps
 	return 0;
 }
 
+/* One frame in @rate that the port receives is copied to the CPU, 0 turns it off */
+int rtldsa_930x_sample_set(int port, u32 rate)
+{
+	if (rate > FIELD_MAX(RTL930X_SFLOW_INGRESS_RATE))
+		return -EINVAL;
+
+	sw_w32_mask(RTL930X_SFLOW_CTRL_EGRESS | RTL930X_SFLOW_CTRL_CPU, 0, RTL930X_SFLOW_CTRL);
+	sw_w32_mask(RTL930X_SFLOW_INGRESS_RATE, rate, RTL930X_SFLOW_PORT_RATE_CTRL(port));
+
+	return 0;
+}
+
 int rtldsa_931x_port_rate_police_add(struct dsa_switch *ds, int port,
 				     const struct flow_action_entry *act,
 				     bool ingress)
@@ -917,6 +936,115 @@ int rtldsa_931x_port_rate_police_del(struct dsa_switch *ds, int port,
 	return 0;
 }
 
+#if IS_BUILTIN(CONFIG_PSAMPLE)
+static int rtldsa_sample_add(struct rtl838x_switch_priv *priv, int port,
+			     struct flow_cls_offload *cls, bool ingress)
+{
+	struct flow_rule *rule = flow_cls_offload_flow_rule(cls);
+	const struct flow_action_entry *act = &rule->action.entries[0];
+	struct rtldsa_port *p = &priv->ports[port];
+	int ret;
+
+	if (!ingress || !priv->r->sample_set || !act->sample.rate ||
+	    !rtldsa_flower_uses_only(cls, 0) ||
+	    !flow_action_basic_hw_stats_check(&rule->action, cls->common.extack))
+		return -EOPNOTSUPP;
+
+	mutex_lock(&priv->reg_mutex);
+
+	if (p->sample_cookie)
+		ret = -EBUSY;
+	else
+		ret = priv->r->sample_set(port, act->sample.rate);
+
+	if (!ret) {
+		psample_group_take(act->sample.psample_group);
+		p->sample_rate = act->sample.rate;
+		p->sample_trunc = act->sample.truncate ? act->sample.trunc_size : 0;
+		p->sample_cookie = cls->cookie;
+		rcu_assign_pointer(p->sample_group, act->sample.psample_group);
+	}
+
+	mutex_unlock(&priv->reg_mutex);
+
+	return ret;
+}
+
+static int rtldsa_sample_del(struct rtl838x_switch_priv *priv, int port,
+			     struct flow_cls_offload *cls)
+{
+	struct rtldsa_port *p = &priv->ports[port];
+	struct psample_group *group;
+
+	mutex_lock(&priv->reg_mutex);
+
+	if (p->sample_cookie != cls->cookie) {
+		mutex_unlock(&priv->reg_mutex);
+		return -ENOENT;
+	}
+
+	priv->r->sample_set(port, 0);
+	group = rcu_replace_pointer(p->sample_group, NULL, lockdep_is_held(&priv->reg_mutex));
+	p->sample_cookie = 0;
+
+	mutex_unlock(&priv->reg_mutex);
+
+	synchronize_rcu();
+	psample_group_put(group);
+
+	return 0;
+}
+
+void rtldsa_sample_rx(struct net_device *conduit, int port, struct sk_buff *skb)
+{
+	struct dsa_port *cpu_dp = conduit->dsa_ptr;
+	struct psample_metadata md = {};
+	struct rtl838x_switch_priv *priv;
+	struct psample_group *group;
+	struct rtldsa_port *p;
+
+	if (!cpu_dp)
+		return;
+
+	priv = cpu_dp->ds->priv;
+	if (port >= priv->r->cpu_port)
+		return;
+
+	p = &priv->ports[port];
+
+	rcu_read_lock();
+
+	group = rcu_dereference(p->sample_group);
+	if (group && p->dp && p->dp->user) {
+		md.trunc_size = p->sample_trunc ?: skb->len;
+		md.in_ifindex = p->dp->user->ifindex;
+		psample_sample_packet(group, skb, p->sample_rate, &md);
+	}
+
+	rcu_read_unlock();
+}
+#else
+static int rtldsa_sample_add(struct rtl838x_switch_priv *priv, int port,
+			     struct flow_cls_offload *cls, bool ingress)
+{
+	return -EOPNOTSUPP;
+}
+
+static int rtldsa_sample_del(struct rtl838x_switch_priv *priv, int port,
+			     struct flow_cls_offload *cls)
+{
+	return -ENOENT;
+}
+#endif
+
+static bool rtldsa_flower_is_sample(struct flow_cls_offload *cls)
+{
+	struct flow_rule *rule = flow_cls_offload_flow_rule(cls);
+
+	return flow_offload_has_one_action(&rule->action) &&
+	       rule->action.entries[0].id == FLOW_ACTION_SAMPLE;
+}
+
 int rtldsa_cls_flower_add(struct dsa_switch *ds, int port,
 			  struct flow_cls_offload *cls, bool ingress)
 {
@@ -924,6 +1052,9 @@ int rtldsa_cls_flower_add(struct dsa_switch *ds, int port,
 	struct rtldsa_port *p = &priv->ports[port];
 	const struct flow_action_entry *act;
 	int ret, storm;
+
+	if (rtldsa_flower_is_sample(cls))
+		return rtldsa_sample_add(priv, port, cls, ingress);
 
 	/* a single rate/bandwidth limiter action on all frames is handled as port policing */
 	act = rtldsa_rate_policy_extract(cls);
@@ -993,6 +1124,10 @@ int rtldsa_cls_flower_del(struct dsa_switch *ds, int port,
 	 */
 	if (ingress) {
 		ret = rtldsa_pie_cls_flower_del(priv, cls, ingress);
+		if (ret != -ENOENT)
+			return ret;
+
+		ret = rtldsa_sample_del(priv, port, cls);
 		if (ret != -ENOENT)
 			return ret;
 	}
