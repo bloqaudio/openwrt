@@ -78,7 +78,6 @@
 #define RTL930X_QM_INTPRI2QID_CTRL		(0xA320)
 #define RTL931X_QM_INTPRI2QID_CTRL		(0xA9D0)
 
-#define MAX_PRIOS 8
 #define DSCP_MAP_MAX 64
 #define RTL930X_SCHED_Q_STRICT			BIT(7)
 #define RTL930X_SCHED_Q_WEIGHT			GENMASK(6, 0)
@@ -594,9 +593,23 @@ void rtldsa_931x_qos_init(struct rtl838x_switch_priv *priv)
 	rtldsa_931x_qos_set_scheduling_queue_weights(priv);
 }
 
-/* A qdisc that replaces another one is set up before the old one is destroyed, so the
+/* A qdisc that replaces another one is set up before the old one is destroyed, so every
  * offload remembers the handle of its qdisc and only that qdisc can take it away again.
+ * The last entry of a handle array is the root, the others are the queues.
  */
+static int rtldsa_qdisc_queue(const struct rtldsa_port *p, u32 parent)
+{
+	unsigned int band = TC_H_MIN(parent);
+
+	if (parent == TC_H_ROOT)
+		return MAX_PRIOS;
+
+	if (TC_H_MAJ(parent) != p->ets_handle || !band || band > MAX_PRIOS)
+		return -EOPNOTSUPP;
+
+	return MAX_PRIOS - band;
+}
+
 static int rtldsa_setup_qdisc_red(struct rtl838x_switch_priv *priv, int port,
 				  struct tc_red_qopt_offload *qopt)
 {
@@ -642,6 +655,19 @@ static int rtldsa_setup_qdisc_red(struct rtl838x_switch_priv *priv, int port,
 	return ret;
 }
 
+/* The children of the bands cannot be matched to a queue once their ETS is gone */
+static void rtldsa_ets_release_queues(struct rtl838x_switch_priv *priv, int port)
+{
+	struct rtldsa_port *p = &priv->ports[port];
+
+	for (int queue = 0; queue < MAX_PRIOS; queue++) {
+		if (p->tbf_handle[queue])
+			priv->r->egress_shaper_set(priv, port, queue, 0, 0);
+
+		p->tbf_handle[queue] = 0;
+	}
+}
+
 /* Band 0 is the band ETS serves first and queue 7 the queue the hardware serves first.
  * The hardware maps priority n to queue n for the whole switch, so only the priomap
  * that says the same can be offloaded.
@@ -652,6 +678,7 @@ static int rtldsa_setup_qdisc_ets(struct rtl838x_switch_priv *priv, int port,
 	struct tc_ets_qopt_offload_replace_params *p = &qopt->replace_params;
 	struct rtldsa_port *pp = &priv->ports[port];
 	bool offload = false;
+	u32 handle;
 
 	if (!priv->r->queue_sched_set || qopt->parent != TC_H_ROOT)
 		return -EOPNOTSUPP;
@@ -689,11 +716,67 @@ static int rtldsa_setup_qdisc_ets(struct rtl838x_switch_priv *priv, int port,
 			priv->r->queue_sched_set(port, queue, 1, true);
 	}
 
-	pp->ets_handle = offload ? qopt->handle : 0;
+	handle = offload ? qopt->handle : 0;
+	if (pp->ets_handle != handle)
+		rtldsa_ets_release_queues(priv, port);
+
+	pp->ets_handle = handle;
 
 	mutex_unlock(&priv->reg_mutex);
 
 	return (offload || qopt->command == TC_ETS_DESTROY) ? 0 : -EOPNOTSUPP;
+}
+
+/* TBF at the root shapes the port, TBF on band n of an offloaded ETS shapes queue 8 - n */
+static int rtldsa_setup_qdisc_tbf(struct rtl838x_switch_priv *priv, int port,
+				  struct tc_tbf_qopt_offload *qopt)
+{
+	struct tc_tbf_qopt_offload_replace_params *params = &qopt->replace_params;
+	struct rtldsa_port *p = &priv->ports[port];
+	int queue = rtldsa_qdisc_queue(p, qopt->parent);
+	int ret = 0, hw_queue;
+	u32 *owner;
+
+	if (!priv->r->egress_shaper_set || queue < 0)
+		return -EOPNOTSUPP;
+
+	owner = &p->tbf_handle[queue];
+	hw_queue = queue == MAX_PRIOS ? -1 : queue;
+
+	mutex_lock(&priv->reg_mutex);
+
+	switch (qopt->command) {
+	case TC_TBF_REPLACE:
+		if (hw_queue < 0 && p->rate_police_egress)
+			ret = -EOPNOTSUPP;
+		else
+			ret = priv->r->egress_shaper_set(priv, port, hw_queue,
+							 params->rate.rate_bytes_ps,
+							 params->max_size);
+
+		if (ret && *owner)
+			priv->r->egress_shaper_set(priv, port, hw_queue, 0, 0);
+
+		*owner = ret ? 0 : qopt->handle;
+		break;
+	case TC_TBF_DESTROY:
+		if (*owner != qopt->handle)
+			break;
+
+		priv->r->egress_shaper_set(priv, port, hw_queue, 0, 0);
+		*owner = 0;
+		break;
+	case TC_TBF_STATS:
+		ret = *owner == qopt->handle ? 0 : -EOPNOTSUPP;
+		break;
+	default:
+		ret = -EOPNOTSUPP;
+		break;
+	}
+
+	mutex_unlock(&priv->reg_mutex);
+
+	return ret;
 }
 
 int rtldsa_port_setup_tc(struct dsa_switch *ds, int port, enum tc_setup_type type,
@@ -702,6 +785,8 @@ int rtldsa_port_setup_tc(struct dsa_switch *ds, int port, enum tc_setup_type typ
 	struct rtl838x_switch_priv *priv = ds->priv;
 
 	switch (type) {
+	case TC_SETUP_QDISC_TBF:
+		return rtldsa_setup_qdisc_tbf(priv, port, type_data);
 	case TC_SETUP_QDISC_ETS:
 		return rtldsa_setup_qdisc_ets(priv, port, type_data);
 	case TC_SETUP_QDISC_RED:
