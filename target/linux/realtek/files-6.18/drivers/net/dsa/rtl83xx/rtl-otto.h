@@ -85,8 +85,8 @@ struct rtldsa_port {
 	bool phy:1;
 	bool isolated:1;
 	bool qinq:1;
-	bool rate_police_egress:1;
-	bool rate_police_ingress:1;
+	unsigned long rate_police_egress;
+	unsigned long rate_police_ingress;
 	u32 ets_handle;
 	u32 tbf_handle[MAX_PRIOS + 1];
 	u32 red_handle[MAX_PRIOS + 1];
