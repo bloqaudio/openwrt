@@ -238,6 +238,8 @@ static int rtldsa_93xx_setup(struct dsa_switch *ds)
 
 	priv->r->led_init(priv);
 
+	rtldsa_qos_setup(ds);
+
 	return 0;
 }
 
@@ -1652,4 +1654,10 @@ const struct dsa_switch_ops rtldsa_93xx_switch_ops = {
 	.cls_flower_add		= rtldsa_cls_flower_add,
 	.cls_flower_del		= rtldsa_cls_flower_del,
 	.cls_flower_stats	= rtldsa_cls_flower_stats,
+
+	.port_get_default_prio	= rtldsa_port_get_default_prio,
+	.port_set_default_prio	= rtldsa_port_set_default_prio,
+	.port_get_dscp_prio	= rtldsa_port_get_dscp_prio,
+	.port_add_dscp_prio	= rtldsa_port_add_dscp_prio,
+	.port_del_dscp_prio	= rtldsa_port_del_dscp_prio,
 };
