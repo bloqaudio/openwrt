@@ -683,29 +683,44 @@ int rtldsa_port_set_apptrust(struct dsa_switch *ds, int port, const u8 *sel, int
 static int rtldsa_setup_qdisc_red(struct rtl838x_switch_priv *priv, int port,
 				  struct tc_red_qopt_offload *qopt)
 {
-	int ret = 0;
+	struct rtldsa_port *p = &priv->ports[port];
+	unsigned int band = TC_H_MIN(qopt->parent);
+	int queue = -1, ret = 0;
 
-	if (!priv->r->red_enable || qopt->parent != TC_H_ROOT)
+	if (!priv->r->red_set)
 		return -EOPNOTSUPP;
+
+	if (qopt->parent != TC_H_ROOT) {
+		if (TC_H_MAJ(qopt->parent) != p->ets_handle || !band || band > MAX_PRIOS)
+			return -EOPNOTSUPP;
+
+		queue = MAX_PRIOS - band;
+	}
 
 	mutex_lock(&priv->reg_mutex);
 
 	switch (qopt->command) {
 	case TC_RED_REPLACE:
-		if (qopt->set.is_ecn)
+		if (qopt->set.is_ecn) {
+			priv->r->red_set(priv, port, queue, NULL);
 			ret = -EOPNOTSUPP;
-		else
-			ret = priv->r->red_enable(priv, port, &qopt->set);
+		} else {
+			ret = priv->r->red_set(priv, port, queue, &qopt->set);
+		}
 
-		if (ret)
-			priv->r->red_disable(priv, port);
+		if (queue < 0)
+			p->red_root = !ret;
 		break;
 	case TC_RED_DESTROY:
-		priv->r->red_disable(priv, port);
+		priv->r->red_set(priv, port, queue, NULL);
+
+		if (queue < 0)
+			p->red_root = false;
 		break;
 	case TC_RED_STATS:
 	case TC_RED_XSTATS:
-		if (!(priv->red_ports & BIT_ULL(port)))
+		if (!(priv->red_ports & BIT_ULL(port)) ||
+		    !(queue < 0 ? p->red_root : p->red_cfg[queue]))
 			ret = -EOPNOTSUPP;
 		break;
 	default:
@@ -770,12 +785,15 @@ static int rtldsa_setup_qdisc_ets(struct rtl838x_switch_priv *priv, int port,
 	} else {
 		priv->ets_ports &= ~BIT_ULL(port);
 
-		/* the queue shapers go with the bands: their TBFs cannot be matched to a band later */
+		/* shapers and RED go with the bands: their qdiscs cannot be matched to one later */
 		for (int queue = 0; queue < MAX_PRIOS; queue++)
 			if (pp->tbf_queues & BIT(queue))
 				priv->r->egress_shaper_set(priv, port, queue, 0, 0);
 
 		pp->tbf_queues = 0;
+
+		if (priv->r->red_set && !pp->red_root)
+			priv->r->red_set(priv, port, -1, NULL);
 	}
 
 	mutex_unlock(&priv->reg_mutex);
