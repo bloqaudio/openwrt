@@ -55,18 +55,10 @@ struct rtl83xx_flow {
 #define RTL930X_INGRESS_FC_CTRL(port)		(0x81CC + ((port / 29) * 4))
 #define RTL930X_INGRESS_FC_CTRL_EN(port)	BIT(port % 29)
 
-#define RTL930X_STORM_PORT_CTRL			0x8A6C
-#define RTL930X_STORM_PORT_UC_CTRL(port)	(0x8A70 + ((port) * 8))
-#define RTL930X_STORM_PORT_UC_LB_RST		0x8B58
-#define RTL930X_STORM_PORT_MC_CTRL(port)	(0x8B60 + ((port) * 8))
-#define RTL930X_STORM_PORT_MC_LB_RST		0x8C48
-#define RTL930X_STORM_PORT_BC_CTRL(port)	(0x8C50 + ((port) * 8))
-#define RTL930X_STORM_PORT_BC_LB_RST		0x8D38
-#define RTL930X_STORM_KNOWN			BIT(25)
-#define RTL930X_STORM_ENABLE			BIT(24)
-#define RTL930X_STORM_RATE			GENMASK(23, 0)
-#define RTL930X_STORM_BURST			GENMASK(15, 0)
-#define RTL930X_STORM_RATE_PKTS			1014
+#define RTL93XX_STORM_KNOWN			BIT(25)
+#define RTL93XX_STORM_ENABLE			BIT(24)
+#define RTL93XX_STORM_RATE			GENMASK(23, 0)
+#define RTL93XX_STORM_BURST			GENMASK(15, 0)
 
 #define RTL930X_SFLOW_CTRL			0xBEA0
 #define RTL930X_SFLOW_CTRL_EGRESS		BIT(0)
@@ -852,41 +844,67 @@ int rtldsa_930x_egress_shaper_set(struct rtl838x_switch_priv *priv, int port, in
 	return 0;
 }
 
-/* A unit of the rate is 1.014 frames per second. Unicast and multicast count only the
- * frames with an unknown address unless told otherwise.
+struct rtldsa_storm_regs {
+	u32 mode;
+	u32 ctrl[RTLDSA_STORM_TYPES];
+	u32 reset[RTLDSA_STORM_TYPES];
+	u32 rate_unit;
+};
+
+/* A unit of the rate is @rate_unit / 1000 frames per second. Unicast and multicast count
+ * only the frames with an unknown address unless told otherwise.
  */
-int rtldsa_930x_storm_set(int port, enum rtldsa_storm_type type, u64 rate_pkt_ps, u32 burst_pkt)
+static int rtldsa_93xx_storm_set(const struct rtldsa_storm_regs *regs, int port,
+				 enum rtldsa_storm_type type, u64 rate_pkt_ps, u32 burst_pkt)
 {
-	static const struct {
-		u32 ctrl;
-		u32 reset;
-	} regs[RTLDSA_STORM_TYPES] = {
-		[RTLDSA_STORM_BROADCAST] = { RTL930X_STORM_PORT_BC_CTRL(0),
-					     RTL930X_STORM_PORT_BC_LB_RST },
-		[RTLDSA_STORM_MULTICAST] = { RTL930X_STORM_PORT_MC_CTRL(0),
-					     RTL930X_STORM_PORT_MC_LB_RST },
-		[RTLDSA_STORM_UNICAST] = { RTL930X_STORM_PORT_UC_CTRL(0),
-					   RTL930X_STORM_PORT_UC_LB_RST },
-	};
-	u64 rate = DIV_ROUND_CLOSEST_ULL(rate_pkt_ps * 1000, RTL930X_STORM_RATE_PKTS);
-	u32 ctrl = regs[type].ctrl + port * 8;
+	u64 rate = DIV_ROUND_CLOSEST_ULL(rate_pkt_ps * 1000, regs->rate_unit);
+	u32 ctrl = regs->ctrl[type] + port * 8;
+	u32 word = (port / 32) * 4;
 
 	if (!rate_pkt_ps) {
-		sw_w32_mask(RTL930X_STORM_ENABLE, 0, ctrl);
+		sw_w32_mask(RTL93XX_STORM_ENABLE, 0, ctrl);
 		return 0;
 	}
 
-	if (!rate || rate > FIELD_MAX(RTL930X_STORM_RATE))
+	if (!rate || rate > FIELD_MAX(RTL93XX_STORM_RATE))
 		return -EINVAL;
 
 	/* count frames, not bytes */
-	sw_w32_mask(BIT(port), 0, RTL930X_STORM_PORT_CTRL);
-	sw_w32(clamp_t(u32, burst_pkt, 1, FIELD_MAX(RTL930X_STORM_BURST)), ctrl + 4);
-	sw_w32(RTL930X_STORM_ENABLE | rate |
-	       (type == RTLDSA_STORM_MULTICAST ? RTL930X_STORM_KNOWN : 0), ctrl);
-	sw_w32(BIT(port), regs[type].reset);
+	sw_w32_mask(BIT(port % 32), 0, regs->mode + word);
+	sw_w32(clamp_t(u32, burst_pkt, 1, FIELD_MAX(RTL93XX_STORM_BURST)), ctrl + 4);
+	sw_w32(RTL93XX_STORM_ENABLE | rate |
+	       (type == RTLDSA_STORM_MULTICAST ? RTL93XX_STORM_KNOWN : 0), ctrl);
+	sw_w32(BIT(port % 32), regs->reset[type] + word);
 
 	return 0;
+}
+
+int rtldsa_930x_storm_set(int port, enum rtldsa_storm_type type, u64 rate_pkt_ps, u32 burst_pkt)
+{
+	static const struct rtldsa_storm_regs regs = {
+		.mode = 0x8A6C,
+		.ctrl = { [RTLDSA_STORM_BROADCAST] = 0x8C50, [RTLDSA_STORM_MULTICAST] = 0x8B60,
+			  [RTLDSA_STORM_UNICAST] = 0x8A70 },
+		.reset = { [RTLDSA_STORM_BROADCAST] = 0x8D38, [RTLDSA_STORM_MULTICAST] = 0x8C48,
+			   [RTLDSA_STORM_UNICAST] = 0x8B58 },
+		.rate_unit = 1014,
+	};
+
+	return rtldsa_93xx_storm_set(&regs, port, type, rate_pkt_ps, burst_pkt);
+}
+
+int rtldsa_931x_storm_set(int port, enum rtldsa_storm_type type, u64 rate_pkt_ps, u32 burst_pkt)
+{
+	static const struct rtldsa_storm_regs regs = {
+		.mode = 0xB00C,
+		.ctrl = { [RTLDSA_STORM_BROADCAST] = 0xB3C4, [RTLDSA_STORM_MULTICAST] = 0xB1EC,
+			  [RTLDSA_STORM_UNICAST] = 0xB014 },
+		.reset = { [RTLDSA_STORM_BROADCAST] = 0xB58C, [RTLDSA_STORM_MULTICAST] = 0xB3B4,
+			   [RTLDSA_STORM_UNICAST] = 0xB1DC },
+		.rate_unit = 994,
+	};
+
+	return rtldsa_93xx_storm_set(&regs, port, type, rate_pkt_ps, burst_pkt);
 }
 
 /* One frame in @rate that the port receives is copied to the CPU, 0 turns it off */
