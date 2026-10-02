@@ -61,10 +61,10 @@ struct rtl83xx_flow {
 #define RTL93XX_STORM_BURST			GENMASK(15, 0)
 
 #define RTL930X_SFLOW_CTRL			0xBEA0
-#define RTL930X_SFLOW_CTRL_EGRESS		BIT(0)
-#define RTL930X_SFLOW_CTRL_CPU			BIT(1)
-#define RTL930X_SFLOW_PORT_RATE_CTRL(port)	(0xBEA4 + ((port) * 4))
-#define RTL930X_SFLOW_INGRESS_RATE		GENMASK(15, 0)
+#define RTL931X_SFLOW_CTRL			0x8400
+#define RTL93XX_SFLOW_CTRL_EGRESS		BIT(0)
+#define RTL93XX_SFLOW_CTRL_CPU			BIT(1)
+#define RTL93XX_SFLOW_INGRESS_RATE		GENMASK(15, 0)
 
 /* Parse the flow rule for the matching conditions */
 static int rtl83xx_parse_flow_rule(struct rtl838x_switch_priv *priv,
@@ -908,15 +908,25 @@ int rtldsa_931x_storm_set(int port, enum rtldsa_storm_type type, u64 rate_pkt_ps
 }
 
 /* One frame in @rate that the port receives is copied to the CPU, 0 turns it off */
-int rtldsa_930x_sample_set(int port, u32 rate)
+static int rtldsa_93xx_sample_set(u32 ctrl, int port, u32 rate)
 {
-	if (rate > FIELD_MAX(RTL930X_SFLOW_INGRESS_RATE))
+	if (rate > FIELD_MAX(RTL93XX_SFLOW_INGRESS_RATE))
 		return -EINVAL;
 
-	sw_w32_mask(RTL930X_SFLOW_CTRL_EGRESS | RTL930X_SFLOW_CTRL_CPU, 0, RTL930X_SFLOW_CTRL);
-	sw_w32_mask(RTL930X_SFLOW_INGRESS_RATE, rate, RTL930X_SFLOW_PORT_RATE_CTRL(port));
+	sw_w32_mask(RTL93XX_SFLOW_CTRL_EGRESS | RTL93XX_SFLOW_CTRL_CPU, 0, ctrl);
+	sw_w32_mask(RTL93XX_SFLOW_INGRESS_RATE, rate, ctrl + 4 + port * 4);
 
 	return 0;
+}
+
+int rtldsa_930x_sample_set(int port, u32 rate)
+{
+	return rtldsa_93xx_sample_set(RTL930X_SFLOW_CTRL, port, rate);
+}
+
+int rtldsa_931x_sample_set(int port, u32 rate)
+{
+	return rtldsa_93xx_sample_set(RTL931X_SFLOW_CTRL, port, rate);
 }
 
 /* The first word of a table entry holds its highest bits */
