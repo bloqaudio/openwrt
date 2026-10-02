@@ -68,6 +68,11 @@
 #define RTL931X_QM_INTPRI2QID_CTRL		(0xA9D0)
 
 #define DSCP_MAP_MAX 64
+#define RTLDSA_RED_PAGE_SIZE			256
+#define RTLDSA_RED_RATE_SCALE			1023
+#define RTLDSA_RED_RATE_MAX			255
+#define RTLDSA_RED_QUEUES			12
+
 #define RTL930X_SCHED_Q_STRICT			BIT(7)
 #define RTL931X_SCHED_Q_STRICT			BIT(8)
 #define RTL93XX_SCHED_Q_WEIGHT			GENMASK(6, 0)
@@ -748,6 +753,83 @@ int rtldsa_port_set_apptrust(struct dsa_switch *ds, int port, const u8 *sel, int
 	return -EOPNOTSUPP;
 }
 
+/* The thresholds are one table of queues for the whole switch and a port has RED on all
+ * its queues or on none, so the ports with RED must all want the same table.
+ */
+static int rtldsa_red_apply(struct rtl838x_switch_priv *priv, int port)
+{
+	struct rtldsa_red_cfg *wanted = priv->ports[port].red_cfg;
+	bool any = false;
+	int ret = 0;
+
+	for (int queue = 0; queue < MAX_PRIOS; queue++)
+		any |= wanted[queue].max;
+
+	if (!any)
+		goto disable;
+
+	if (priv->red_ports & ~BIT_ULL(port)) {
+		if (memcmp(wanted, priv->red_cfg, sizeof(priv->red_cfg))) {
+			dev_warn(priv->dev, "port %d: RED differs from the one in use\n", port);
+			ret = -EBUSY;
+			goto disable;
+		}
+	} else {
+		for (int queue = 0; queue < RTLDSA_RED_QUEUES; queue++)
+			priv->r->red_queue_set(queue, queue < MAX_PRIOS && wanted[queue].max ?
+						      &wanted[queue] : NULL);
+
+		memcpy(priv->red_cfg, wanted, sizeof(priv->red_cfg));
+	}
+
+	priv->r->red_port_set(port, true);
+	priv->red_ports |= BIT_ULL(port);
+
+	return 0;
+
+disable:
+	if (priv->red_ports & BIT_ULL(port)) {
+		priv->r->red_port_set(port, false);
+		priv->red_ports &= ~BIT_ULL(port);
+	}
+
+	return ret;
+}
+
+/* A negative @queue stands for all queues of the port, no @p for no RED */
+static int rtldsa_red_set(struct rtl838x_switch_priv *priv, int port, int queue,
+			  const struct tc_red_qopt_offload_params *p)
+{
+	struct rtldsa_red_cfg *wanted = priv->ports[port].red_cfg;
+	struct rtldsa_red_cfg cfg = {};
+	int ret, err = 0;
+
+	if (p) {
+		u32 min = DIV_ROUND_UP(p->min, RTLDSA_RED_PAGE_SIZE);
+		u32 max = p->max / RTLDSA_RED_PAGE_SIZE;
+		u64 rate = ((u64)p->probability * RTLDSA_RED_RATE_SCALE + U32_MAX) >> 32;
+
+		if (!min || min >= max || max > priv->r->red_max_thr ||
+		    !rate || rate > RTLDSA_RED_RATE_MAX) {
+			err = -EINVAL;
+		} else {
+			cfg.min = min;
+			cfg.max = max;
+			cfg.rate = rate;
+		}
+	}
+
+	for (int i = 0; i < MAX_PRIOS; i++)
+		if (queue < 0 || queue == i)
+			wanted[i] = cfg;
+
+	ret = rtldsa_red_apply(priv, port);
+	if (ret && cfg.max)
+		rtldsa_red_set(priv, port, queue, NULL);
+
+	return err ?: ret;
+}
+
 /* A qdisc that replaces another one is set up before the old one is destroyed, so every
  * offload remembers the handle of its qdisc and only that qdisc can take it away again.
  * The last entry of the handle arrays is the root, the others are the queues.
@@ -773,7 +855,7 @@ static int rtldsa_setup_qdisc_red(struct rtl838x_switch_priv *priv, int port,
 	int ret = 0, hw_queue;
 	u32 *owner;
 
-	if (!priv->r->red_set || queue < 0)
+	if (!priv->r->red_queue_set || queue < 0)
 		return -EOPNOTSUPP;
 
 	owner = &p->red_handle[queue];
@@ -784,10 +866,10 @@ static int rtldsa_setup_qdisc_red(struct rtl838x_switch_priv *priv, int port,
 	switch (qopt->command) {
 	case TC_RED_REPLACE:
 		if (qopt->set.is_ecn) {
-			priv->r->red_set(priv, port, hw_queue, NULL);
+			rtldsa_red_set(priv, port, hw_queue, NULL);
 			ret = -EOPNOTSUPP;
 		} else {
-			ret = priv->r->red_set(priv, port, hw_queue, &qopt->set);
+			ret = rtldsa_red_set(priv, port, hw_queue, &qopt->set);
 		}
 
 		*owner = ret ? 0 : qopt->handle;
@@ -796,7 +878,7 @@ static int rtldsa_setup_qdisc_red(struct rtl838x_switch_priv *priv, int port,
 		if (*owner != qopt->handle)
 			break;
 
-		priv->r->red_set(priv, port, hw_queue, NULL);
+		rtldsa_red_set(priv, port, hw_queue, NULL);
 		*owner = 0;
 		break;
 	case TC_RED_STATS:
@@ -824,7 +906,7 @@ static void rtldsa_ets_release_queues(struct rtl838x_switch_priv *priv, int port
 			priv->r->egress_shaper_set(priv, port, queue, 0, 0);
 
 		if (p->red_handle[queue] && !p->red_handle[MAX_PRIOS])
-			priv->r->red_set(priv, port, queue, NULL);
+			rtldsa_red_set(priv, port, queue, NULL);
 
 		p->tbf_handle[queue] = 0;
 		p->red_handle[queue] = 0;
