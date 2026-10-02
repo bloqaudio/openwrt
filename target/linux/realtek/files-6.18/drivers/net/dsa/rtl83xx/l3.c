@@ -1043,6 +1043,43 @@ static void otto_l3_route_compact(struct otto_l3_ctrl *ctrl, struct otto_l3_rout
 	ctrl->cfg->route_write(ctrl, last, r);
 }
 
+/* A next hop is shared by every route through its gateway, so the offload
+ * state is reported on the route itself.
+ */
+static void otto_l3_fib4_flags_set(struct otto_l3_route *r, bool offload, bool trap,
+				   bool failed)
+{
+	struct fib_rt_info fri = {
+		.fi = r->fi,
+		.tb_id = r->tb_id,
+		.dst = cpu_to_be32(r->dst_ip),
+		.dst_len = r->prefix_len,
+		.dscp = r->dscp,
+		.type = r->fib_type,
+		.offload = offload,
+		.trap = trap,
+		.offload_failed = failed,
+	};
+
+	if (r->fi)
+		fib_alias_hw_flags_set(&init_net, &fri);
+}
+
+static void otto_l3_fib4_info_failed(struct fib_entry_notifier_info *info)
+{
+	struct fib_rt_info fri = {
+		.fi = info->fi,
+		.tb_id = info->tb_id,
+		.dst = cpu_to_be32(info->dst),
+		.dst_len = info->dst_len,
+		.dscp = info->dscp,
+		.type = info->type,
+		.offload_failed = true,
+	};
+
+	fib_alias_hw_flags_set(&init_net, &fri);
+}
+
 static void otto_l3_route_update_hw(struct otto_l3_ctrl *ctrl, struct otto_l3_route *r,
 				    u64 mac)
 {
@@ -1108,6 +1145,7 @@ static void otto_l3_route_update_hw(struct otto_l3_ctrl *ctrl, struct otto_l3_ro
 		if (slot < 0) {
 			dev_err(ctrl->dev, "no slot for host route %pI4\n",
 				&r->dst_ip);
+			otto_l3_fib4_flags_set(r, false, false, true);
 			return;
 		}
 
@@ -1117,8 +1155,10 @@ static void otto_l3_route_update_hw(struct otto_l3_ctrl *ctrl, struct otto_l3_ro
 		if (r->row < 0)
 			r->row = otto_l3_route_place(ctrl, r);
 
-		if (r->row < 0)
+		if (r->row < 0) {
+			otto_l3_fib4_flags_set(r, false, false, true);
 			return;
+		}
 
 		ctrl->cfg->route_write(ctrl, r->row, r);
 		r->pr.fwd_sel = true;
@@ -1128,6 +1168,8 @@ static void otto_l3_route_update_hw(struct otto_l3_ctrl *ctrl, struct otto_l3_ro
 
 	if (ctrl->cfg->set_nexthop)
 		ctrl->cfg->set_nexthop(ctrl, r->nh.id, r->nh.l2_id, r->nh.if_id);
+
+	otto_l3_fib4_flags_set(r, !no_port, no_port, false);
 
 	if (ctrl->cfg->use_l3_tables)
 		return;
@@ -1180,6 +1222,8 @@ static void otto_l3_route_trap_hw(struct otto_l3_ctrl *ctrl, struct otto_l3_rout
 		ctrl->cfg->host_route_write(ctrl, slot, r);
 	else
 		ctrl->cfg->route_write(ctrl, slot, r);
+
+	otto_l3_fib4_flags_set(r, false, true, false);
 }
 
 /* Updates an L3 next hop entry in the ROUTING table */
@@ -1324,6 +1368,11 @@ static void otto_l3_route_free(struct otto_l3_ctrl *ctrl, struct otto_l3_route *
 		clear_bit(r->id - MAX_ROUTES, ctrl->host_route_use_bm);
 	else
 		clear_bit(r->id, ctrl->route_use_bm);
+
+	if (r->fi) {
+		otto_l3_fib4_flags_set(r, false, false, false);
+		fib_info_put(r->fi);
+	}
 
 	list_del(&r->list);
 	kfree(r);
@@ -1538,8 +1587,10 @@ static void otto_l3_host_route_trap(struct otto_l3_ctrl *ctrl,
 
 	ipv6_addr_set_v4mapped(0, &gw);
 	route = otto_l3_host_route_alloc(ctrl, &gw);
-	if (!route)
+	if (!route) {
+		otto_l3_fib4_info_failed(info);
 		return;
+	}
 
 	route->dst_ip = info->dst;
 	route->prefix_len = info->dst_len;
@@ -1547,6 +1598,10 @@ static void otto_l3_host_route_trap(struct otto_l3_ctrl *ctrl,
 	route->attr.valid = true;
 	route->attr.action = ROUTE_ACT_TRAP2CPU;
 	route->attr.type = ROUTE_TYPE_IP4UC;
+	route->fi = info->fi;
+	fib_info_hold(route->fi);
+	route->dscp = info->dscp;
+	route->fib_type = info->type;
 
 	slot = ctrl->cfg->find_slot(ctrl, route, true);
 	if (slot < 0)
@@ -1555,10 +1610,12 @@ static void otto_l3_host_route_trap(struct otto_l3_ctrl *ctrl,
 	if (slot < 0) {
 		dev_err(ctrl->dev, "no slot for host route %pI4\n", &route->dst_ip);
 		otto_l3_route_free(ctrl, route);
+		otto_l3_fib4_info_failed(info);
 		return;
 	}
 
 	ctrl->cfg->host_route_write(ctrl, slot, route);
+	otto_l3_fib4_flags_set(route, false, true, false);
 }
 
 static int otto_l3_fib_add_v4(struct otto_l3_ctrl *ctrl, struct fib_entry_notifier_info *info)
@@ -1623,6 +1680,7 @@ static int otto_l3_fib_add_v4(struct otto_l3_ctrl *ctrl, struct fib_entry_notifi
 	else {
 		dev_err(ctrl->dev, "could not extend route hashtable for gw %pI4\n",
 			&nh->fib_nh_gw4);
+		otto_l3_fib4_info_failed(info);
 		return -ENOSPC;
 	}
 
@@ -1630,6 +1688,10 @@ static int otto_l3_fib_add_v4(struct otto_l3_ctrl *ctrl, struct fib_entry_notifi
 	route->prefix_len = info->dst_len;
 	route->tb_id = info->tb_id;
 	route->attr.type = ROUTE_TYPE_IP4UC;
+	route->fi = info->fi;
+	fib_info_hold(route->fi);
+	route->dscp = info->dscp;
+	route->fib_type = info->type;
 	route->nh.rvid = vlan;
 	route->gw_ifindex = ndev->ifindex;
 
@@ -1666,6 +1728,7 @@ static int otto_l3_fib_add_v4(struct otto_l3_ctrl *ctrl, struct fib_entry_notifi
 
 			dev_dbg(ctrl->dev, "Got slot for route: %d\n", slot);
 			ctrl->cfg->host_route_write(ctrl, slot, route);
+			otto_l3_fib4_flags_set(route, false, true, false);
 		}
 	}
 
@@ -1673,13 +1736,12 @@ static int otto_l3_fib_add_v4(struct otto_l3_ctrl *ctrl, struct fib_entry_notifi
 	if (nh->fib_nh_gw4)
 		otto_l3_port_ipv4_resolve(ctrl, ndev, nh->fib_nh_gw4);
 
-	nh->fib_nh_flags |= RTNH_F_OFFLOAD;
-
 	return 0;
 
 out_free_rmac:
 out_free_rt:
 	otto_l3_route_free(ctrl, route);
+	otto_l3_fib4_info_failed(info);
 	return 0;
 }
 
@@ -1734,8 +1796,6 @@ static int otto_l3_fib_del_v4(struct otto_l3_ctrl *ctrl, struct fib_entry_notifi
 	}
 
 	otto_l3_route_teardown(ctrl, route);
-
-	nh->fib_nh_flags &= ~RTNH_F_OFFLOAD;
 
 	return 0;
 }
