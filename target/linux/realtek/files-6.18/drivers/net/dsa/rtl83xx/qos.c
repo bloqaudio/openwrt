@@ -684,6 +684,11 @@ void otto_qos_setup(struct dsa_switch *ds)
 		dsa_switch_for_each_user_port(dp, ds)
 			otto_qos_port_set_group(priv, dp->index, 0);
 
+	if (priv->r->storm_set)
+		dsa_switch_for_each_user_port(dp, ds)
+			for (int type = 0; type < RTLDSA_STORM_TYPES; type++)
+				priv->r->storm_set(dp->index, type, 0, 0);
+
 	if (!priv->r->pri_sel_remap_dscp)
 		return;
 
