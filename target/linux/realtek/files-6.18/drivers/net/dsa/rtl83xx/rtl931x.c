@@ -6,6 +6,7 @@
 #include "lag.h"
 #include "l2.h"
 #include "pie.h"
+#include "flowctrl.h"
 #include "qos.h"
 #include "mirror.h"
 #include "rtl-otto.h"
@@ -507,6 +508,9 @@ const struct rtldsa_config rtldsa_931x_cfg = {
 	.enable_flood = otto_l2_931x_enable_flood,
 	.enable_bcast_flood = otto_l2_931x_enable_bcast_flood,
 	.set_receive_management_action = rtldsa_931x_set_receive_management_action,
+	.red_max_thr = 8191,
+	.red_queue_set = rtldsa_931x_red_queue_set,
+	.red_port_set = rtldsa_931x_red_port_set,
 	.queue_sched_set = rtldsa_931x_queue_sched_set,
 	.egress_shaper_set = rtldsa_931x_egress_shaper_set,
 	.qos_init = rtldsa_931x_qos_init,
