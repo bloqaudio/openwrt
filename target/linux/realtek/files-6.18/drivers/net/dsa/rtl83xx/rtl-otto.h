@@ -852,6 +852,7 @@ struct rtldsa_port {
 	bool rate_police_ingress:1;
 	bool tbf_root:1;
 	u8 tbf_queues;
+	u32 ets_handle;
 	unsigned long cached_flags;
 	u64 pm;
 	u16 pvid;
