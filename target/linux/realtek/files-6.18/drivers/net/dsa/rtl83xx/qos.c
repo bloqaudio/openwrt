@@ -80,6 +80,8 @@
 
 #define MAX_PRIOS 8
 #define DSCP_MAP_MAX 64
+#define RTL930X_SCHED_Q_STRICT			BIT(7)
+#define RTL930X_SCHED_Q_WEIGHT			GENMASK(6, 0)
 
 enum scheduler_type {
 	WEIGHTED_FAIR_QUEUE = 0,
@@ -475,21 +477,24 @@ static void rtldsa_930x_qos_prio2queue_matrix(int *min_queues)
 	sw_w32(v, RTL930X_QM_INTPRI2QID_CTRL);
 }
 
+void rtldsa_930x_queue_sched_set(int port, int queue, u32 weight, bool strict)
+{
+	u32 v = FIELD_PREP(RTL930X_SCHED_Q_WEIGHT, weight) | (strict ? RTL930X_SCHED_Q_STRICT : 0);
+
+	if (port < 24)
+		sw_w32(v, RTL930X_SCHED_PORT_Q_CTRL_SET0(port, queue));
+	else
+		sw_w32(v, RTL930X_SCHED_PORT_Q_CTRL_SET1(port, queue));
+}
+
 static void rtldsa_930x_qos_set_scheduling_queue_weights(struct rtl838x_switch_priv *priv)
 {
 	struct dsa_port *dp;
-	u32 addr;
 
-	dsa_switch_for_each_user_port(dp, priv->ds) {
-		for (int q = 0; q < 8; q++) {
-			if (dp->index < 24)
-				addr = RTL930X_SCHED_PORT_Q_CTRL_SET0(dp->index, q);
-			else
-				addr = RTL930X_SCHED_PORT_Q_CTRL_SET1(dp->index, q);
-
-			sw_w32(rtldsa_default_queue_weights[q], addr);
-		}
-	}
+	dsa_switch_for_each_user_port(dp, priv->ds)
+		for (int q = 0; q < MAX_PRIOS; q++)
+			rtldsa_930x_queue_sched_set(dp->index, q, rtldsa_default_queue_weights[q],
+						    false);
 }
 
 void rtldsa_930x_qos_init(struct rtl838x_switch_priv *priv)
@@ -637,12 +642,68 @@ static int rtldsa_setup_qdisc_red(struct rtl838x_switch_priv *priv, int port,
 	return ret;
 }
 
+/* Band 0 is the band ETS serves first and queue 7 the queue the hardware serves first.
+ * The hardware maps priority n to queue n for the whole switch, so only the priomap
+ * that says the same can be offloaded.
+ */
+static int rtldsa_setup_qdisc_ets(struct rtl838x_switch_priv *priv, int port,
+				  struct tc_ets_qopt_offload *qopt)
+{
+	struct tc_ets_qopt_offload_replace_params *p = &qopt->replace_params;
+	struct rtldsa_port *pp = &priv->ports[port];
+	bool offload = false;
+
+	if (!priv->r->queue_sched_set || qopt->parent != TC_H_ROOT)
+		return -EOPNOTSUPP;
+
+	switch (qopt->command) {
+	case TC_ETS_REPLACE:
+		offload = p->bands == MAX_PRIOS;
+		for (int band = 0; offload && band < MAX_PRIOS; band++)
+			offload = p->priomap[MAX_PRIOS - 1 - band] == band &&
+				  (!p->quanta[band] ||
+				   (p->weights[band] &&
+				    p->weights[band] <= FIELD_MAX(RTL930X_SCHED_Q_WEIGHT)));
+		break;
+	case TC_ETS_DESTROY:
+		if (pp->ets_handle != qopt->handle)
+			return 0;
+		break;
+	case TC_ETS_STATS:
+		return pp->ets_handle == qopt->handle ? 0 : -EOPNOTSUPP;
+	default:
+		return -EOPNOTSUPP;
+	}
+
+	mutex_lock(&priv->reg_mutex);
+
+	for (int band = 0; band < MAX_PRIOS; band++) {
+		int queue = MAX_PRIOS - 1 - band;
+
+		if (!offload)
+			priv->r->queue_sched_set(port, queue, rtldsa_default_queue_weights[queue],
+						 false);
+		else if (p->quanta[band])
+			priv->r->queue_sched_set(port, queue, p->weights[band], false);
+		else
+			priv->r->queue_sched_set(port, queue, 1, true);
+	}
+
+	pp->ets_handle = offload ? qopt->handle : 0;
+
+	mutex_unlock(&priv->reg_mutex);
+
+	return (offload || qopt->command == TC_ETS_DESTROY) ? 0 : -EOPNOTSUPP;
+}
+
 int rtldsa_port_setup_tc(struct dsa_switch *ds, int port, enum tc_setup_type type,
 			 void *type_data)
 {
 	struct rtl838x_switch_priv *priv = ds->priv;
 
 	switch (type) {
+	case TC_SETUP_QDISC_ETS:
+		return rtldsa_setup_qdisc_ets(priv, port, type_data);
 	case TC_SETUP_QDISC_RED:
 		return rtldsa_setup_qdisc_red(priv, port, type_data);
 	default:
