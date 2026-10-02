@@ -340,6 +340,7 @@ struct rteth_cfg {
 	int dma_tx_base;
 	int rst_glb_ctrl;
 	int skb_headroom;
+	bool tx_queue_from_priority;
 	u32 mac_reg[RTETH_MAX_MAC_REGS];
 	int l2_tbl_flush_ctrl;
 	void (*confirm_disable_irqs)(struct rteth_ctrl *ctrl, unsigned long *rings, bool *l2);

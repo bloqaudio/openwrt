@@ -1145,7 +1145,8 @@ static int rteth_start_xmit(struct sk_buff *skb, struct net_device *dev)
 	}
 
 	if (port >= 0)
-		ctrl->cfg->create_tx_header(frag, port, 0); // TODO ok to set prio to 0?
+		ctrl->cfg->create_tx_header(frag, port, ctrl->cfg->tx_queue_from_priority ?
+					    min_t(u32, skb->priority, 7) : 0);
 
 	/* Hand frag over to switch */
 	dma_wmb();
@@ -1686,6 +1687,7 @@ static const struct rteth_cfg rteth_930x_cfg = {
 	.mac_force_mode_ctrl	= RTETH_930X_MAC_FORCE_MODE_CTRL,
 	.rst_glb_ctrl		= RTETH_930X_RST_GLB_CTRL_0,
 	.skb_headroom		= RTETH_SKB_HEADROOM_FAST,
+	.tx_queue_from_priority	= true,
 	.mac_reg		= { RTETH_930X_MAC_L2_ADDR_CTRL },
 	.l2_tbl_flush_ctrl	= RTETH_930X_L2_TBL_FLUSH_CTRL,
 	.confirm_disable_irqs	= rteth_93xx_confirm_disable_irqs,
