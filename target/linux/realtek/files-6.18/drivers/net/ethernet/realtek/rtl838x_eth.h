@@ -239,7 +239,7 @@ struct rteth_skb_cb {
 };
 
 #define RTETH_SKB_CB(skb)	((struct rteth_skb_cb *)(skb)->cb)
-#define RTETH_930X_SFLOW_RX	1
+#define RTETH_93XX_SFLOW_RX	1
 
 void rtldsa_sample_rx(struct net_device *conduit, int port, struct sk_buff *skb);
 
