@@ -224,6 +224,15 @@ static bool rteth_839x_decode_tag(struct rteth_frag *frag, struct rteth_dsa_tag 
 	return t->l2_offloaded;
 }
 
+static bool rteth_93xx_decode_tag(struct rteth_frag *frag, struct rteth_dsa_tag *t);
+
+static bool rteth_930x_decode_tag(struct rteth_frag *frag, struct rteth_dsa_tag *t)
+{
+	t->sflow = (frag->cpu_tag[4] >> 10) & 0x3;
+
+	return rteth_93xx_decode_tag(frag, t);
+}
+
 static bool rteth_93xx_decode_tag(struct rteth_frag *frag, struct rteth_dsa_tag *t)
 {
 	t->port = (frag->cpu_tag[0] >> 8) & 0x3f;
@@ -1183,7 +1192,7 @@ static struct sk_buff *rteth_create_skb(struct rteth_ctrl *ctrl, int ring, int s
 	struct page_pool *pool = ctrl->rx_info[ring].pool;
 	struct net_device *dev = ctrl->dev;
 	unsigned int len = frag->len;
-	struct rteth_dsa_tag tag;
+	struct rteth_dsa_tag tag = {};
 	struct sk_buff *skb;
 
 	page_pool_dma_sync_for_cpu(pool, page, offset + ctrl->cfg->skb_headroom, len);
@@ -1198,6 +1207,13 @@ static struct sk_buff *rteth_create_skb(struct rteth_ctrl *ctrl, int ring, int s
 	skb_put(skb, len);
 
 	ctrl->cfg->decode_tag(frag, &tag);
+	if (unlikely(tag.sflow)) {
+		RTETH_SKB_CB(skb)->sflow = tag.sflow;
+		RTETH_SKB_CB(skb)->port = tag.port;
+
+		return skb;
+	}
+
 	if (netdev_uses_dsa(dev)) {
 		if (tag.port < ctrl->cfg->cpu_port)
 			skb_dst_set_noref(skb, &ctrl->dsa_meta[tag.port]->dst);
@@ -1304,6 +1320,14 @@ static int rteth_hw_receive(struct net_device *dev, int ring, int budget)
 		if (is_tail && skb) {
 			if (unlikely(skb->len < ETH_HLEN + ETH_FCS_LEN)) {
 				rx_errors += rteth_free_skb(&skb);
+			} else if (unlikely(RTETH_SKB_CB(skb)->sflow)) {
+				/* a copy for the sampler, the frame itself takes its usual way */
+				pskb_trim(skb, skb->len - ETH_FCS_LEN);
+				if (IS_BUILTIN(CONFIG_PSAMPLE) &&
+				    IS_ENABLED(CONFIG_NET_DSA_RTL83XX) &&
+				    RTETH_SKB_CB(skb)->sflow == RTETH_930X_SFLOW_RX)
+					rtldsa_sample_rx(dev, RTETH_SKB_CB(skb)->port, skb);
+				rteth_free_skb(&skb);
 			} else {
 				pskb_trim(skb, skb->len - ETH_FCS_LEN);
 				rx_bytes += skb->len;
@@ -1694,7 +1718,7 @@ static const struct rteth_cfg rteth_930x_cfg = {
 	.enable_rx_irq		= rteth_93xx_enable_rx_irq,
 	.update_counter		= rteth_93xx_update_counter,
 	.create_tx_header	= rteth_93xx_create_tx_header,
-	.decode_tag		= rteth_93xx_decode_tag,
+	.decode_tag		= rteth_930x_decode_tag,
 	.hw_en_rxtx		= rteth_930x_hw_en_rxtx,
 	.hw_init		= rteth_930x_hw_init,
 	.hw_stop		= rteth_930x_hw_stop,
