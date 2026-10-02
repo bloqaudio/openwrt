@@ -845,6 +845,13 @@ struct rtldsa_93xx_lag_entry {
 
 struct psample_group;
 
+/* @min and @max in pages of 256 bytes, @rate in 1/1023; no RED without @max */
+struct rtldsa_red_cfg {
+	u16 min;
+	u16 max;
+	u16 rate;
+};
+
 enum rtldsa_storm_type {
 	RTLDSA_STORM_BROADCAST,
 	RTLDSA_STORM_MULTICAST,
@@ -867,7 +874,7 @@ struct rtldsa_port {
 	u32 ets_handle;
 	u32 tbf_handle[MAX_PRIOS + 1];
 	u32 red_handle[MAX_PRIOS + 1];
-	u32 red_cfg[MAX_PRIOS];
+	struct rtldsa_red_cfg red_cfg[MAX_PRIOS];
 	unsigned long cached_flags;
 	u64 pm;
 	u16 pvid;
@@ -1259,8 +1266,9 @@ struct rtldsa_config {
 	u32 (*get_egress_rate)(struct rtl838x_switch_priv *priv, int port);
 	int (*set_egress_rate)(struct rtl838x_switch_priv *priv, int port, u32 rate);
 	void (*flowctrl_init)(struct rtl838x_switch_priv *priv);
-	int (*red_set)(struct rtl838x_switch_priv *priv, int port, int queue,
-		       const struct tc_red_qopt_offload_params *p);
+	u32 red_max_thr;
+	void (*red_queue_set)(int queue, const struct rtldsa_red_cfg *cfg);
+	void (*red_port_set)(int port, bool enable);
 	void (*queue_sched_set)(int port, int queue, u32 weight, bool strict);
 	int (*egress_shaper_set)(struct rtl838x_switch_priv *priv, int port, int queue,
 				 u64 rate_bytes_ps, u32 burst);
@@ -1325,7 +1333,7 @@ struct rtl838x_switch_priv {
 	u64 red_ports;
 
 	/** @red_cfg: RED thresholds and drop rate of each queue, shared by all ports in @red_ports */
-	u32 red_cfg[MAX_PRIOS];
+	struct rtldsa_red_cfg red_cfg[MAX_PRIOS];
 	struct workqueue_struct *wq;
 	bool eee_enabled;
 	unsigned long mc_group_bm[MAX_MC_GROUPS >> 5];
