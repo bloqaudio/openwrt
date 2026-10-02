@@ -744,47 +744,60 @@ int rtldsa_port_set_apptrust(struct dsa_switch *ds, int port, const u8 *sel, int
 	return -EOPNOTSUPP;
 }
 
+/* A qdisc that replaces another one is set up before the old one is destroyed, so every
+ * offload remembers the handle of its qdisc and only that qdisc can take it away again.
+ * The last entry of the handle arrays is the root, the others are the queues.
+ */
+static int rtldsa_qdisc_queue(const struct rtldsa_port *p, u32 parent)
+{
+	unsigned int band = TC_H_MIN(parent);
+
+	if (parent == TC_H_ROOT)
+		return MAX_PRIOS;
+
+	if (TC_H_MAJ(parent) != p->ets_handle || !band || band > MAX_PRIOS)
+		return -EOPNOTSUPP;
+
+	return MAX_PRIOS - band;
+}
+
 static int rtldsa_setup_qdisc_red(struct rtl838x_switch_priv *priv, int port,
 				  struct tc_red_qopt_offload *qopt)
 {
 	struct rtldsa_port *p = &priv->ports[port];
-	unsigned int band = TC_H_MIN(qopt->parent);
-	int queue = -1, ret = 0;
+	int queue = rtldsa_qdisc_queue(p, qopt->parent);
+	int ret = 0, hw_queue;
+	u32 *owner;
 
-	if (!priv->r->red_set)
+	if (!priv->r->red_set || queue < 0)
 		return -EOPNOTSUPP;
 
-	if (qopt->parent != TC_H_ROOT) {
-		if (TC_H_MAJ(qopt->parent) != p->ets_handle || !band || band > MAX_PRIOS)
-			return -EOPNOTSUPP;
-
-		queue = MAX_PRIOS - band;
-	}
+	owner = &p->red_handle[queue];
+	hw_queue = queue == MAX_PRIOS ? -1 : queue;
 
 	mutex_lock(&priv->reg_mutex);
 
 	switch (qopt->command) {
 	case TC_RED_REPLACE:
 		if (qopt->set.is_ecn) {
-			priv->r->red_set(priv, port, queue, NULL);
+			priv->r->red_set(priv, port, hw_queue, NULL);
 			ret = -EOPNOTSUPP;
 		} else {
-			ret = priv->r->red_set(priv, port, queue, &qopt->set);
+			ret = priv->r->red_set(priv, port, hw_queue, &qopt->set);
 		}
 
-		if (queue < 0)
-			p->red_root = !ret;
+		*owner = ret ? 0 : qopt->handle;
 		break;
 	case TC_RED_DESTROY:
-		priv->r->red_set(priv, port, queue, NULL);
+		if (*owner != qopt->handle)
+			break;
 
-		if (queue < 0)
-			p->red_root = false;
+		priv->r->red_set(priv, port, hw_queue, NULL);
+		*owner = 0;
 		break;
 	case TC_RED_STATS:
 	case TC_RED_XSTATS:
-		if (!(priv->red_ports & BIT_ULL(port)) ||
-		    !(queue < 0 ? p->red_root : p->red_cfg[queue]))
+		if (!(priv->red_ports & BIT_ULL(port)) || *owner != qopt->handle)
 			ret = -EOPNOTSUPP;
 		break;
 	default:
@@ -797,6 +810,23 @@ static int rtldsa_setup_qdisc_red(struct rtl838x_switch_priv *priv, int port,
 	return ret;
 }
 
+/* The children of the bands cannot be matched to a queue once their ETS is gone */
+static void rtldsa_ets_release_queues(struct rtl838x_switch_priv *priv, int port)
+{
+	struct rtldsa_port *p = &priv->ports[port];
+
+	for (int queue = 0; queue < MAX_PRIOS; queue++) {
+		if (p->tbf_handle[queue])
+			priv->r->egress_shaper_set(priv, port, queue, 0, 0);
+
+		if (p->red_handle[queue] && !p->red_handle[MAX_PRIOS])
+			priv->r->red_set(priv, port, queue, NULL);
+
+		p->tbf_handle[queue] = 0;
+		p->red_handle[queue] = 0;
+	}
+}
+
 /* Band 0 is the band ETS serves first and queue 7 the queue the hardware serves first.
  * The hardware maps priority n to queue n for the whole switch, so only the priomap
  * that says the same can be offloaded.
@@ -807,6 +837,7 @@ static int rtldsa_setup_qdisc_ets(struct rtl838x_switch_priv *priv, int port,
 	struct tc_ets_qopt_offload_replace_params *p = &qopt->replace_params;
 	struct rtldsa_port *pp = &priv->ports[port];
 	bool offload = false;
+	u32 handle;
 	int queue;
 
 	if (!priv->r->queue_sched_set || qopt->parent != TC_H_ROOT)
@@ -822,17 +853,19 @@ static int rtldsa_setup_qdisc_ets(struct rtl838x_switch_priv *priv, int port,
 				    p->weights[band] <= FIELD_MAX(RTL930X_SCHED_Q_WEIGHT)));
 		break;
 	case TC_ETS_DESTROY:
+		if (pp->ets_handle != qopt->handle)
+			return 0;
 		break;
 	case TC_ETS_STATS:
-		return (priv->ets_ports & BIT_ULL(port)) ? 0 : -EOPNOTSUPP;
+		return pp->ets_handle == qopt->handle ? 0 : -EOPNOTSUPP;
 	case TC_ETS_GRAFT:
 		queue = MAX_PRIOS - 1 - qopt->graft_params.band;
-		if (!pp->ets_handle || queue < 0)
+		handle = qopt->graft_params.child_handle;
+		if (pp->ets_handle != qopt->handle || queue < 0)
 			return -EOPNOTSUPP;
 
 		/* the default child, or one that took the queue when it was created */
-		if (!qopt->graft_params.child_handle || pp->tbf_queues & BIT(queue) ||
-		    (priv->red_ports & BIT_ULL(port) && pp->red_cfg[queue]))
+		if (!handle || handle == pp->tbf_handle[queue] || handle == pp->red_handle[queue])
 			return 0;
 
 		return -EOPNOTSUPP;
@@ -854,23 +887,11 @@ static int rtldsa_setup_qdisc_ets(struct rtl838x_switch_priv *priv, int port,
 			priv->r->queue_sched_set(port, queue, 1, true);
 	}
 
-	pp->ets_handle = offload ? qopt->handle : 0;
+	handle = offload ? qopt->handle : 0;
+	if (pp->ets_handle != handle)
+		rtldsa_ets_release_queues(priv, port);
 
-	if (offload) {
-		priv->ets_ports |= BIT_ULL(port);
-	} else {
-		priv->ets_ports &= ~BIT_ULL(port);
-
-		/* shapers and RED go with the bands: their qdiscs cannot be matched to one later */
-		for (int queue = 0; queue < MAX_PRIOS; queue++)
-			if (pp->tbf_queues & BIT(queue))
-				priv->r->egress_shaper_set(priv, port, queue, 0, 0);
-
-		pp->tbf_queues = 0;
-
-		if (priv->r->red_set && !pp->red_root)
-			priv->r->red_set(priv, port, -1, NULL);
-	}
+	pp->ets_handle = handle;
 
 	mutex_unlock(&priv->reg_mutex);
 
@@ -883,58 +904,46 @@ static int rtldsa_setup_qdisc_tbf(struct rtl838x_switch_priv *priv, int port,
 {
 	struct tc_tbf_qopt_offload_replace_params *params = &qopt->replace_params;
 	struct rtldsa_port *p = &priv->ports[port];
-	unsigned int band = TC_H_MIN(qopt->parent);
-	int queue = -1, ret = 0;
-	bool active;
+	int queue = rtldsa_qdisc_queue(p, qopt->parent);
+	int ret = 0, hw_queue;
+	u32 *owner;
 
-	if (!priv->r->egress_shaper_set)
+	if (!priv->r->egress_shaper_set || queue < 0)
 		return -EOPNOTSUPP;
 
-	if (qopt->parent != TC_H_ROOT) {
-		if (TC_H_MAJ(qopt->parent) != p->ets_handle || !band || band > MAX_PRIOS)
-			return -EOPNOTSUPP;
-
-		queue = MAX_PRIOS - band;
-	}
+	owner = &p->tbf_handle[queue];
+	hw_queue = queue == MAX_PRIOS ? -1 : queue;
 
 	mutex_lock(&priv->reg_mutex);
 
-	active = queue < 0 ? p->tbf_root : p->tbf_queues & BIT(queue);
-
 	switch (qopt->command) {
 	case TC_TBF_REPLACE:
-		if (queue < 0 && p->rate_police_egress)
+		if (hw_queue < 0 && p->rate_police_egress)
 			ret = -EOPNOTSUPP;
 		else
-			ret = priv->r->egress_shaper_set(priv, port, queue,
+			ret = priv->r->egress_shaper_set(priv, port, hw_queue,
 							 params->rate.rate_bytes_ps,
 							 params->max_size);
 
-		if (ret && active)
-			priv->r->egress_shaper_set(priv, port, queue, 0, 0);
+		if (ret && *owner)
+			priv->r->egress_shaper_set(priv, port, hw_queue, 0, 0);
 
-		active = !ret;
+		*owner = ret ? 0 : qopt->handle;
 		break;
 	case TC_TBF_DESTROY:
-		if (active)
-			priv->r->egress_shaper_set(priv, port, queue, 0, 0);
+		if (*owner != qopt->handle)
+			break;
 
-		active = false;
+		priv->r->egress_shaper_set(priv, port, hw_queue, 0, 0);
+		*owner = 0;
 		break;
 	case TC_TBF_STATS:
-		ret = active ? 0 : -EOPNOTSUPP;
+		ret = *owner == qopt->handle ? 0 : -EOPNOTSUPP;
 		break;
 	default:
 		ret = -EOPNOTSUPP;
 		break;
 	}
-
-	if (queue < 0)
-		p->tbf_root = active;
-	else if (active)
-		p->tbf_queues |= BIT(queue);
-	else
-		p->tbf_queues &= ~BIT(queue);
 
 	mutex_unlock(&priv->reg_mutex);
 

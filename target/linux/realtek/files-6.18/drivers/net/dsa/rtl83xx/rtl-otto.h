@@ -94,9 +94,6 @@ struct rtldsa_port {
 	bool phy:1;
 	bool isolated:1;
 	bool qinq:1;
-	bool tbf_root:1;
-	bool red_root:1;
-	u8 tbf_queues;
 	unsigned long rate_police_egress;
 	unsigned long rate_police_ingress;
 	unsigned long storm_police[RTLDSA_STORM_TYPES];
@@ -105,6 +102,8 @@ struct rtldsa_port {
 	u32 sample_rate;
 	u32 sample_trunc;
 	u32 ets_handle;
+	u32 tbf_handle[MAX_PRIOS + 1];
+	u32 red_handle[MAX_PRIOS + 1];
 	u32 red_cfg[MAX_PRIOS];
 	unsigned long cached_flags;
 	u64 pm;
@@ -556,9 +555,6 @@ struct rtl838x_switch_priv {
 
 	/** @lagmembers: Port (bit) is part of any LAG */
 	u64 lagmembers;
-
-	/** @ets_ports: Port (bit) has ETS offloaded */
-	u64 ets_ports;
 
 	/** @red_ports: Port (bit) has RED offloaded */
 	u64 red_ports;

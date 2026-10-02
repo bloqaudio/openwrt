@@ -1092,7 +1092,7 @@ int rtldsa_cls_flower_add(struct dsa_switch *ds, int port,
 		goto unlock;
 	}
 
-	if (!ingress && (p->rate_police_egress || p->tbf_root)) {
+	if (!ingress && (p->rate_police_egress || p->tbf_handle[MAX_PRIOS])) {
 		ret = -EOPNOTSUPP;
 		goto unlock;
 	}
