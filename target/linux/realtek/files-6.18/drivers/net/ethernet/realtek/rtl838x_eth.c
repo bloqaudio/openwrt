@@ -1763,6 +1763,7 @@ static const struct rteth_cfg rteth_931x_cfg = {
 	.mac_force_mode_ctrl	= RTETH_931X_MAC_FORCE_MODE_CTRL,
 	.rst_glb_ctrl		= RTETH_931X_RST_GLB_CTRL,
 	.skb_headroom		= RTETH_SKB_HEADROOM_FAST,
+	.tx_queue_from_priority	= true,
 	.mac_reg		= { RTETH_930X_MAC_L2_ADDR_CTRL },
 	.l2_tbl_flush_ctrl	= RTETH_931X_L2_TBL_FLUSH_CTRL,
 	.confirm_disable_irqs	= rteth_93xx_confirm_disable_irqs,
