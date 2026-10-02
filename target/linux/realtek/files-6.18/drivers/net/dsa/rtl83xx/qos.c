@@ -858,6 +858,17 @@ static int rtldsa_setup_qdisc_ets(struct rtl838x_switch_priv *priv, int port,
 		break;
 	case TC_ETS_STATS:
 		return pp->ets_handle == qopt->handle ? 0 : -EOPNOTSUPP;
+	case TC_ETS_GRAFT:
+		queue = MAX_PRIOS - 1 - qopt->graft_params.band;
+		handle = qopt->graft_params.child_handle;
+		if (pp->ets_handle != qopt->handle || queue < 0)
+			return -EOPNOTSUPP;
+
+		/* the default child, or one that took the queue when it was created */
+		if (!handle || handle == pp->tbf_handle[queue] || handle == pp->red_handle[queue])
+			return 0;
+
+		return -EOPNOTSUPP;
 	default:
 		return -EOPNOTSUPP;
 	}
