@@ -848,11 +848,11 @@ struct rtldsa_port {
 	bool phy:1;
 	bool isolated:1;
 	bool qinq:1;
-	bool rate_police_egress:1;
-	bool rate_police_ingress:1;
 	bool tbf_root:1;
 	bool red_root:1;
 	u8 tbf_queues;
+	unsigned long rate_police_egress;
+	unsigned long rate_police_ingress;
 	u32 ets_handle;
 	u32 red_cfg[MAX_PRIOS];
 	unsigned long cached_flags;
