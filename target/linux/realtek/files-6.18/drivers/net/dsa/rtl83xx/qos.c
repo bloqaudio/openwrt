@@ -614,6 +614,12 @@ static void rtldsa_qos_prio_set(int base, int index, u8 prio)
 void rtldsa_qos_setup(struct dsa_switch *ds)
 {
 	struct rtl838x_switch_priv *priv = ds->priv;
+	struct dsa_port *dp;
+
+	if (priv->r->storm_set)
+		dsa_switch_for_each_user_port(dp, ds)
+			for (int type = 0; type < RTLDSA_STORM_TYPES; type++)
+				priv->r->storm_set(dp->index, type, 0, 0);
 
 	if (!priv->r->pri_sel_remap_dscp)
 		return;
