@@ -3,6 +3,8 @@
 #ifndef _OTTO_L3_H
 #define _OTTO_L3_H
 
+#include <net/inet_dscp.h>
+
 #include "l3_limits.h"
 #include "rtl-otto.h"
 
@@ -91,6 +93,9 @@ struct otto_l3_route {
 	u16 switch_mac_id;		/* Index into switch's own MACs, RTL839X only */
 	struct otto_l3_nexthop nh;
 	struct pie_rule pr;
+	struct fib_info *fi;
+	dscp_t dscp;
+	u8 fib_type;
 	struct otto_l3_route_attr attr;
 };
 
