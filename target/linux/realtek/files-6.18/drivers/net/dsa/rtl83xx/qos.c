@@ -448,6 +448,11 @@ void rtldsa_930x_qos_init(struct rtl838x_switch_priv *priv)
 
 	rtldsa_930x_qos_setup_default_dscp2queue_map();
 	rtldsa_930x_qos_set_scheduling_queue_weights(priv);
+
+	/* queue n of a frame from the CPU is queue n of the port, which has 8 or 12 queues */
+	sw_w32(0x00fac688, RTL930X_QM_CPUQID2QID_CTRL);
+	sw_w32(0x76543210, RTL930X_QM_CPUQID2XGQID_CTRL);
+	sw_w32(0x0000ba98, RTL930X_QM_CPUQID2XGQID_CTRL + 4);
 }
 
 static void rtldsa_931x_qos_set_group_selector(int port, int group)

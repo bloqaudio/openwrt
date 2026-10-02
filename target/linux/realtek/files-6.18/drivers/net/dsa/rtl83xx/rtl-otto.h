@@ -672,6 +672,8 @@ enum rtldsa_flood_type {
 						((0x2F08 + ((port) - 52) * 48) + ((index) * 4))
 
 #define RTL930X_QM_INTPRI2QID_CTRL		(0xA320)
+#define RTL930X_QM_CPUQID2QID_CTRL		(0xA324)
+#define RTL930X_QM_CPUQID2XGQID_CTRL		(0xA334)
 #define RTL931X_QM_INTPRI2QID_CTRL		(0xA9D0)
 
 /* Packet Inspection Engine */
