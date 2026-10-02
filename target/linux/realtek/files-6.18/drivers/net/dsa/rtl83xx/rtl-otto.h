@@ -600,6 +600,7 @@ enum rtldsa_flood_type {
 #define RTL838X_PRI_SEL_PORT_PRI(p)		(0x5FB8 + (((p / 10) << 2)))
 #define RTL839X_PRI_SEL_PORT_PRI(p)		(0x10A8 + (((p / 10) << 2)))
 #define RTL930X_PRI_SEL_PORT_PRI(p)		(0x9AE8 + (((p) / 10) * 4))
+#define RTL931X_PRI_SEL_PORT_PRI(p)		(0x900C + (((p) / 10) * 4))
 #define RTL838X_QM_PKT2CPU_INTPRI_MAP		(0x5F10)
 #define RTL839X_QM_PKT2CPU_INTPRI_MAP		(0x1154)
 #define RTL838X_PRI_SEL_CTRL			(0x10E0)
