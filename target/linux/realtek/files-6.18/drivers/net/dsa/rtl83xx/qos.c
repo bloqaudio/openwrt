@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
 #include <net/dsa.h>
+#include <linux/dcbnl.h>
 #include <linux/delay.h>
 #include <net/pkt_cls.h>
 #include <net/pkt_sched.h>
@@ -40,13 +41,6 @@
 #define RTL838X_SCHED_LB_CTRL(p)		(0xC004 + (((p) << 7)))
 #define RTL838X_FC_P_EGR_DROP_CTRL(p)		(0x6B1C + (((p) << 2)))
 
-#define RTL930X_PORT_TBL_IDX_CTRL(port)		(0x9B20 + (((port) / 16) * 4))
-#define RTL931X_PORT_TBL_IDX_CTRL(port)		(0x9064 + (((port) / 16) * 4))
-#define RTL93XX_PORT_TBL_IDX_CTRL_IDX_OFFSET(port) \
-						(((port) & 0xF) << 1)
-#define RTL93XX_PORT_TBL_IDX_CTRL_IDX_MASK(port) \
-						(0x3 << RTL93XX_PORT_TBL_IDX_CTRL_IDX_OFFSET(port))
-
 #define RTL930X_PRI_SEL_TBL_CTRL(group)		(0x9B28 + ((group) * 4))
 #define RTL931X_PRI_SEL_TBL_CTRL(group)		(0x9074 + ((group) * 8))
 
@@ -80,6 +74,19 @@
 enum scheduler_type {
 	WEIGHTED_FAIR_QUEUE = 0,
 	WEIGHTED_ROUND_ROBIN,
+};
+
+struct rtldsa_trust {
+	u8 nsel;
+	u8 sel[2];
+};
+
+/* One entry for each of the four priority selection groups of RTL93xx */
+static const struct rtldsa_trust rtldsa_93xx_trust[] = {
+	{ 2, { DCB_APP_SEL_PCP, IEEE_8021QAZ_APP_SEL_DSCP } },
+	{ 1, { DCB_APP_SEL_PCP } },
+	{ 1, { IEEE_8021QAZ_APP_SEL_DSCP } },
+	{ 0 },
 };
 
 static int rtldsa_max_available_queue[] = {0, 1, 2, 3, 4, 5, 6, 7};
@@ -440,6 +447,25 @@ void rtldsa_839x_qos_init(struct rtl838x_switch_priv *priv)
 	}
 }
 
+static bool rtldsa_trusts(const struct rtldsa_trust *trust, u8 sel)
+{
+	return memchr(trust->sel, sel, trust->nsel);
+}
+
+static u32 rtldsa_93xx_trust_weights(const struct rtldsa_trust *trust)
+{
+	u32 v = FIELD_PREP(RTL93XX_PRI_SEL_TBL_CTRL_PORT_MASK, 3);
+
+	if (rtldsa_trusts(trust, IEEE_8021QAZ_APP_SEL_DSCP))
+		v |= FIELD_PREP(RTL93XX_PRI_SEL_TBL_CTRL_DSCP_MASK, 5);
+
+	if (rtldsa_trusts(trust, DCB_APP_SEL_PCP))
+		v |= FIELD_PREP(RTL93XX_PRI_SEL_TBL_CTRL_ITAG_MASK, 6) |
+		     FIELD_PREP(RTL93XX_PRI_SEL_TBL_CTRL_OTAG_MASK, 7);
+
+	return v;
+}
+
 static void rtldsa_930x_qos_set_group_selector(int port, int group)
 {
 	sw_w32_mask(RTL93XX_PORT_TBL_IDX_CTRL_IDX_MASK(port),
@@ -480,7 +506,6 @@ static void rtldsa_930x_qos_set_scheduling_queue_weights(struct rtl838x_switch_p
 void rtldsa_930x_qos_init(struct rtl838x_switch_priv *priv)
 {
 	struct dsa_port *dp;
-	u32 v;
 
 	/* Assign all the ports to the Group-0 */
 	dsa_switch_for_each_user_port(dp, priv->ds)
@@ -489,13 +514,9 @@ void rtldsa_930x_qos_init(struct rtl838x_switch_priv *priv)
 	rtldsa_930x_qos_prio2queue_matrix(rtldsa_max_available_queue);
 
 	/* configure priority weights */
-	v = 0;
-	v |= FIELD_PREP(RTL93XX_PRI_SEL_TBL_CTRL_PORT_MASK, 3);
-	v |= FIELD_PREP(RTL93XX_PRI_SEL_TBL_CTRL_DSCP_MASK, 5);
-	v |= FIELD_PREP(RTL93XX_PRI_SEL_TBL_CTRL_ITAG_MASK, 6);
-	v |= FIELD_PREP(RTL93XX_PRI_SEL_TBL_CTRL_OTAG_MASK, 7);
-
-	sw_w32(v, RTL930X_PRI_SEL_TBL_CTRL(0));
+	for (int group = 0; group < ARRAY_SIZE(rtldsa_93xx_trust); group++)
+		sw_w32(rtldsa_93xx_trust_weights(&rtldsa_93xx_trust[group]),
+		       RTL930X_PRI_SEL_TBL_CTRL(group));
 
 	rtldsa_930x_qos_set_scheduling_queue_weights(priv);
 
@@ -671,6 +692,50 @@ int rtldsa_port_del_dscp_prio(struct dsa_switch *ds, int port, u8 dscp, u8 prio)
 	mutex_unlock(&priv->reg_mutex);
 
 	return 0;
+}
+
+int rtldsa_port_get_apptrust(struct dsa_switch *ds, int port, u8 *sel, int *nsel)
+{
+	struct rtl838x_switch_priv *priv = ds->priv;
+	const struct rtldsa_trust *trust;
+	u32 v;
+
+	if (!priv->r->pri_sel_port_tbl_idx)
+		return -EOPNOTSUPP;
+
+	v = sw_r32(priv->r->pri_sel_port_tbl_idx + (port / 16) * 4);
+	trust = &rtldsa_93xx_trust[(v & RTL93XX_PORT_TBL_IDX_CTRL_IDX_MASK(port)) >>
+				   RTL93XX_PORT_TBL_IDX_CTRL_IDX_OFFSET(port)];
+
+	memcpy(sel, trust->sel, trust->nsel);
+	*nsel = trust->nsel;
+
+	return 0;
+}
+
+int rtldsa_port_set_apptrust(struct dsa_switch *ds, int port, const u8 *sel, int nsel)
+{
+	struct rtl838x_switch_priv *priv = ds->priv;
+
+	if (!priv->r->pri_sel_port_tbl_idx)
+		return -EOPNOTSUPP;
+
+	for (int group = 0; group < ARRAY_SIZE(rtldsa_93xx_trust); group++) {
+		const struct rtldsa_trust *trust = &rtldsa_93xx_trust[group];
+
+		if (nsel != trust->nsel || memcmp(sel, trust->sel, nsel))
+			continue;
+
+		mutex_lock(&priv->reg_mutex);
+		sw_w32_mask(RTL93XX_PORT_TBL_IDX_CTRL_IDX_MASK(port),
+			    group << RTL93XX_PORT_TBL_IDX_CTRL_IDX_OFFSET(port),
+			    priv->r->pri_sel_port_tbl_idx + (port / 16) * 4);
+		mutex_unlock(&priv->reg_mutex);
+
+		return 0;
+	}
+
+	return -EOPNOTSUPP;
 }
 
 /* A qdisc that replaces another one is set up before the old one is destroyed, so every
