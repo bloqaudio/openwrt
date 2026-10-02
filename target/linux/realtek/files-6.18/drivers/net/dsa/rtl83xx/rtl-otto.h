@@ -599,6 +599,7 @@ enum rtldsa_flood_type {
 #define RTL839X_QM_PORT_QNUM(p)			(0x1130 + (((p / 10) << 2)))
 #define RTL838X_PRI_SEL_PORT_PRI(p)		(0x5FB8 + (((p / 10) << 2)))
 #define RTL839X_PRI_SEL_PORT_PRI(p)		(0x10A8 + (((p / 10) << 2)))
+#define RTL930X_PRI_SEL_PORT_PRI(p)		(0x9AE8 + (((p) / 10) * 4))
 #define RTL838X_QM_PKT2CPU_INTPRI_MAP		(0x5F10)
 #define RTL839X_QM_PKT2CPU_INTPRI_MAP		(0x1154)
 #define RTL838X_PRI_SEL_CTRL			(0x10E0)
@@ -1142,6 +1143,8 @@ struct rtldsa_config {
 	enum otto_table_id l2_cam_tbl;
 	int trk_ctrl;
 	int trk_hash_ctrl;
+	int pri_sel_port_pri;
+	int pri_sel_remap_dscp;
 	void (*stp_init)(void);
 	void (*vlan_tables_read)(u32 vlan, struct rtldsa_vlan_info *info);
 	void (*vlan_set_tagged)(u32 vlan, struct rtldsa_vlan_info *info);
