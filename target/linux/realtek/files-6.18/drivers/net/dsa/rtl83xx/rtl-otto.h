@@ -86,6 +86,7 @@ struct rtldsa_port {
 	bool qinq:1;
 	unsigned long rate_police_egress;
 	unsigned long rate_police_ingress;
+	u32 ets_handle;
 	u32 red_handle;
 	unsigned long cached_flags;
 	u64 pm;
@@ -484,6 +485,7 @@ struct rtldsa_config {
 	int (*red_enable)(struct otto_dsa_priv *priv, int port,
 			  const struct tc_red_qopt_offload_params *p);
 	void (*red_disable)(struct otto_dsa_priv *priv, int port);
+	void (*queue_sched_set)(int port, int queue, u32 weight, bool strict);
 	void (*qos_init)(struct otto_dsa_priv *priv);
 	int (*trk_mbr_ctr)(int group);
 	void (*lag_switch_init)(struct otto_dsa_priv *priv);
