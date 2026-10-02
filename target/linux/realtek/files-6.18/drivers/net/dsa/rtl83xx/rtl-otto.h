@@ -109,6 +109,13 @@ struct rtldsa_ets {
 	struct rtldsa_red queue_red[MAX_PRIOS];
 };
 
+enum rtldsa_storm_type {
+	RTLDSA_STORM_BROADCAST,
+	RTLDSA_STORM_MULTICAST,
+	RTLDSA_STORM_UNICAST,
+	RTLDSA_STORM_TYPES,
+};
+
 struct rtldsa_port {
 	bool enable:1;
 	bool phy:1;
@@ -118,6 +125,7 @@ struct rtldsa_port {
 	bool vlan_filtering:1;
 	unsigned long rate_police_egress;
 	unsigned long rate_police_ingress;
+	unsigned long storm_police[RTLDSA_STORM_TYPES];
 	u32 ets_handle;
 	u16 ets_children;
 	bool ets_offloadable;
@@ -531,6 +539,7 @@ struct rtldsa_config {
 	void (*red_drops_update)(struct otto_dsa_priv *priv, int port);
 	int (*egress_shaper_set)(struct otto_dsa_priv *priv, int port, int queue,
 				 u64 rate_bytes_ps, u32 burst);
+	int (*storm_set)(int port, enum rtldsa_storm_type type, u64 rate_pkt_ps, u32 burst_pkt);
 	void (*qos_init)(struct otto_dsa_priv *priv);
 	int (*trk_mbr_ctr)(int group);
 	void (*lag_switch_init)(struct otto_dsa_priv *priv);
