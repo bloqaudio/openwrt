@@ -28,6 +28,7 @@ int otto_tc_930x_port_rate_police_del(struct dsa_switch *ds, int port,
 				      bool ingress);
 int otto_tc_930x_egress_shaper_set(struct rtl838x_switch_priv *priv, int port, int queue,
 				   u64 rate_bytes_ps, u32 burst);
+int otto_tc_930x_storm_set(int port, enum rtldsa_storm_type type, u64 rate_pkt_ps, u32 burst_pkt);
 int otto_tc_931x_port_rate_police_add(struct dsa_switch *ds, int port,
 				      const struct flow_action_entry *act,
 				      bool ingress);
