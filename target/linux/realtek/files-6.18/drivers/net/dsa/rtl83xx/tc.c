@@ -38,6 +38,14 @@ struct rtl83xx_flow {
 						GENMASK(30, 0)
 
 #define RTL931X_BANDWIDTH_CTRL_EGRESS(port)	(0x2164 + (port * 8))
+#define RTL931X_EGBW_LB_CTRL			0x2160
+#define RTL931X_EGBW_LB_CTRL_TOKEN		GENMASK(15, 0)
+#define RTL931X_EGR_Q_BW_WORDS			29
+#define RTL931X_EGR_Q_BW_ENABLE(queue)		(28 + (queue))
+#define RTL931X_EGR_Q_BW_RATE(queue)		(40 + (queue) * 20)
+#define RTL931X_EGR_Q_BW_RATE_BITS		20
+#define RTL931X_EGR_Q_BW_BURST(queue)		(280 + (queue) * 16)
+#define RTL931X_EGR_Q_BW_BURST_BITS		16
 #define RTL931X_BANDWIDTH_CTRL_INGRESS(port)	(0xe008 + (port * 8))
 
 #define RTL93XX_BANDWIDTH_CTRL_RATE_MAX		GENMASK(19, 0)
@@ -891,6 +899,57 @@ int rtldsa_930x_sample_set(int port, u32 rate)
 	sw_w32_mask(RTL930X_SFLOW_INGRESS_RATE, rate, RTL930X_SFLOW_PORT_RATE_CTRL(port));
 
 	return 0;
+}
+
+/* The first word of a table entry holds its highest bits */
+static void rtldsa_931x_q_bw_set(u32 *entry, int lsb, int bits, u32 val)
+{
+	for (int bit = 0; bit < bits; bit++) {
+		u32 *word = &entry[RTL931X_EGR_Q_BW_WORDS - 1 - (lsb + bit) / 32];
+		u32 mask = BIT((lsb + bit) % 32);
+
+		*word = (*word & ~mask) | (val & BIT(bit) ? mask : 0);
+	}
+}
+
+int rtldsa_931x_egress_shaper_set(struct rtl838x_switch_priv *priv, int port, int queue,
+				  u64 rate_bytes_ps, u32 burst)
+{
+	u32 min_burst = 8 * FIELD_GET(RTL931X_EGBW_LB_CTRL_TOKEN, sw_r32(RTL931X_EGBW_LB_CTRL));
+	u32 addr = RTL931X_BANDWIDTH_CTRL_EGRESS(port);
+	u64 rate = DIV_ROUND_UP_ULL(rate_bytes_ps, 2000);
+	u32 entry[RTL931X_EGR_Q_BW_WORDS];
+	int ret;
+
+	burst = min_t(u32, burst, RTL931X_BANDWIDTH_CTRL_MAX_BURST);
+	if (rate && (rate > RTL93XX_BANDWIDTH_CTRL_RATE_MAX || burst < min_burst))
+		return -EINVAL;
+
+	if (queue < 0) {
+		if (rate) {
+			sw_w32(burst, addr + 4);
+			sw_w32(rate | RTL93XX_BANDWIDTH_CTRL_ENABLE, addr);
+		} else {
+			sw_w32_mask(RTL93XX_BANDWIDTH_CTRL_ENABLE, 0, addr);
+		}
+
+		return 0;
+	}
+
+	ret = otto_table_read(RTL9310_TBL_EGR_Q_BW, port, &entry);
+	if (ret)
+		return ret;
+
+	if (rate) {
+		rtldsa_931x_q_bw_set(entry, RTL931X_EGR_Q_BW_RATE(queue),
+				     RTL931X_EGR_Q_BW_RATE_BITS, rate);
+		rtldsa_931x_q_bw_set(entry, RTL931X_EGR_Q_BW_BURST(queue),
+				     RTL931X_EGR_Q_BW_BURST_BITS, burst);
+	}
+
+	rtldsa_931x_q_bw_set(entry, RTL931X_EGR_Q_BW_ENABLE(queue), 1, !!rate);
+
+	return otto_table_write(RTL9310_TBL_EGR_Q_BW, port, &entry);
 }
 
 int rtldsa_931x_port_rate_police_add(struct dsa_switch *ds, int port,
