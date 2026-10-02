@@ -740,7 +740,7 @@ int rtldsa_port_set_apptrust(struct dsa_switch *ds, int port, const u8 *sel, int
 
 /* A qdisc that replaces another one is set up before the old one is destroyed, so every
  * offload remembers the handle of its qdisc and only that qdisc can take it away again.
- * The last entry of a handle array is the root, the others are the queues.
+ * The last entry of the handle arrays is the root, the others are the queues.
  */
 static int rtldsa_qdisc_queue(const struct rtldsa_port *p, u32 parent)
 {
@@ -759,35 +759,39 @@ static int rtldsa_setup_qdisc_red(struct rtl838x_switch_priv *priv, int port,
 				  struct tc_red_qopt_offload *qopt)
 {
 	struct rtldsa_port *p = &priv->ports[port];
-	int ret = 0;
+	int queue = rtldsa_qdisc_queue(p, qopt->parent);
+	int ret = 0, hw_queue;
+	u32 *owner;
 
-	if (!priv->r->red_enable || qopt->parent != TC_H_ROOT)
+	if (!priv->r->red_set || queue < 0)
 		return -EOPNOTSUPP;
+
+	owner = &p->red_handle[queue];
+	hw_queue = queue == MAX_PRIOS ? -1 : queue;
 
 	mutex_lock(&priv->reg_mutex);
 
 	switch (qopt->command) {
 	case TC_RED_REPLACE:
-		if (qopt->set.is_ecn)
+		if (qopt->set.is_ecn) {
+			priv->r->red_set(priv, port, hw_queue, NULL);
 			ret = -EOPNOTSUPP;
-		else
-			ret = priv->r->red_enable(priv, port, &qopt->set);
+		} else {
+			ret = priv->r->red_set(priv, port, hw_queue, &qopt->set);
+		}
 
-		if (ret)
-			priv->r->red_disable(priv, port);
-
-		p->red_handle = ret ? 0 : qopt->handle;
+		*owner = ret ? 0 : qopt->handle;
 		break;
 	case TC_RED_DESTROY:
-		if (p->red_handle != qopt->handle)
+		if (*owner != qopt->handle)
 			break;
 
-		priv->r->red_disable(priv, port);
-		p->red_handle = 0;
+		priv->r->red_set(priv, port, hw_queue, NULL);
+		*owner = 0;
 		break;
 	case TC_RED_STATS:
 	case TC_RED_XSTATS:
-		if (!(priv->red_ports & BIT_ULL(port)) || p->red_handle != qopt->handle)
+		if (!(priv->red_ports & BIT_ULL(port)) || *owner != qopt->handle)
 			ret = -EOPNOTSUPP;
 		break;
 	default:
@@ -809,7 +813,11 @@ static void rtldsa_ets_release_queues(struct rtl838x_switch_priv *priv, int port
 		if (p->tbf_handle[queue])
 			priv->r->egress_shaper_set(priv, port, queue, 0, 0);
 
+		if (p->red_handle[queue] && !p->red_handle[MAX_PRIOS])
+			priv->r->red_set(priv, port, queue, NULL);
+
 		p->tbf_handle[queue] = 0;
+		p->red_handle[queue] = 0;
 	}
 }
 
@@ -824,6 +832,7 @@ static int rtldsa_setup_qdisc_ets(struct rtl838x_switch_priv *priv, int port,
 	struct rtldsa_port *pp = &priv->ports[port];
 	bool offload = false;
 	u32 handle;
+	int queue;
 
 	if (!priv->r->queue_sched_set || qopt->parent != TC_H_ROOT)
 		return -EOPNOTSUPP;
@@ -850,7 +859,7 @@ static int rtldsa_setup_qdisc_ets(struct rtl838x_switch_priv *priv, int port,
 	mutex_lock(&priv->reg_mutex);
 
 	for (int band = 0; band < MAX_PRIOS; band++) {
-		int queue = MAX_PRIOS - 1 - band;
+		queue = MAX_PRIOS - 1 - band;
 
 		if (!offload)
 			priv->r->queue_sched_set(port, queue, rtldsa_default_queue_weights[queue],
