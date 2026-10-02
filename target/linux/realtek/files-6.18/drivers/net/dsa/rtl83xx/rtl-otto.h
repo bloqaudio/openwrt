@@ -474,6 +474,7 @@ struct rtldsa_config {
 	int (*red_enable)(struct rtl838x_switch_priv *priv, int port,
 			  const struct tc_red_qopt_offload_params *p);
 	void (*red_disable)(struct rtl838x_switch_priv *priv, int port);
+	void (*queue_sched_set)(int port, int queue, u32 weight, bool strict);
 	void (*qos_init)(struct rtl838x_switch_priv *priv);
 	int (*trk_mbr_ctr)(int group);
 	void (*lag_switch_init)(struct rtl838x_switch_priv *priv);
@@ -528,6 +529,9 @@ struct rtl838x_switch_priv {
 
 	/** @lagmembers: Port (bit) is part of any LAG */
 	u64 lagmembers;
+
+	/** @ets_ports: Port (bit) has ETS offloaded */
+	u64 ets_ports;
 
 	/** @red_ports: Port (bit) has RED offloaded */
 	u64 red_ports;
