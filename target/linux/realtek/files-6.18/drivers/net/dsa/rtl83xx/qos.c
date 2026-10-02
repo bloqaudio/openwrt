@@ -785,6 +785,7 @@ static int rtldsa_setup_qdisc_ets(struct rtl838x_switch_priv *priv, int port,
 				  struct tc_ets_qopt_offload *qopt)
 {
 	struct tc_ets_qopt_offload_replace_params *p = &qopt->replace_params;
+	struct rtldsa_port *pp = &priv->ports[port];
 	bool offload = false;
 
 	if (!priv->r->queue_sched_set || qopt->parent != TC_H_ROOT)
@@ -821,10 +822,20 @@ static int rtldsa_setup_qdisc_ets(struct rtl838x_switch_priv *priv, int port,
 			priv->r->queue_sched_set(port, queue, 1, true);
 	}
 
-	if (offload)
+	pp->ets_handle = offload ? qopt->handle : 0;
+
+	if (offload) {
 		priv->ets_ports |= BIT_ULL(port);
-	else
+	} else {
 		priv->ets_ports &= ~BIT_ULL(port);
+
+		/* the queue shapers go with the bands: their TBFs cannot be matched to a band later */
+		for (int queue = 0; queue < MAX_PRIOS; queue++)
+			if (pp->tbf_queues & BIT(queue))
+				priv->r->egress_shaper_set(priv, port, queue, 0, 0);
+
+		pp->tbf_queues = 0;
+	}
 
 	mutex_unlock(&priv->reg_mutex);
 
@@ -845,7 +856,7 @@ static int rtldsa_setup_qdisc_tbf(struct rtl838x_switch_priv *priv, int port,
 		return -EOPNOTSUPP;
 
 	if (qopt->parent != TC_H_ROOT) {
-		if (!band || band > MAX_PRIOS)
+		if (TC_H_MAJ(qopt->parent) != p->ets_handle || !band || band > MAX_PRIOS)
 			return -EOPNOTSUPP;
 
 		queue = MAX_PRIOS - band;
@@ -857,7 +868,7 @@ static int rtldsa_setup_qdisc_tbf(struct rtl838x_switch_priv *priv, int port,
 
 	switch (qopt->command) {
 	case TC_TBF_REPLACE:
-		if (queue < 0 ? p->rate_police_egress : !(priv->ets_ports & BIT_ULL(port)))
+		if (queue < 0 && p->rate_police_egress)
 			ret = -EOPNOTSUPP;
 		else
 			ret = priv->r->egress_shaper_set(priv, port, queue,
