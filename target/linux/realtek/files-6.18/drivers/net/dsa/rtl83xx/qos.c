@@ -686,12 +686,78 @@ static int rtldsa_setup_qdisc_ets(struct rtl838x_switch_priv *priv, int port,
 	return (offload || qopt->command == TC_ETS_DESTROY) ? 0 : -EOPNOTSUPP;
 }
 
+/* TBF at the root shapes the port, TBF on band n of an offloaded ETS shapes queue 8 - n */
+static int rtldsa_setup_qdisc_tbf(struct rtl838x_switch_priv *priv, int port,
+				  struct tc_tbf_qopt_offload *qopt)
+{
+	struct tc_tbf_qopt_offload_replace_params *params = &qopt->replace_params;
+	struct rtldsa_port *p = &priv->ports[port];
+	unsigned int band = TC_H_MIN(qopt->parent);
+	int queue = -1, ret = 0;
+	bool active;
+
+	if (!priv->r->egress_shaper_set)
+		return -EOPNOTSUPP;
+
+	if (qopt->parent != TC_H_ROOT) {
+		if (!band || band > MAX_PRIOS)
+			return -EOPNOTSUPP;
+
+		queue = MAX_PRIOS - band;
+	}
+
+	mutex_lock(&priv->reg_mutex);
+
+	active = queue < 0 ? p->tbf_root : p->tbf_queues & BIT(queue);
+
+	switch (qopt->command) {
+	case TC_TBF_REPLACE:
+		if (queue < 0 ? p->rate_police_egress : !(priv->ets_ports & BIT_ULL(port)))
+			ret = -EOPNOTSUPP;
+		else
+			ret = priv->r->egress_shaper_set(priv, port, queue,
+							 params->rate.rate_bytes_ps,
+							 params->max_size);
+
+		if (ret && active)
+			priv->r->egress_shaper_set(priv, port, queue, 0, 0);
+
+		active = !ret;
+		break;
+	case TC_TBF_DESTROY:
+		if (active)
+			priv->r->egress_shaper_set(priv, port, queue, 0, 0);
+
+		active = false;
+		break;
+	case TC_TBF_STATS:
+		ret = active ? 0 : -EOPNOTSUPP;
+		break;
+	default:
+		ret = -EOPNOTSUPP;
+		break;
+	}
+
+	if (queue < 0)
+		p->tbf_root = active;
+	else if (active)
+		p->tbf_queues |= BIT(queue);
+	else
+		p->tbf_queues &= ~BIT(queue);
+
+	mutex_unlock(&priv->reg_mutex);
+
+	return ret;
+}
+
 int rtldsa_port_setup_tc(struct dsa_switch *ds, int port, enum tc_setup_type type,
 			 void *type_data)
 {
 	struct rtl838x_switch_priv *priv = ds->priv;
 
 	switch (type) {
+	case TC_SETUP_QDISC_TBF:
+		return rtldsa_setup_qdisc_tbf(priv, port, type_data);
 	case TC_SETUP_QDISC_ETS:
 		return rtldsa_setup_qdisc_ets(priv, port, type_data);
 	case TC_SETUP_QDISC_RED:

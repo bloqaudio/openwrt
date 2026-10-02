@@ -24,6 +24,12 @@ struct rtl83xx_flow {
 
 #define RTL930X_BANDWIDTH_CTRL_EGRESS(port)	(0x7660 + (port * 16))
 #define RTL930X_BANDWIDTH_CTRL_INGRESS(port)	(0x8068 + (port * 4))
+#define RTL930X_BANDWIDTH_CTRL_QUEUE_SET0(port, queue) \
+						(0x3C60 + ((port) * 384) + ((queue) * 8))
+#define RTL930X_BANDWIDTH_CTRL_QUEUE_SET1(port, queue) \
+						(0xE300 + (((port) - 24) * 96) + ((queue) * 8))
+#define RTL930X_EGBW_LB_CTRL			0x78EC
+#define RTL930X_EGBW_LB_CTRL_TOKEN		GENMASK(31, 16)
 #define RTL930X_BANDWIDTH_CTRL_INGRESS_BURST_HIGH_ON(port) \
 						(0x80DC + (port * 8))
 #define RTL930X_BANDWIDTH_CTRL_INGRESS_BURST_HIGH_OFF(port) \
@@ -734,6 +740,38 @@ int rtldsa_930x_port_rate_police_del(struct dsa_switch *ds, int port,
 	return 0;
 }
 
+/* A queue below 0 is the shaper of the whole port and a rate of 0 switches the shaper off */
+int rtldsa_930x_egress_shaper_set(struct rtl838x_switch_priv *priv, int port, int queue,
+				  u64 rate_bytes_ps, u32 burst)
+{
+	u32 min_burst = 3 * FIELD_GET(RTL930X_EGBW_LB_CTRL_TOKEN, sw_r32(RTL930X_EGBW_LB_CTRL));
+	u64 rate = DIV_ROUND_UP_ULL(rate_bytes_ps, 2000);
+	u32 addr;
+
+	if (queue < 0)
+		addr = RTL930X_BANDWIDTH_CTRL_EGRESS(port);
+	else if (port < 24)
+		addr = RTL930X_BANDWIDTH_CTRL_QUEUE_SET0(port, queue);
+	else
+		addr = RTL930X_BANDWIDTH_CTRL_QUEUE_SET1(port, queue);
+
+	if (!rate) {
+		sw_w32_mask(RTL93XX_BANDWIDTH_CTRL_ENABLE, 0, addr);
+		return 0;
+	}
+
+	/* the bucket is 16 bit wide and has to hold the burst and one frame */
+	burst = min_t(u32, burst, U16_MAX - priv->r->max_frame);
+
+	if (rate > RTL93XX_BANDWIDTH_CTRL_RATE_MAX || burst < min_burst)
+		return -EINVAL;
+
+	sw_w32(burst, addr + 4);
+	sw_w32(rate | RTL93XX_BANDWIDTH_CTRL_ENABLE, addr);
+
+	return 0;
+}
+
 int rtldsa_931x_port_rate_police_add(struct dsa_switch *ds, int port,
 				     const struct flow_action_entry *act,
 				     bool ingress)
@@ -802,7 +840,7 @@ int rtldsa_cls_flower_add(struct dsa_switch *ds, int port,
 		goto unlock;
 	}
 
-	if (!ingress && p->rate_police_egress) {
+	if (!ingress && (p->rate_police_egress || p->tbf_root)) {
 		ret = -EOPNOTSUPP;
 		goto unlock;
 	}
