@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
+#include <linux/bitfield.h>
 #include <linux/debugfs.h>
 #include <linux/if_vlan.h>
 #include <linux/inetdevice.h>
+#include <linux/iopoll.h>
 #include <linux/notifier.h>
 #include <linux/of.h>
 #include <linux/rhashtable.h>
@@ -2581,6 +2583,455 @@ static void otto_l3_930x_dbgfs_init(struct otto_l3_ctrl *ctrl)
 	debugfs_create_file("clear_route_hits", 0200, root, ctrl, &otto_l3_930x_clear_hit_fops);
 }
 
+#define OTTO_L3_931X_ROUTE_ROWS		12288
+#define OTTO_L3_931X_CATCH_ALL_ROW	(OTTO_L3_931X_ROUTE_ROWS - 1)
+#define OTTO_L3_931X_CATCH_ALL6_ROW	(OTTO_L3_931X_ROUTE_ROWS - 6)
+#define OTTO_L3_931X_NH_INVALID		0xfffc
+
+#define OTTO_L3_931X_NON_IP_ACT		GENMASK(11, 10)
+#define OTTO_L3_931X_NH_AGE_OUT_ACT	GENMASK(8, 6)
+#define OTTO_L3_931X_NH_ERR_ACT		GENMASK(5, 4)
+#define OTTO_L3_931X_TTL_FAIL_ACT	GENMASK(17, 16)
+#define OTTO_L3_931X_MTU_FAIL_ACT	GENMASK(15, 14)
+#define OTTO_L3_931X_HDR_OPT_ACT	GENMASK(13, 11)
+#define OTTO_L3_931X_DMAC_BC_ACT	GENMASK(8, 7)
+#define OTTO_L3_931X_HL_FAIL_ACT	GENMASK(21, 20)
+#define OTTO_L3_931X_MTU6_FAIL_ACT	GENMASK(19, 18)
+#define OTTO_L3_931X_HDR_ROUTE_ACT	GENMASK(17, 15)
+#define OTTO_L3_931X_UC_HASH_ALG	GENMASK(3, 2)
+#define OTTO_L3_931X_TCAM_EN		(GENMASK(5, 0) | BIT(7))
+
+/* Six of every eight table addresses hold an entry */
+static int otto_l3_931x_row_addr(int row)
+{
+	return (row / 6) * 8 + row % 6;
+}
+
+static int otto_l3_931x_addr_row(int addr)
+{
+	return (addr / 8) * 6 + addr % 8;
+}
+
+/* A VLAN that was given no interface uses interface 0 */
+static int otto_l3_931x_intf(int idx)
+{
+	return idx + 1;
+}
+
+__maybe_unused
+static void otto_l3_931x_get_router_mac(struct otto_l3_ctrl *ctrl,
+					u32 idx, struct otto_l3_router_mac *m)
+{
+	u32 data[5];
+
+	otto_table_read(RTL9310_TBL_L3_ROUTER_MAC, idx, &data);
+
+	m->valid = !!(data[0] & BIT(31));
+	m->p_type = !!(data[0] & BIT(30));
+	m->p_id = (data[0] >> 23) & 0x7f;
+	m->p_id_mask = (data[2] >> 15) & 0x7f;
+	/* The entry matches on the ingress interface, not on a VLAN */
+	m->vid = (data[0] >> 13) & 0x3ff;
+	m->vid_mask = (data[2] >> 5) & 0x3ff;
+	m->mac = ((u64)(data[0] & 0x1fff) << 35) | ((u64)data[1] << 3) | (data[2] >> 29);
+	m->mac_mask = ((u64)(data[2] & 0x1f) << 43) | ((u64)data[3] << 11) | (data[4] >> 21);
+	m->action = (data[4] >> 12) & 0x7;
+}
+
+__maybe_unused
+static void otto_l3_931x_set_router_mac(struct otto_l3_ctrl *ctrl,
+					u32 idx, struct otto_l3_router_mac *m)
+{
+	u32 data[5];
+
+	data[0] = m->valid ? BIT(31) : 0;
+	data[0] |= m->p_type ? BIT(30) : 0;
+	data[0] |= (m->p_id & 0x7f) << 23;
+	data[0] |= (m->vid & 0x3ff) << 13;
+	data[0] |= (m->mac >> 35) & 0x1fff;
+	data[1] = m->mac >> 3;
+	data[2] = (m->mac & 0x7) << 29;
+	data[2] |= (m->p_id_mask & 0x7f) << 15;
+	data[2] |= (m->vid_mask & 0x3ff) << 5;
+	data[2] |= (m->mac_mask >> 43) & 0x1f;
+	data[3] = m->mac_mask >> 11;
+	data[4] = (m->mac_mask & 0x7ff) << 21;
+	data[4] |= (m->action & 0x7) << 12;
+
+	otto_table_write(RTL9310_TBL_L3_ROUTER_MAC, idx, &data);
+}
+
+__maybe_unused
+static void otto_l3_931x_set_egress_intf(struct otto_l3_ctrl *ctrl, int idx,
+					 struct otto_l3_intf *intf)
+{
+	struct rtl838x_switch_priv *priv = ctrl->priv;
+	struct rtldsa_vlan_info info;
+	u32 igr[2] = { BIT(23) | BIT(22), 0 };
+	u32 egr[4];
+
+	idx = otto_l3_931x_intf(idx);
+
+	egr[0] = (intf->vid & 0xfff) << 20;
+	egr[1] = intf->ip4_mtu_id & 0xf;
+	egr[2] = (intf->ip6_mtu_id & 0xf) << 28;
+	egr[2] |= (intf->ttl_scope & 0xff) << 20;
+	egr[2] |= (intf->hl_scope & 0xff) << 12;
+	egr[2] |= (intf->ip4_icmp_redirect & 0x7) << 9;
+	egr[2] |= (intf->ip6_icmp_redirect & 0x7) << 6;
+	egr[2] |= (intf->ip4_pbr_icmp_redirect & 0x7) << 3;
+	egr[2] |= intf->ip6_pbr_icmp_redirect & 0x7;
+	egr[3] = 0;
+
+	otto_table_write(RTL9310_TBL_L3_IGR_INTF, idx, &igr);
+	otto_table_write(RTL9310_TBL_L3_EGR_INTF, idx, &egr);
+
+	if (!intf->vid)
+		return;
+
+	priv->r->vlan_tables_read(intf->vid, &info);
+	info.if_id = idx;
+	priv->r->vlan_set_tagged(intf->vid, &info);
+}
+
+/* The source MAC is part of the egress interface entry, and a next hop names
+ * its destination MAC by the L2 entry that holds it.
+ */
+__maybe_unused
+static u64 otto_l3_931x_get_egress_mac(struct otto_l3_ctrl *ctrl, u32 idx)
+{
+	u32 data[4];
+
+	if (idx < L3_EGRESS_DMACS)
+		return 0;
+
+	idx = otto_l3_931x_intf(idx - L3_EGRESS_DMACS);
+	otto_table_read(RTL9310_TBL_L3_EGR_INTF, idx, &data);
+
+	return ((u64)(data[0] & 0xfffff) << 28) | (data[1] >> 4);
+}
+
+__maybe_unused
+static void otto_l3_931x_set_egress_mac(struct otto_l3_ctrl *ctrl, u32 idx, u64 mac)
+{
+	u32 data[4];
+
+	if (idx < L3_EGRESS_DMACS)
+		return;
+
+	idx = otto_l3_931x_intf(idx - L3_EGRESS_DMACS);
+
+	otto_table_read(RTL9310_TBL_L3_EGR_INTF, idx, &data);
+	data[0] = (data[0] & 0xfff00000) | ((mac >> 28) & 0xfffff);
+	data[1] = (data[1] & 0xf) | ((u32)mac << 4);
+	otto_table_write(RTL9310_TBL_L3_EGR_INTF, idx, &data);
+}
+
+__maybe_unused
+static void otto_l3_931x_set_nexthop(struct otto_l3_ctrl *ctrl, int idx, u16 dmac_id,
+				     u16 interface)
+{
+	u32 data = ((u32)dmac_id << 16) | ((otto_l3_931x_intf(interface) & 0x3ff) << 6);
+
+	otto_table_write(RTL9310_TBL_L3_NEXTHOP, idx, &data);
+}
+
+static u32 otto_l3_931x_hash4(u32 ip, int algorithm)
+{
+	u32 h = (ip >> 30) & 0x3;
+
+	if (!algorithm)
+		return h ^ ((ip >> 20) & 0x3ff) ^ ((ip >> 10) & 0x3ff) ^ (ip & 0x3ff);
+
+	for (int shift = 20; shift >= 0; shift -= 10) {
+		h += (ip >> shift) & 0x3ff;
+		h = (h & 0x3ff) + (h >> 10);
+	}
+
+	return h;
+}
+
+static void otto_l3_931x_host_route_read(struct otto_l3_ctrl *ctrl, int idx,
+					 struct otto_l3_route *rt)
+{
+	u32 data[4];
+
+	otto_table_read(RTL9310_TBL_L3_HOST_ROUTE_IPUC, otto_l3_931x_row_addr(idx), &data);
+
+	rt->attr.valid = !!(data[0] & BIT(31));
+	if (!rt->attr.valid)
+		return;
+
+	rt->attr.type = (data[0] >> 28) & 0x3;
+	if (rt->attr.type != ROUTE_TYPE_IP4UC)
+		return;
+
+	rt->dst_ip = ((data[0] & 0xfffff) << 12) | (data[1] >> 20);
+	rt->attr.dst_null = !!(data[1] & BIT(10));
+	rt->attr.action = (data[1] >> 7) & 0x7;
+	rt->nh.id = ((data[1] & 0x3f) << 7) | (data[2] >> 25);
+	rt->attr.ttl_dec = !!(data[2] & BIT(24));
+	rt->attr.ttl_check = !!(data[2] & BIT(23));
+	rt->attr.qos_as = !!(data[2] & BIT(22));
+	rt->attr.qos_prio = (data[2] >> 19) & 0x7;
+	rt->attr.hit = !!(data[3] & BIT(15));
+}
+
+__maybe_unused
+static void otto_l3_931x_host_route_write(struct otto_l3_ctrl *ctrl, int idx,
+					  struct otto_l3_route *rt)
+{
+	u32 data[4] = {};
+
+	if (rt->attr.type != ROUTE_TYPE_IP4UC) {
+		dev_warn(ctrl->dev, "route type not supported\n");
+		return;
+	}
+
+	if (rt->attr.valid) {
+		data[0] = BIT(31) | (rt->dst_ip >> 12);
+		data[1] = (rt->dst_ip & 0xfff) << 20;
+		data[1] |= rt->attr.dst_null ? BIT(10) : 0;
+		data[1] |= (rt->attr.action & 0x7) << 7;
+		data[1] |= (rt->nh.id >> 7) & 0x3f;
+		data[2] = (rt->nh.id & 0x7f) << 25;
+		data[2] |= rt->attr.ttl_dec ? BIT(24) : 0;
+		data[2] |= rt->attr.ttl_check ? BIT(23) : 0;
+		data[2] |= rt->attr.qos_as ? BIT(22) : 0;
+		data[2] |= (rt->attr.qos_prio & 0x7) << 19;
+		data[3] = rt->attr.hit ? BIT(15) : 0;
+	}
+
+	otto_table_write(RTL9310_TBL_L3_HOST_ROUTE_IPUC, otto_l3_931x_row_addr(idx), &data);
+}
+
+__maybe_unused
+static int otto_l3_931x_find_slot(struct otto_l3_ctrl *ctrl, struct otto_l3_route *rt,
+				  bool must_exist)
+{
+	struct otto_l3_route entry;
+	int algorithm, idx;
+	u32 hash;
+
+	if (rt->attr.type != ROUTE_TYPE_IP4UC)
+		return -1;
+
+	for (int t = 0; t < 2; t++) {
+		algorithm = (sw_r32(RTL931X_L3_HOST_TBL_CTRL) >> (2 + t)) & 0x1;
+		hash = otto_l3_931x_hash4(rt->dst_ip, algorithm);
+
+		for (int s = 0; s < 6; s++) {
+			idx = otto_l3_931x_addr_row((t << 13) | ((hash & 0x3ff) << 3) | s);
+
+			otto_l3_931x_host_route_read(ctrl, idx, &entry);
+			if (!must_exist && !entry.attr.valid)
+				return idx;
+			if (must_exist && entry.attr.valid &&
+			    entry.attr.type == ROUTE_TYPE_IP4UC && entry.dst_ip == rt->dst_ip)
+				return idx;
+		}
+	}
+
+	return -1;
+}
+
+__maybe_unused
+static void otto_l3_931x_route_read(struct otto_l3_ctrl *ctrl, int idx, struct otto_l3_route *rt)
+{
+	u32 data[6];
+
+	otto_table_read(RTL9310_TBL_L3_PREFIX_ROUTE_IPUC, otto_l3_931x_row_addr(idx), &data);
+
+	rt->attr.valid = !!(data[0] & BIT(31));
+	if (!rt->attr.valid)
+		return;
+
+	rt->attr.type = (data[0] >> 28) & 0x3;
+	if (rt->attr.type != ROUTE_TYPE_IP4UC)
+		return;
+
+	rt->dst_ip = ((data[0] & 0xfffff) << 12) | (data[1] >> 20);
+	rt->prefix_len = inet_mask_len(data[2]);
+	rt->attr.dst_null = !!(data[3] & BIT(20));
+	rt->attr.action = (data[3] >> 17) & 0x7;
+	rt->nh.id = (data[3] >> 3) & 0x1fff;
+	rt->attr.ttl_dec = !!(data[3] & BIT(2));
+	rt->attr.ttl_check = !!(data[3] & BIT(1));
+	rt->attr.qos_as = !!(data[3] & BIT(0));
+	rt->attr.qos_prio = data[4] >> 29;
+	rt->attr.hit = !!(data[5] & BIT(27));
+}
+
+static void otto_l3_931x_route_encode(u32 data[6], u32 ip, int prefix_len)
+{
+	data[0] = BIT(31) | (ip >> 12);
+	data[1] = ((ip & 0xfff) << 20) | BIT(10) | (0x3 << 8) | 0xff;
+	data[2] = inet_make_mask(prefix_len);
+	data[3] = prefix_len == 32 ? BIT(22) : 0;
+	data[3] |= prefix_len == 0 ? BIT(21) : 0;
+}
+
+__maybe_unused
+static void otto_l3_931x_route_write(struct otto_l3_ctrl *ctrl, int idx, struct otto_l3_route *rt)
+{
+	u32 data[6] = {};
+
+	if (rt->attr.type != ROUTE_TYPE_IP4UC) {
+		dev_warn(ctrl->dev, "route type not supported\n");
+		return;
+	}
+
+	if (rt->attr.valid) {
+		otto_l3_931x_route_encode(data, rt->dst_ip, rt->prefix_len);
+		data[3] |= rt->attr.dst_null ? BIT(20) : 0;
+		data[3] |= (rt->attr.action & 0x7) << 17;
+		data[3] |= (rt->nh.id & 0x1fff) << 3;
+		data[3] |= rt->attr.ttl_dec ? BIT(2) : 0;
+		data[3] |= rt->attr.ttl_check ? BIT(1) : 0;
+		data[3] |= rt->attr.qos_as ? BIT(0) : 0;
+		data[4] = (rt->attr.qos_prio & 0x7) << 29;
+		data[5] = rt->attr.hit ? BIT(27) : 0;
+	}
+
+	otto_table_write(RTL9310_TBL_L3_PREFIX_ROUTE_IPUC, otto_l3_931x_row_addr(idx), &data);
+}
+
+__maybe_unused
+static int otto_l3_931x_route_lookup_hw(struct otto_l3_ctrl *ctrl, struct otto_l3_route *rt)
+{
+	u32 v;
+	int row;
+
+	if (rt->attr.type != ROUTE_TYPE_IP4UC)
+		return -1;
+
+	sw_w32_mask(GENMASK(24, 0), rt->attr.type << 22, RTL931X_L3_HW_LU_KEY_CTRL);
+	sw_w32(0, RTL931X_L3_HW_LU_KEY_DIP_CTRL);
+	sw_w32(0, RTL931X_L3_HW_LU_KEY_DIP_CTRL + 4);
+	sw_w32(0, RTL931X_L3_HW_LU_KEY_DIP_CTRL + 8);
+	sw_w32(rt->dst_ip & inet_make_mask(rt->prefix_len), RTL931X_L3_HW_LU_KEY_DIP_CTRL + 12);
+
+	sw_w32_mask(BIT(15), BIT(15), RTL931X_L3_HW_LU_CTRL);
+	if (read_poll_timeout(sw_r32, v, !(v & BIT(15)), 10, 10000, false,
+			      RTL931X_L3_HW_LU_CTRL)) {
+		dev_err(ctrl->dev, "prefix route lookup timed out\n");
+		return -1;
+	}
+
+	if (!(v & BIT(14)))
+		return -1;
+
+	row = otto_l3_931x_addr_row(v & 0x3fff);
+
+	return row < OTTO_L3_931X_CATCH_ALL6_ROW ? row : -1;
+}
+
+/* Returns -EAGAIN when no row was written and the table is as it was, and -EIO
+ * when the block may be half shifted.
+ */
+__maybe_unused
+static int otto_l3_931x_route_rows_move(struct otto_l3_ctrl *ctrl, int dst, int src, int count)
+{
+	u32 data[6];
+	int handle, err = 0;
+
+	if (max(dst, src) + count > OTTO_L3_931X_CATCH_ALL6_ROW)
+		return -EAGAIN;
+
+	handle = otto_table_acquire(RTL9310_TBL_L3_PREFIX_ROUTE_IPUC);
+	if (handle < 0) {
+		dev_err(ctrl->dev, "cannot move prefix route rows: %d\n", handle);
+		return -EAGAIN;
+	}
+
+	/* The ranges overlap, so the copy runs away from the direction of travel */
+	for (int n = 0; n < count; n++) {
+		int i = dst > src ? count - 1 - n : n;
+		bool unread;
+
+		err = __otto_table_read(handle, otto_l3_931x_row_addr(src + i), &data);
+		unread = err;
+		if (!err)
+			err = __otto_table_write(handle, otto_l3_931x_row_addr(dst + i), &data);
+		if (err) {
+			dev_err(ctrl->dev, "prefix route row %d not moved to %d: %d\n",
+				src + i, dst + i, err);
+			err = unread && !n ? -EAGAIN : -EIO;
+			break;
+		}
+	}
+
+	otto_table_release(handle);
+
+	return err;
+}
+
+__maybe_unused
+static int otto_l3_931x_setup(struct otto_l3_ctrl *ctrl)
+{
+	struct rtl838x_switch_priv *priv = ctrl->priv;
+	u32 nexthop = OTTO_L3_931X_NH_INVALID << 16;
+	u32 catch_all[6] = {};
+
+	for (int i = 0; i < MAX_INTF_MTUS; i++)
+		priv->intf_mtu_count[i] = priv->intf_mtus[i] = 0;
+
+	for (int i = 0; i < 2; i++) {
+		priv->intf_mtus[i] = DEFAULT_MTU;
+		sw_w32_mask(GENMASK(13, 0), DEFAULT_MTU, RTL931X_L3_INTF_IP_MTU(i));
+		sw_w32_mask(GENMASK(13, 0), DEFAULT_MTU, RTL931X_L3_INTF_IP6_MTU(i));
+	}
+
+	sw_w32_mask(OTTO_L3_931X_UC_HASH_ALG, BIT(3), RTL931X_L3_HOST_TBL_CTRL);
+
+	sw_w32_mask(OTTO_L3_931X_NON_IP_ACT | OTTO_L3_931X_NH_AGE_OUT_ACT |
+		    OTTO_L3_931X_NH_ERR_ACT,
+		    FIELD_PREP(OTTO_L3_931X_NON_IP_ACT, 1) |
+		    FIELD_PREP(OTTO_L3_931X_NH_AGE_OUT_ACT, 1) |
+		    FIELD_PREP(OTTO_L3_931X_NH_ERR_ACT, 1),
+		    RTL931X_L3_IP_ROUTE_CTRL);
+
+	otto_table_write(RTL9310_TBL_L3_NEXTHOP, 0, &nexthop);
+	set_bit(0, ctrl->route_use_bm);
+
+	/* A frame for the router MAC that no row matches is dropped, of either
+	 * family, so IPv6 is looked up as well although no IPv6 route is
+	 * offloaded. An IPv6 row is three wide and starts on row 0 or 3 of six.
+	 */
+	otto_l3_931x_route_encode(catch_all, 0, 0);
+	catch_all[1] &= ~(BIT(10) | 0xff);
+	catch_all[3] |= ROUTE_ACT_TRAP2CPU << 17;
+	otto_table_write(RTL9310_TBL_L3_PREFIX_ROUTE_IPUC,
+			 otto_l3_931x_row_addr(OTTO_L3_931X_CATCH_ALL_ROW), &catch_all);
+
+	catch_all[0] |= ROUTE_TYPE_IP6UC << 28;
+	for (int i = 0; i < 3; i++) {
+		otto_table_write(RTL9310_TBL_L3_PREFIX_ROUTE_IPUC,
+				 otto_l3_931x_row_addr(OTTO_L3_931X_CATCH_ALL6_ROW + i),
+				 &catch_all);
+		catch_all[3] = 0;
+	}
+
+	sw_w32_mask(OTTO_L3_931X_TCAM_EN, OTTO_L3_931X_TCAM_EN, RTL931X_ALE_L3_MISC_CTRL);
+
+	sw_w32_mask(OTTO_L3_931X_TTL_FAIL_ACT | OTTO_L3_931X_MTU_FAIL_ACT |
+		    OTTO_L3_931X_HDR_OPT_ACT | OTTO_L3_931X_DMAC_BC_ACT | BIT(0),
+		    FIELD_PREP(OTTO_L3_931X_TTL_FAIL_ACT, 1) |
+		    FIELD_PREP(OTTO_L3_931X_MTU_FAIL_ACT, 1) |
+		    FIELD_PREP(OTTO_L3_931X_HDR_OPT_ACT, 2) |
+		    FIELD_PREP(OTTO_L3_931X_DMAC_BC_ACT, 1) | BIT(0),
+		    RTL931X_L3_IPUC_ROUTE_CTRL);
+
+	sw_w32_mask(OTTO_L3_931X_HL_FAIL_ACT | OTTO_L3_931X_MTU6_FAIL_ACT |
+		    OTTO_L3_931X_HDR_ROUTE_ACT | BIT(0),
+		    FIELD_PREP(OTTO_L3_931X_HL_FAIL_ACT, 1) |
+		    FIELD_PREP(OTTO_L3_931X_MTU6_FAIL_ACT, 1) |
+		    FIELD_PREP(OTTO_L3_931X_HDR_ROUTE_ACT, 2) | BIT(0),
+		    RTL931X_L3_IP6UC_ROUTE_CTRL);
+
+	return 0;
+}
+
 const struct otto_l3_config otto_l3_838x_cfg = {
 	.route_read = otto_l3_838x_route_read,
 	.route_write = otto_l3_838x_route_write,
@@ -2615,6 +3066,22 @@ const struct otto_l3_config otto_l3_930x_cfg = {
 };
 
 const struct otto_l3_config otto_l3_931x_cfg = {
+#ifdef CONFIG_NET_DSA_RTL83XX_RTL931X_L3_OFFLOAD
+	.use_l3_tables = true,
+	.find_slot = otto_l3_931x_find_slot,
+	.get_egress_mac = otto_l3_931x_get_egress_mac,
+	.set_egress_mac = otto_l3_931x_set_egress_mac,
+	.set_egress_intf = otto_l3_931x_set_egress_intf,
+	.host_route_write = otto_l3_931x_host_route_write,
+	.get_router_mac = otto_l3_931x_get_router_mac,
+	.set_router_mac = otto_l3_931x_set_router_mac,
+	.set_nexthop = otto_l3_931x_set_nexthop,
+	.route_lookup_hw = otto_l3_931x_route_lookup_hw,
+	.route_rows_move = otto_l3_931x_route_rows_move,
+	.route_read = otto_l3_931x_route_read,
+	.route_write = otto_l3_931x_route_write,
+	.setup = otto_l3_931x_setup,
+#endif
 };
 
 static const struct of_device_id otto_l3_of_ids[] = {

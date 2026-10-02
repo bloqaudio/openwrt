@@ -10,3 +10,7 @@ config NET_DSA_RTL83XX
 config NET_DSA_RTL83XX_RTL930X_L3_OFFLOAD
 	bool "Realtek RTL930x layer 3 offload (experimental)"
 	depends on NET_DSA_RTL83XX
+
+config NET_DSA_RTL83XX_RTL931X_L3_OFFLOAD
+	bool "Realtek RTL931x layer 3 offload (experimental)"
+	depends on NET_DSA_RTL83XX
