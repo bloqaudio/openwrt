@@ -247,51 +247,98 @@ void rtldsa_930x_flowctrl_init(struct rtl838x_switch_priv *priv)
 	mutex_unlock(&priv->reg_mutex);
 }
 
-/* The thresholds are one table for the whole switch. Between the two thresholds the
- * hardware drops with one fixed probability of rate / 1023, above the upper one it
- * drops everything.
- */
-int rtldsa_930x_red_enable(struct rtl838x_switch_priv *priv, int port,
-			   const struct tc_red_qopt_offload_params *p)
+/* A row with both thresholds at the tail drop threshold of the queue drops like no RED */
+static u32 rtldsa_930x_red_tail_drop(int queue)
 {
-	u32 min = DIV_ROUND_UP(p->min, RTL930X_SWRED_PAGE_SIZE);
-	u32 max = p->max / RTL930X_SWRED_PAGE_SIZE;
-	u64 rate = ((u64)p->probability * RTL930X_SWRED_RATE_SCALE + U32_MAX) >> 32;
-	u32 cfg;
+	u32 thr = 0;
 
-	if (!min || min >= max || max > FIELD_MAX(RTL930X_SWRED_MAX) ||
-	    !rate || rate > FIELD_MAX(RTL930X_SWRED_RATE))
-		return -EINVAL;
+	for (int set = 0; set < RTL930X_FC_THR_SETS; set++)
+		thr = max(thr, FIELD_GET(RTL930X_FC_ON,
+					 sw_r32(RTL930X_FC_Q_EGR_DROP_THR(queue, set))));
 
-	cfg = FIELD_PREP(RTL930X_SWRED_RATE, rate) | FIELD_PREP(RTL930X_SWRED_MAX, max) |
-	      FIELD_PREP(RTL930X_SWRED_MIN, min);
+	return FIELD_PREP(RTL930X_SWRED_MAX, thr) | FIELD_PREP(RTL930X_SWRED_MIN, thr);
+}
 
-	if ((priv->red_ports & ~BIT_ULL(port)) && cfg != priv->red_cfg) {
-		dev_warn(priv->dev, "port %d: RED parameters differ from the ones in use\n", port);
-		return -EBUSY;
+/* The thresholds are one table of queues for the whole switch and a port has RED on all
+ * its queues or on none, so the ports with RED must all want the same table.
+ */
+static int rtldsa_930x_red_apply(struct rtl838x_switch_priv *priv, int port)
+{
+	u32 *wanted = priv->ports[port].red_cfg;
+	int ret = 0;
+
+	if (!memchr_inv(wanted, 0, sizeof(priv->red_cfg)))
+		goto disable;
+
+	if (priv->red_ports & ~BIT_ULL(port)) {
+		if (memcmp(wanted, priv->red_cfg, sizeof(priv->red_cfg))) {
+			dev_warn(priv->dev, "port %d: RED differs from the one in use\n", port);
+			ret = -EBUSY;
+			goto disable;
+		}
+	} else {
+		for (int queue = 0; queue < RTL930X_FC_QUEUES; queue++) {
+			u32 cfg = queue < MAX_PRIOS ? wanted[queue] : 0;
+
+			if (!cfg)
+				cfg = rtldsa_930x_red_tail_drop(queue);
+
+			for (int dp = 0; dp < RTL930X_SWRED_DROP_PRECEDENCES; dp++)
+				sw_w32(cfg, RTL930X_SWRED_QUEUE_DROP_CTRL(queue, dp));
+		}
+
+		memcpy(priv->red_cfg, wanted, sizeof(priv->red_cfg));
 	}
-
-	for (int queue = 0; queue < RTL930X_FC_QUEUES; queue++)
-		for (int dp = 0; dp < RTL930X_SWRED_DROP_PRECEDENCES; dp++)
-			sw_w32(cfg, RTL930X_SWRED_QUEUE_DROP_CTRL(queue, dp));
 
 	/* the egress drop stage has to look at the egress queue, not at the ingress port */
 	sw_w32_mask(RTL930X_FC_REF_RXCNGST, 0, RTL930X_FC_PORT_EGR_DROP_CTRL(port));
 	sw_w32_mask(0, BIT(port), RTL930X_SWRED_PORT_CTRL);
-
-	priv->red_cfg = cfg;
 	priv->red_ports |= BIT_ULL(port);
 
 	return 0;
+
+disable:
+	if (priv->red_ports & BIT_ULL(port)) {
+		sw_w32_mask(BIT(port), 0, RTL930X_SWRED_PORT_CTRL);
+		sw_w32_mask(0, RTL930X_FC_REF_RXCNGST, RTL930X_FC_PORT_EGR_DROP_CTRL(port));
+		priv->red_ports &= ~BIT_ULL(port);
+	}
+
+	return ret;
 }
 
-void rtldsa_930x_red_disable(struct rtl838x_switch_priv *priv, int port)
+/* Between the two thresholds the hardware drops with one fixed probability of rate / 1023,
+ * above the upper one it drops everything. A negative @queue stands for all queues of the
+ * port, no @p for no RED.
+ */
+int rtldsa_930x_red_set(struct rtl838x_switch_priv *priv, int port, int queue,
+			const struct tc_red_qopt_offload_params *p)
 {
-	if (!(priv->red_ports & BIT_ULL(port)))
-		return;
+	u32 *wanted = priv->ports[port].red_cfg;
+	int ret, err = 0;
+	u32 cfg = 0;
 
-	sw_w32_mask(BIT(port), 0, RTL930X_SWRED_PORT_CTRL);
-	sw_w32_mask(0, RTL930X_FC_REF_RXCNGST, RTL930X_FC_PORT_EGR_DROP_CTRL(port));
+	if (p) {
+		u32 min = DIV_ROUND_UP(p->min, RTL930X_SWRED_PAGE_SIZE);
+		u32 max = p->max / RTL930X_SWRED_PAGE_SIZE;
+		u64 rate = ((u64)p->probability * RTL930X_SWRED_RATE_SCALE + U32_MAX) >> 32;
 
-	priv->red_ports &= ~BIT_ULL(port);
+		if (!min || min >= max || max > FIELD_MAX(RTL930X_SWRED_MAX) ||
+		    !rate || rate > FIELD_MAX(RTL930X_SWRED_RATE))
+			err = -EINVAL;
+		else
+			cfg = FIELD_PREP(RTL930X_SWRED_RATE, rate) |
+			      FIELD_PREP(RTL930X_SWRED_MAX, max) |
+			      FIELD_PREP(RTL930X_SWRED_MIN, min);
+	}
+
+	for (int i = 0; i < MAX_PRIOS; i++)
+		if (queue < 0 || queue == i)
+			wanted[i] = cfg;
+
+	ret = rtldsa_930x_red_apply(priv, port);
+	if (ret && cfg)
+		rtldsa_930x_red_set(priv, port, queue, NULL);
+
+	return err ?: ret;
 }
