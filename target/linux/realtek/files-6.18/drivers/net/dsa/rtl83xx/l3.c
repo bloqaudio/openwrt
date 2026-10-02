@@ -1785,15 +1785,21 @@ static int otto_l3_fib_check_v4(struct otto_l3_ctrl *ctrl,
 	return 0;
 }
 
-static void otto_l3_host_route_trap(struct otto_l3_ctrl *ctrl,
-				    struct fib_entry_notifier_info *info)
+/* A shorter prefix in hardware would forward what the CPU has to handle, so
+ * a route that is not offloaded gets a row that traps it.
+ */
+static void otto_l3_route_trap(struct otto_l3_ctrl *ctrl, struct fib_entry_notifier_info *info)
 {
+	bool host = info->dst_len == 32 && ctrl->cfg->host_route_write;
 	struct otto_l3_route *route;
 	struct in6_addr gw;
 	int slot;
 
+	if (!host && (!ctrl->cfg->use_l3_tables || !info->dst_len))
+		return;
+
 	ipv6_addr_set_v4mapped(0, &gw);
-	route = otto_l3_host_route_alloc(ctrl, &gw);
+	route = host ? otto_l3_host_route_alloc(ctrl, &gw) : otto_l3_route_alloc(ctrl, &gw);
 	if (!route) {
 		otto_l3_fib4_info_failed(info);
 		return;
@@ -1805,24 +1811,37 @@ static void otto_l3_host_route_trap(struct otto_l3_ctrl *ctrl,
 	route->attr.valid = true;
 	route->attr.action = ROUTE_ACT_TRAP2CPU;
 	route->attr.type = ROUTE_TYPE_IP4UC;
+	route->nh.id = route->id;
 	route->fi = info->fi;
 	fib_info_hold(route->fi);
 	route->dscp = info->dscp;
 	route->fib_type = info->type;
 
-	slot = ctrl->cfg->find_slot(ctrl, route, true);
-	if (slot < 0)
-		slot = ctrl->cfg->find_slot(ctrl, route, false);
+	if (host) {
+		slot = ctrl->cfg->find_slot(ctrl, route, true);
+		if (slot < 0)
+			slot = ctrl->cfg->find_slot(ctrl, route, false);
+		if (slot < 0) {
+			dev_err(ctrl->dev, "no slot for host route %pI4\n", &route->dst_ip);
+			goto out_failed;
+		}
 
-	if (slot < 0) {
-		dev_err(ctrl->dev, "no slot for host route %pI4\n", &route->dst_ip);
-		otto_l3_route_free(ctrl, route);
-		otto_l3_fib4_info_failed(info);
-		return;
+		ctrl->cfg->host_route_write(ctrl, slot, route);
+	} else {
+		route->row = otto_l3_route_place(ctrl, route);
+		if (route->row < 0)
+			goto out_failed;
+
+		ctrl->cfg->route_write(ctrl, route->row, route);
 	}
 
-	ctrl->cfg->host_route_write(ctrl, slot, route);
 	otto_l3_fib4_flags_set(route, false, true, false);
+
+	return;
+
+out_failed:
+	otto_l3_route_free(ctrl, route);
+	otto_l3_fib4_info_failed(info);
 }
 
 static int otto_l3_fib_add_v4(struct otto_l3_ctrl *ctrl, struct fib_entry_notifier_info *info)
@@ -1846,8 +1865,7 @@ static int otto_l3_fib_add_v4(struct otto_l3_ctrl *ctrl, struct fib_entry_notifi
 					   NULL, info->dst_len);
 		if (route)
 			otto_l3_route_teardown(ctrl, route);
-		if (info->dst_len == 32 && ctrl->cfg->host_route_write)
-			otto_l3_host_route_trap(ctrl, info);
+		otto_l3_route_trap(ctrl, info);
 		return 0;
 	}
 
