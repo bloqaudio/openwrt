@@ -758,6 +758,16 @@ enum rtldsa_flood_type {
 #define RTL930X_L3_HW_LU_KEY_IP_CTRL		(0xACA0)
 #define RTL930X_L3_HW_LU_CTRL			(0xACC0)
 #define RTL930X_L3_IP_ROUTE_CTRL		0xab44
+#define RTL931X_L3_IP_ROUTE_CTRL		(0xF000)
+#define RTL931X_L3_HOST_TBL_CTRL		(0xF004)
+#define RTL931X_L3_IPUC_ROUTE_CTRL		(0xF008)
+#define RTL931X_L3_IP6UC_ROUTE_CTRL		(0xF00C)
+#define RTL931X_L3_INTF_IP_MTU(i)		(0xF1E0 + ((i) << 2))
+#define RTL931X_L3_INTF_IP6_MTU(i)		(0xF220 + ((i) << 2))
+#define RTL931X_L3_HW_LU_KEY_CTRL		(0xF29C)
+#define RTL931X_L3_HW_LU_KEY_DIP_CTRL		(0xF2B0)
+#define RTL931X_L3_HW_LU_CTRL			(0xF2C0)
+#define RTL931X_ALE_L3_MISC_CTRL		(0xF2E8)
 
 /* Port LED Control */
 #define RTL930X_LED_PORT_NUM_CTRL(p)		(0xCC04 + (((p >> 4) << 2)))
