@@ -1330,6 +1330,7 @@ static void otto_l3_host_unshadow(struct otto_l3_ctrl *ctrl, struct otto_l3_rout
 		slot = ctrl->cfg->find_slot(ctrl, q, false);
 		if (slot >= 0) {
 			ctrl->cfg->host_route_write(ctrl, slot, q);
+			q->hw_forward = q->attr.action == ROUTE_ACT_FORWARD;
 			otto_l3_fib4_flags_set(q, q->attr.action == ROUTE_ACT_FORWARD,
 					       q->attr.action != ROUTE_ACT_FORWARD, false);
 		}
@@ -1429,6 +1430,7 @@ static void otto_l3_route_update_hw(struct otto_l3_ctrl *ctrl, struct otto_l3_ro
 		otto_l3_route_rewrite(ctrl, r);
 	}
 
+	r->hw_forward = false;
 	r->nh.mac = r->nh.gw = mac;
 	r->nh.port = priv->r->port_ignore;
 	r->nh.id = r->id;
@@ -1495,6 +1497,7 @@ static void otto_l3_route_update_hw(struct otto_l3_ctrl *ctrl, struct otto_l3_ro
 
 	shadowed = otto_l3_host_shadowed(ctrl, r);
 	otto_l3_fib4_flags_set(r, !trap && !shadowed, trap || shadowed, false);
+	r->hw_forward = !trap && !shadowed;
 
 	if (ctrl->cfg->use_l3_tables)
 		return;
@@ -1534,6 +1537,7 @@ static void otto_l3_route_trap_hw(struct otto_l3_ctrl *ctrl, struct otto_l3_rout
 	r->attr.action = ROUTE_ACT_TRAP2CPU;
 	r->attr.ttl_dec = false;
 	r->attr.ttl_check = false;
+	r->hw_forward = false;
 	otto_l3_fib4_flags_set(r, false, true, false);
 
 	if (r->is_host_route)
@@ -1587,6 +1591,13 @@ static int otto_l3_nexthop_update(struct otto_l3_ctrl *ctrl, u8 type, int ifinde
 		 * the address alone does not say whose route this is.
 		 */
 		if (r->attr.type != type || r->gw_ifindex != ifindex)
+			continue;
+
+		/* A neighbour that is confirmed again changes nothing for a route
+		 * that already forwards to it
+		 */
+		if (valid && r->hw_forward && r->nh.mac == mac &&
+		    rtldsa_l2_nexthop_current(ctrl->priv, &r->nh))
 			continue;
 
 		if (valid)
@@ -2793,6 +2804,7 @@ static void otto_l3_rules_check(struct otto_l3_ctrl *ctrl, int family)
 			r->attr.action = ROUTE_ACT_TRAP2CPU;
 			r->attr.ttl_dec = false;
 			r->attr.ttl_check = false;
+			r->hw_forward = false;
 			otto_l3_route_rewrite(ctrl, r);
 			otto_l3_fib4_flags_set(r, false, true, false);
 			if (IS_REACHABLE(CONFIG_IPV6) && r->f6i && r->row >= FIRST_PREFIX_ROW)
