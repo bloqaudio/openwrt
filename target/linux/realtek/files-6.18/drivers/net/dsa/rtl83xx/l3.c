@@ -1358,14 +1358,17 @@ static int otto_l3_nexthop_update(struct otto_l3_ctrl *ctrl, u8 type, int ifinde
 	return 0;
 }
 
-static int otto_l3_port_gw_resolve(struct otto_l3_ctrl *ctrl, struct net_device *dev,
-				   struct neigh_table *tbl, const struct in6_addr *gw)
+/* Every route through a gateway that is already resolved is in hardware, so
+ * only the new one is programmed.
+ */
+static int otto_l3_port_gw_resolve(struct otto_l3_ctrl *ctrl, struct otto_l3_route *r,
+				   struct net_device *dev, struct neigh_table *tbl,
+				   const struct in6_addr *gw)
 {
 	/* An ARP neighbour is keyed on four bytes, which in a v4-mapped
 	 * address are the last word of it.
 	 */
 	const void *key = tbl == &arp_tbl ? (const void *)&gw->s6_addr32[3] : gw;
-	u8 type = tbl == &arp_tbl ? ROUTE_TYPE_IP4UC : ROUTE_TYPE_IP6UC;
 	struct neighbour *n = neigh_lookup(tbl, key, dev);
 	int err = 0;
 	u64 mac;
@@ -1380,9 +1383,11 @@ static int otto_l3_port_gw_resolve(struct otto_l3_ctrl *ctrl, struct net_device 
 	 * install the entry, otherwise start the resolution.
 	 */
 	if (n->nud_state & NUD_VALID) {
+		read_lock_bh(&n->lock);
 		mac = ether_addr_to_u64(n->ha);
+		read_unlock_bh(&n->lock);
 		dev_info(ctrl->dev, "resolved mac: %016llx\n", mac);
-		otto_l3_nexthop_update(ctrl, type, dev->ifindex, gw, mac, true);
+		otto_l3_route_update_hw(ctrl, r, mac);
 	} else {
 		dev_info(ctrl->dev, "need to wait\n");
 		neigh_event_send(n, NULL);
@@ -1856,7 +1861,7 @@ static int otto_l3_fib_add_v4(struct otto_l3_ctrl *ctrl, struct fib_entry_notifi
 
 	/* We need to resolve the mac address of the GW */
 	if (nh->fib_nh_gw4)
-		otto_l3_port_gw_resolve(ctrl, ndev, &arp_tbl, &gw);
+		otto_l3_port_gw_resolve(ctrl, route, ndev, &arp_tbl, &gw);
 
 	return 0;
 
