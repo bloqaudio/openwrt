@@ -736,7 +736,7 @@ u32 rtl930x_l2_hash_key(struct rtl838x_switch_priv *priv, u64 seed)
 	h2 = (seed >> 33) & 0x7ff;
 	h2 = ((h2 & 0x3f) << 5) | ((h2 >> 6) & 0x3f);
 
-	k1 = (u32)(((seed << 55) & 0x1f) ^
+	k1 = (u32)(((seed >> 55) & 0x1f) ^
 		   ((seed >> 44) & 0x7ff) ^
 		   h2 ^
 		   ((seed >> 22) & 0x7ff) ^
@@ -999,7 +999,7 @@ u32 rtl930x_hash(struct rtl838x_switch_priv *priv, u64 seed)
 	h2 = (seed >> 33) & 0x7ff;
 	h2 = ((h2 & 0x3f) << 5) | ((h2 >> 6) & 0x3f);
 
-	k1 = (u32) (((seed << 55) & 0x1f) ^
+	k1 = (u32) (((seed >> 55) & 0x1f) ^
 		    ((seed >> 44) & 0x7ff) ^
 		    h2 ^
 		    ((seed >> 22) & 0x7ff) ^
