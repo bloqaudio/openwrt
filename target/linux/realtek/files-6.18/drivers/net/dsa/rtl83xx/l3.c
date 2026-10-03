@@ -132,6 +132,7 @@ struct otto_l3_net_event_work {
 	struct in6_addr gw_addr;
 	int ifindex;
 	bool valid;
+	bool noarp;
 	u8 type;
 };
 
@@ -1557,7 +1558,7 @@ static int otto_l3_nexthop_update(struct otto_l3_ctrl *ctrl, u8 type, int ifinde
 		/* An IPv4 gateway written v4-mapped is a valid IPv6 one, so
 		 * the address alone does not say whose route this is.
 		 */
-		if (r->attr.type != type || r->gw_ifindex != ifindex)
+		if (r->neigh || r->attr.type != type || r->gw_ifindex != ifindex)
 			continue;
 
 		/* A neighbour that is confirmed again changes nothing for a route
@@ -2980,6 +2981,88 @@ static int otto_l3_fib_notifier(struct notifier_block *this, unsigned long event
 	return NOTIFY_DONE;
 }
 
+/* A host on a connected subnet is never the destination of a FIB route, only
+ * of a neighbour entry, so without a host route of its own every packet to it
+ * is routed by the CPU. The route lives as long as the neighbour is valid, and
+ * a FIB route to the same address replaces it.
+ */
+static void otto_l3_neigh_route_update(struct otto_l3_ctrl *ctrl,
+				       struct otto_l3_net_event_work *nw)
+{
+	struct otto_l3_route *r = NULL, *q;
+	struct net_device *dev;
+	u32 ip = be32_to_cpu(nw->gw_addr.s6_addr32[3]);
+	u64 dev_mac;
+	int vlan;
+
+	if (nw->type != ROUTE_TYPE_IP4UC || !ctrl->cfg->use_l3_tables ||
+	    !ctrl->cfg->host_route_write)
+		return;
+
+	list_for_each_entry(q, &ctrl->routes_list, list) {
+		if (q->neigh && q->gw_ifindex == nw->ifindex &&
+		    ipv6_addr_equal(&q->gw_ip, &nw->gw_addr)) {
+			r = q;
+			break;
+		}
+	}
+
+	if (!nw->valid || nw->noarp) {
+		if (r)
+			otto_l3_route_teardown(ctrl, r);
+		return;
+	}
+
+	if (r) {
+		if (r->hw_forward && r->nh.mac == nw->mac &&
+		    rtldsa_l2_nexthop_current(ctrl->priv, &r->nh))
+			return;
+		otto_l3_route_update_hw(ctrl, r, nw->mac);
+		return;
+	}
+
+	if (ipv4_is_multicast(htonl(ip)) || ipv4_is_lbcast(htonl(ip)) ||
+	    otto_l3_route_find(ctrl, RT_TABLE_MAIN, ROUTE_TYPE_IP4UC, ip, NULL, 32))
+		return;
+
+	dev = dev_get_by_index(&init_net, nw->ifindex);
+	if (!dev)
+		return;
+	vlan = is_vlan_dev(dev) ? vlan_dev_vlan_id(dev) : 0;
+	dev_mac = ether_addr_to_u64(dev->dev_addr);
+	dev_put(dev);
+
+	/* A bare port has no VLAN to route in */
+	if (!vlan)
+		return;
+
+	r = otto_l3_route_alloc(ctrl, &nw->gw_addr, ROUTE_HOST);
+	if (!r)
+		return;
+
+	r->neigh = true;
+	r->dst_ip = ip;
+	r->prefix_len = 32;
+	r->tb_id = RT_TABLE_MAIN;
+	r->attr.type = ROUTE_TYPE_IP4UC;
+	r->nh.rvid = vlan;
+	r->gw_ifindex = nw->ifindex;
+
+	if (otto_l3_alloc_router_mac(ctrl, dev_mac))
+		goto out_free;
+
+	r->nh.if_id = otto_l3_alloc_egress_intf(ctrl, dev_mac, vlan);
+	if (r->nh.if_id < 0)
+		goto out_free;
+
+	otto_l3_route_update_hw(ctrl, r, nw->mac);
+
+	return;
+
+out_free:
+	otto_l3_route_free(ctrl, r);
+}
+
 static void otto_l3_net_event_work_do(struct work_struct *work)
 {
 	struct otto_l3_net_event_work *net_work =
@@ -2987,6 +3070,7 @@ static void otto_l3_net_event_work_do(struct work_struct *work)
 
 	otto_l3_nexthop_update(net_work->ctrl, net_work->type, net_work->ifindex,
 			       &net_work->gw_addr, net_work->mac, net_work->valid);
+	otto_l3_neigh_route_update(net_work->ctrl, net_work);
 
 	kfree(net_work);
 }
@@ -3044,6 +3128,7 @@ static int otto_l3_netevent_notifier(struct notifier_block *this, unsigned long 
 		 */
 		read_lock_bh(&n->lock);
 		net_work->valid = (n->nud_state & NUD_VALID) && !n->dead;
+		net_work->noarp = n->nud_state & NUD_NOARP;
 		net_work->mac = ether_addr_to_u64(n->ha);
 		read_unlock_bh(&n->lock);
 		net_work->ifindex = dev->ifindex;
@@ -4282,6 +4367,13 @@ static void otto_l3_fib_dump_flush(struct notifier_block *nb)
 	destroy_work_on_stack(&fw.work);
 }
 
+static void otto_l3_neigh_replay(struct neighbour *n, void *data)
+{
+	struct otto_l3_ctrl *ctrl = data;
+
+	otto_l3_netevent_notifier(&ctrl->ne_nb, NETEVENT_NEIGH_UPDATE, n);
+}
+
 /* An event the notifiers had no memory to queue is lost, and with it what it
  * would have changed: a deleted route or a neighbour gone can stay forwarding.
  * Take every route out and have the kernel replay the FIB, as when the notifier
@@ -4304,6 +4396,10 @@ static void otto_l3_resync_work_do(struct work_struct *work)
 	err = register_fib_notifier(&init_net, &ctrl->fib_nb, otto_l3_fib_dump_flush, NULL);
 	if (!err) {
 		ctrl->resync_delay = 0;
+		/* The flush took the routes to connected hosts as well, and no
+		 * FIB replay brings those back
+		 */
+		neigh_for_each(&arp_tbl, otto_l3_neigh_replay, ctrl);
 		return;
 	}
 
