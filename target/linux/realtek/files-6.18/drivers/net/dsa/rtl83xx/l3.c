@@ -1849,6 +1849,23 @@ static void otto_l3_route_trap_hw(struct otto_l3_ctrl *ctrl, struct otto_l3_rout
 	otto_l3_route_rewrite(ctrl, r);
 }
 
+static void otto_l3_fib6_flags_report(struct otto_l3_route *r)
+{
+	bool trap;
+
+	if (!IS_REACHABLE(CONFIG_IPV6) || !r->f6i)
+		return;
+
+	/* A route takes its row when it is added, so one still without a
+	 * row is one that could not be placed.
+	 */
+	trap = r->attr.action == ROUTE_ACT_TRAP2CPU;
+	if (r->row >= FIRST_PREFIX_ROW)
+		fib6_info_hw_flags_set(&init_net, r->f6i, !trap, trap, false);
+	else
+		fib6_info_hw_flags_set(&init_net, r->f6i, false, false, true);
+}
+
 /* Updates an L3 next hop entry in the ROUTING table */
 static int otto_l3_nexthop_update(struct otto_l3_ctrl *ctrl, u8 type, int ifindex,
 				  const struct in6_addr *gw, u64 mac, bool valid)
@@ -1890,33 +1907,24 @@ static int otto_l3_nexthop_update(struct otto_l3_ctrl *ctrl, u8 type, int ifinde
 	 * every route here comes from.
 	 */
 	list_for_each_entry(r, &ctrl->routes_list, list) {
-		bool trap;
-
-		if (!IS_REACHABLE(CONFIG_IPV6) || !r->f6i || r->gw_ifindex != ifindex ||
-		    !ipv6_addr_equal(&r->gw_ip, gw))
-			continue;
-
-		/* A route takes its row when it is added, so one still without a
-		 * row is one that could not be placed.
-		 */
-		trap = r->attr.action == ROUTE_ACT_TRAP2CPU;
-		if (r->row >= FIRST_PREFIX_ROW)
-			fib6_info_hw_flags_set(&init_net, r->f6i, !trap, trap, false);
-		else
-			fib6_info_hw_flags_set(&init_net, r->f6i, false, false, true);
+		if (r->gw_ifindex == ifindex && ipv6_addr_equal(&r->gw_ip, gw))
+			otto_l3_fib6_flags_report(r);
 	}
 
 	return 0;
 }
 
-static int otto_l3_port_gw_resolve(struct otto_l3_ctrl *ctrl, struct net_device *dev,
-				   struct neigh_table *tbl, const struct in6_addr *gw)
+/* Every route through a gateway that is already resolved is in hardware, so
+ * only the new one is programmed.
+ */
+static int otto_l3_port_gw_resolve(struct otto_l3_ctrl *ctrl, struct otto_l3_route *r,
+				   struct net_device *dev, struct neigh_table *tbl,
+				   const struct in6_addr *gw)
 {
 	/* An ARP neighbour is keyed on four bytes, which in a v4-mapped
 	 * address are the last word of it.
 	 */
 	const void *key = tbl == &arp_tbl ? (const void *)&gw->s6_addr32[3] : gw;
-	u8 type = tbl == &arp_tbl ? ROUTE_TYPE_IP4UC : ROUTE_TYPE_IP6UC;
 	struct neighbour *n = neigh_lookup(tbl, key, dev);
 	int err = 0;
 	u64 mac;
@@ -1931,9 +1939,12 @@ static int otto_l3_port_gw_resolve(struct otto_l3_ctrl *ctrl, struct net_device 
 	 * install the entry, otherwise start the resolution.
 	 */
 	if (n->nud_state & NUD_VALID) {
+		read_lock_bh(&n->lock);
 		mac = ether_addr_to_u64(n->ha);
+		read_unlock_bh(&n->lock);
 		dev_info(ctrl->dev, "resolved mac: %016llx\n", mac);
-		otto_l3_nexthop_update(ctrl, type, dev->ifindex, gw, mac, true);
+		otto_l3_route_update_hw(ctrl, r, mac);
+		otto_l3_fib6_flags_report(r);
 	} else {
 		dev_info(ctrl->dev, "need to wait\n");
 		neigh_event_send(n, NULL);
@@ -2540,7 +2551,7 @@ static int otto_l3_fib_add_v4(struct otto_l3_ctrl *ctrl, struct fib_entry_notifi
 
 	/* We need to resolve the mac address of the GW */
 	if (nh->fib_nh_gw4)
-		otto_l3_port_gw_resolve(ctrl, ndev, &arp_tbl, &gw);
+		otto_l3_port_gw_resolve(ctrl, route, ndev, &arp_tbl, &gw);
 
 	return 0;
 
@@ -2991,7 +3002,7 @@ static int otto_l3_fib_add_v6(struct otto_l3_ctrl *ctrl, struct fib6_entry_notif
 		fib6_info_hw_flags_set(&init_net, rt, false, true, false);
 	}
 
-	otto_l3_port_gw_resolve(ctrl, ndev, &nd_tbl, gw);
+	otto_l3_port_gw_resolve(ctrl, route, ndev, &nd_tbl, gw);
 
 	return 0;
 
@@ -3192,27 +3203,6 @@ static bool otto_l3_route_inside(struct otto_l3_route *r, struct fib_notifier_in
 	       ipv6_prefix_equal(&r->dst_ip6, &rt->fib6_dst.addr, rt->fib6_dst.plen);
 }
 
-/* One resolve brings back every route through a gateway. With @info, only the
- * routes inside that local prefix are looked at.
- */
-static bool otto_l3_gw_seen(struct otto_l3_ctrl *ctrl, struct otto_l3_route *r,
-			    struct fib_notifier_info *info)
-{
-	struct otto_l3_route *q;
-
-	list_for_each_entry(q, &ctrl->routes_list, list) {
-		if (q == r)
-			return false;
-		if (info && !otto_l3_route_inside(q, info))
-			continue;
-		if (q->attr.type == r->attr.type && q->gw_ifindex == r->gw_ifindex &&
-		    ipv6_addr_equal(&q->gw_ip, &r->gw_ip))
-			return true;
-	}
-
-	return false;
-}
-
 static void otto_l3_rules_check(struct otto_l3_ctrl *ctrl, int family)
 {
 	u8 type = family == AF_INET6 ? ROUTE_TYPE_IP6UC : ROUTE_TYPE_IP4UC;
@@ -3255,12 +3245,11 @@ static void otto_l3_rules_check(struct otto_l3_ctrl *ctrl, int family)
 		 * back: through the gateway, if it still answers
 		 */
 		if (ipv6_addr_any(&r->gw_ip) ||
-		    (type == ROUTE_TYPE_IP4UC && !r->gw_ip.s6_addr32[3]) ||
-		    otto_l3_gw_seen(ctrl, r, NULL))
+		    (type == ROUTE_TYPE_IP4UC && !r->gw_ip.s6_addr32[3]))
 			continue;
 		dev = __dev_get_by_index(&init_net, r->gw_ifindex);
 		if (dev)
-			otto_l3_port_gw_resolve(ctrl, dev, tbl, &r->gw_ip);
+			otto_l3_port_gw_resolve(ctrl, r, dev, tbl, &r->gw_ip);
 	}
 }
 
@@ -3297,12 +3286,11 @@ static void otto_l3_local_prefix_check(struct otto_l3_ctrl *ctrl, struct fib_not
 
 	list_for_each_entry(r, &ctrl->routes_list, list) {
 		if (!otto_l3_route_inside(r, info) || ipv6_addr_any(&r->gw_ip) ||
-		    (r->attr.type == ROUTE_TYPE_IP4UC && !r->gw_ip.s6_addr32[3]) ||
-		    otto_l3_gw_seen(ctrl, r, info))
+		    (r->attr.type == ROUTE_TYPE_IP4UC && !r->gw_ip.s6_addr32[3]))
 			continue;
 		dev = __dev_get_by_index(&init_net, r->gw_ifindex);
 		if (dev)
-			otto_l3_port_gw_resolve(ctrl, dev, tbl, &r->gw_ip);
+			otto_l3_port_gw_resolve(ctrl, r, dev, tbl, &r->gw_ip);
 	}
 }
 
