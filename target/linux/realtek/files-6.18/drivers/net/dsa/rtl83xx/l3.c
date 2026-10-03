@@ -1343,6 +1343,7 @@ static int otto_l3_alloc_egress_intf(struct otto_l3_ctrl *ctrl, u64 mac, int vla
  */
 #define V6_MOVE_ROWS		1
 #define FIRST_V6_ROW		(MAX_ROUTES - 1 - 4)
+#define V6_GROUP_ROWS		8
 
 /* An RTL839x PIE rule matches a whole IPv6 destination, in any row */
 static int otto_l3_v6_row(struct otto_l3_ctrl *ctrl, int slot)
@@ -1350,15 +1351,18 @@ static int otto_l3_v6_row(struct otto_l3_ctrl *ctrl, int slot)
 	if (!ctrl->cfg->use_l3_tables)
 		return MAX_ROUTES - 1 - slot;
 
-	return FIRST_V6_ROW - (slot / 2) * 8 - (slot % 2) * V6_PREFIX_ROWS;
+	return ctrl->v6_first_row - (slot / 2) * ctrl->v6_group_rows -
+	       (slot % 2) * V6_PREFIX_ROWS;
 }
 
 static int otto_l3_v6_slot(struct otto_l3_ctrl *ctrl, int row)
 {
+	int group = ctrl->v6_group_rows;
+
 	if (!ctrl->cfg->use_l3_tables)
 		return MAX_ROUTES - 1 - row;
 
-	return 2 * (FIRST_V6_ROW / 8 - row / 8) + (row % 8 ? 0 : 1);
+	return 2 * (ctrl->v6_first_row / group - row / group) + (row % group ? 0 : 1);
 }
 
 /* The programmed prefix routes of one address family sit in one dense block,
@@ -1438,7 +1442,7 @@ static int otto_l3_route_place(struct otto_l3_ctrl *ctrl, struct otto_l3_route *
 		 */
 		for (int s = rows - 1; s >= rows - below; s--) {
 			err = ctrl->cfg->route_rows_move(ctrl, otto_l3_v6_row(ctrl, s + 1),
-							 otto_l3_v6_row(ctrl, s), V6_MOVE_ROWS);
+							 otto_l3_v6_row(ctrl, s), ctrl->v6_move_rows);
 			if (err) {
 				if (err == -EIO || s < rows - 1)
 					otto_l3_rows_stale(ctrl, r, otto_l3_v6_row(ctrl, s));
@@ -1512,7 +1516,7 @@ static void otto_l3_route_compact(struct otto_l3_ctrl *ctrl, struct otto_l3_rout
 
 		for (int s = slot + 1; s < rows; s++)
 			if (ctrl->cfg->route_rows_move(ctrl, otto_l3_v6_row(ctrl, s - 1),
-						       otto_l3_v6_row(ctrl, s), V6_MOVE_ROWS)) {
+						       otto_l3_v6_row(ctrl, s), ctrl->v6_move_rows)) {
 				otto_l3_rows_stale(ctrl, r, otto_l3_v6_row(ctrl, s));
 				return;
 			}
@@ -5204,6 +5208,9 @@ int otto_l3_probe(struct device *dev, struct rtl838x_switch_priv *priv)
 
 	ctrl->max_routes = ctrl->cfg->max_routes ?: MAX_ROUTES;
 	ctrl->max_host_routes = ctrl->cfg->max_host_routes ?: MAX_HOST_ROUTES;
+	ctrl->v6_first_row = ctrl->cfg->v6_first_row ?: FIRST_V6_ROW;
+	ctrl->v6_group_rows = ctrl->cfg->v6_group_rows ?: V6_GROUP_ROWS;
+	ctrl->v6_move_rows = ctrl->cfg->v6_move_rows ?: V6_MOVE_ROWS;
 	ctrl->route_use_bm = devm_bitmap_zalloc(dev, ctrl->max_routes, GFP_KERNEL);
 	ctrl->host_route_use_bm = devm_bitmap_zalloc(dev, ctrl->max_host_routes, GFP_KERNEL);
 	if (!ctrl->route_use_bm || !ctrl->host_route_use_bm)
