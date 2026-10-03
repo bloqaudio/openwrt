@@ -113,6 +113,9 @@ struct otto_l3_config {
 	 * need a PIE rule to match the destination and point at the next hop.
 	 */
 	bool use_l3_tables;
+	/* Every route id names a next hop, so both pools share the next hop table */
+	int max_routes;
+	int max_host_routes;
 	int (*find_slot)(struct otto_l3_ctrl *ctrl, struct otto_l3_route *rt, bool must_exist);
 	void (*get_egress_intf)(struct otto_l3_ctrl *ctrl, int idx, struct otto_l3_intf *intf);
 	void (*set_egress_intf)(struct otto_l3_ctrl *ctrl, int idx, struct otto_l3_intf *intf);
@@ -141,8 +144,10 @@ struct otto_l3_ctrl {
 	unsigned int resync_delay;
 	bool resync_wanted;
 	struct list_head routes_list;
-	unsigned long route_use_bm[MAX_ROUTES / 32];
-	unsigned long host_route_use_bm[MAX_HOST_ROUTES / 32];
+	int max_routes;
+	int max_host_routes;
+	unsigned long *route_use_bm;
+	unsigned long *host_route_use_bm;
 	struct otto_l3_intf interfaces[MAX_SMACS];
 	bool prefix_rows_stale;	/* a move failed, the rows are not where we say */
 	bool v4_fwd_off;	/* policy rules keep IPv4 forwarding in software */
