@@ -1202,6 +1202,7 @@ static void otto_l3_route_update_hw(struct otto_l3_ctrl *ctrl, struct otto_l3_ro
 	dev_dbg(ctrl->dev, "route %d to %s\n",
 		r->id, otto_l3_route_dst(r, dst, sizeof(dst)));
 
+	r->hw_forward = false;
 	r->nh.mac = r->nh.gw = mac;
 	r->nh.port = priv->r->port_ignore;
 	r->nh.id = r->id;
@@ -1286,6 +1287,7 @@ static void otto_l3_route_update_hw(struct otto_l3_ctrl *ctrl, struct otto_l3_ro
 		ctrl->cfg->set_nexthop(ctrl, r->nh.id, r->nh.l2_id, r->nh.if_id);
 
 	otto_l3_fib4_flags_set(r, !no_port, no_port, false);
+	r->hw_forward = !no_port;
 
 	if (ctrl->cfg->use_l3_tables)
 		return;
@@ -1338,6 +1340,7 @@ static void otto_l3_route_trap_hw(struct otto_l3_ctrl *ctrl, struct otto_l3_rout
 	r->attr.action = ROUTE_ACT_TRAP2CPU;
 	r->attr.ttl_dec = false;
 	r->attr.ttl_check = false;
+	r->hw_forward = false;
 
 	if (r->is_host_route)
 		ctrl->cfg->host_route_write(ctrl, slot, r);
@@ -1392,6 +1395,13 @@ static int otto_l3_nexthop_update(struct otto_l3_ctrl *ctrl, u8 type, int ifinde
 		 */
 		if (r->attr.type != type || r->gw_ifindex != ifindex ||
 		    !ipv6_addr_equal(&r->gw_ip, gw))
+			continue;
+
+		/* A neighbour that is confirmed again changes nothing for a route
+		 * that already forwards to it
+		 */
+		if (valid && r->hw_forward && r->nh.mac == mac &&
+		    rtldsa_l2_nexthop_current(ctrl->priv, &r->nh))
 			continue;
 
 		if (valid)
