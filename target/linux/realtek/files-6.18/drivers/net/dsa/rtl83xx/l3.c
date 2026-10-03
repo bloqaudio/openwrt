@@ -1053,15 +1053,19 @@ static int otto_l3_alloc_egress_intf(struct otto_l3_ctrl *ctrl, u64 mac, int vla
  */
 #define V6_MOVE_ROWS		1
 #define FIRST_V6_ROW		(MAX_ROUTES - 1 - 4)
+#define V6_GROUP_ROWS		8
 
-static int otto_l3_v6_row(int slot)
+static int otto_l3_v6_row(struct otto_l3_ctrl *ctrl, int slot)
 {
-	return FIRST_V6_ROW - (slot / 2) * 8 - (slot % 2) * V6_PREFIX_ROWS;
+	return ctrl->v6_first_row - (slot / 2) * ctrl->v6_group_rows -
+	       (slot % 2) * V6_PREFIX_ROWS;
 }
 
-static int otto_l3_v6_slot(int row)
+static int otto_l3_v6_slot(struct otto_l3_ctrl *ctrl, int row)
 {
-	return 2 * (FIRST_V6_ROW / 8 - row / 8) + (row % 8 ? 0 : 1);
+	int group = ctrl->v6_group_rows;
+
+	return 2 * (ctrl->v6_first_row / group - row / group) + (row % group ? 0 : 1);
 }
 
 /* The programmed prefix routes of one address family sit in one dense block,
@@ -1128,7 +1132,7 @@ static int otto_l3_route_place(struct otto_l3_ctrl *ctrl, struct otto_l3_route *
 	if (r->attr.type == ROUTE_TYPE_IP6UC) {
 		int v4_rows = otto_l3_prefix_rows(ctrl, ROUTE_TYPE_IP4UC, 0);
 
-		if (otto_l3_v6_row(rows) < FIRST_PREFIX_ROW + v4_rows) {
+		if (otto_l3_v6_row(ctrl, rows) < FIRST_PREFIX_ROW + v4_rows) {
 			dev_err(ctrl->dev, "prefix route table full, %d IPv4 and %d IPv6 routes\n",
 				v4_rows, rows);
 			return -1;
@@ -1140,21 +1144,21 @@ static int otto_l3_route_place(struct otto_l3_ctrl *ctrl, struct otto_l3_route *
 		 * failing move wrote itself.
 		 */
 		for (int s = rows - 1; s >= rows - below; s--) {
-			err = ctrl->cfg->route_rows_move(ctrl, otto_l3_v6_row(s + 1),
-							 otto_l3_v6_row(s), V6_MOVE_ROWS);
+			err = ctrl->cfg->route_rows_move(ctrl, otto_l3_v6_row(ctrl, s + 1),
+							 otto_l3_v6_row(ctrl, s), ctrl->v6_move_rows);
 			if (err) {
 				if (err == -EIO || s < rows - 1)
-					otto_l3_rows_stale(ctrl, r, otto_l3_v6_row(s));
+					otto_l3_rows_stale(ctrl, r, otto_l3_v6_row(ctrl, s));
 				return -1;
 			}
 		}
 
-		row = otto_l3_v6_row(rows - below);
+		row = otto_l3_v6_row(ctrl, rows - below);
 
 		list_for_each_entry(q, &ctrl->routes_list, list)
 			if (!q->is_host_route && q->attr.type == r->attr.type &&
 			    q->row >= FIRST_PREFIX_ROW && q->row <= row)
-				q->row = otto_l3_v6_row(otto_l3_v6_slot(q->row) + 1);
+				q->row = otto_l3_v6_row(ctrl, otto_l3_v6_slot(ctrl, q->row) + 1);
 
 		return row;
 	}
@@ -1163,7 +1167,7 @@ static int otto_l3_route_place(struct otto_l3_ctrl *ctrl, struct otto_l3_route *
 	row = FIRST_PREFIX_ROW + below;
 	last = FIRST_PREFIX_ROW + rows;
 
-	if (v6_rows && otto_l3_v6_row(v6_rows - 1) <= last) {
+	if (v6_rows && otto_l3_v6_row(ctrl, v6_rows - 1) <= last) {
 		dev_err(ctrl->dev, "prefix route table full, %d IPv4 and %d IPv6 routes\n",
 			rows, v6_rows);
 		return -1;
@@ -1206,23 +1210,23 @@ static void otto_l3_route_compact(struct otto_l3_ctrl *ctrl, struct otto_l3_rout
 	 * leaves a hole in the block that the row count cannot see.
 	 */
 	if (r->attr.type == ROUTE_TYPE_IP6UC) {
-		int slot = otto_l3_v6_slot(r->row);
+		int slot = otto_l3_v6_slot(ctrl, r->row);
 
-		last = otto_l3_v6_row(rows - 1);
+		last = otto_l3_v6_row(ctrl, rows - 1);
 		if (slot >= rows - 1)
 			return;
 
 		for (int s = slot + 1; s < rows; s++)
-			if (ctrl->cfg->route_rows_move(ctrl, otto_l3_v6_row(s - 1),
-						       otto_l3_v6_row(s), V6_MOVE_ROWS)) {
-				otto_l3_rows_stale(ctrl, r, otto_l3_v6_row(s));
+			if (ctrl->cfg->route_rows_move(ctrl, otto_l3_v6_row(ctrl, s - 1),
+						       otto_l3_v6_row(ctrl, s), ctrl->v6_move_rows)) {
+				otto_l3_rows_stale(ctrl, r, otto_l3_v6_row(ctrl, s));
 				return;
 			}
 
 		list_for_each_entry(q, &ctrl->routes_list, list)
 			if (!q->is_host_route && q->attr.type == r->attr.type &&
 			    q->row >= FIRST_PREFIX_ROW && q->row < r->row)
-				q->row = otto_l3_v6_row(otto_l3_v6_slot(q->row) - 1);
+				q->row = otto_l3_v6_row(ctrl, otto_l3_v6_slot(ctrl, q->row) - 1);
 	} else {
 		last = FIRST_PREFIX_ROW + rows - 1;
 		if (r->row >= last)
@@ -4209,6 +4213,9 @@ int otto_l3_probe(struct device *dev, struct rtl838x_switch_priv *priv)
 
 	ctrl->max_routes = ctrl->cfg->max_routes ?: MAX_ROUTES;
 	ctrl->max_host_routes = ctrl->cfg->max_host_routes ?: MAX_HOST_ROUTES;
+	ctrl->v6_first_row = ctrl->cfg->v6_first_row ?: FIRST_V6_ROW;
+	ctrl->v6_group_rows = ctrl->cfg->v6_group_rows ?: V6_GROUP_ROWS;
+	ctrl->v6_move_rows = ctrl->cfg->v6_move_rows ?: V6_MOVE_ROWS;
 	ctrl->route_use_bm = devm_bitmap_zalloc(dev, ctrl->max_routes, GFP_KERNEL);
 	ctrl->host_route_use_bm = devm_bitmap_zalloc(dev, ctrl->max_host_routes, GFP_KERNEL);
 	if (!ctrl->route_use_bm || !ctrl->host_route_use_bm)
