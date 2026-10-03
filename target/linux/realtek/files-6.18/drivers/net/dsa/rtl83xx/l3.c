@@ -1476,7 +1476,7 @@ static void otto_l3_route_free(struct otto_l3_ctrl *ctrl, struct otto_l3_route *
 		dev_warn(ctrl->dev, "Could not remove route\n");
 
 	if (r->is_host_route)
-		clear_bit(r->id - MAX_ROUTES, ctrl->host_route_use_bm);
+		clear_bit(r->id - ctrl->max_routes, ctrl->host_route_use_bm);
 	else
 		clear_bit(r->id, ctrl->route_use_bm);
 
@@ -1569,10 +1569,10 @@ static struct otto_l3_route *otto_l3_host_route_alloc(struct otto_l3_ctrl *ctrl,
 
 	mutex_lock(ctrl->lock);
 
-	idx = find_first_zero_bit(ctrl->host_route_use_bm, MAX_HOST_ROUTES);
-	if (idx >= MAX_HOST_ROUTES) {
+	idx = find_first_zero_bit(ctrl->host_route_use_bm, ctrl->max_host_routes);
+	if (idx >= ctrl->max_host_routes) {
 		dev_err(ctrl->dev, "host route table full, %d entries in use\n",
-			MAX_HOST_ROUTES);
+			ctrl->max_host_routes);
 		mutex_unlock(ctrl->lock);
 		return NULL;
 	}
@@ -1587,7 +1587,7 @@ static struct otto_l3_route *otto_l3_host_route_alloc(struct otto_l3_ctrl *ctrl,
 	/* We require a unique route ID irrespective of whether it is a prefix or host
 	 * route (on RTL93xx) as we use this ID to associate a DMAC and next-hop entry
 	 */
-	r->id = idx + MAX_ROUTES;
+	r->id = idx + ctrl->max_routes;
 	r->row = -1;			/* placed by find_slot(), not by row */
 
 	r->gw_ip = *gw;
@@ -1623,10 +1623,10 @@ static struct otto_l3_route *otto_l3_route_alloc(struct otto_l3_ctrl *ctrl,
 
 	mutex_lock(ctrl->lock);
 
-	idx = find_first_zero_bit(ctrl->route_use_bm, MAX_ROUTES);
-	if (idx >= MAX_ROUTES) {
+	idx = find_first_zero_bit(ctrl->route_use_bm, ctrl->max_routes);
+	if (idx >= ctrl->max_routes) {
 		dev_err(ctrl->dev, "prefix route table full, %d entries in use\n",
-			MAX_ROUTES);
+			ctrl->max_routes);
 		mutex_unlock(ctrl->lock);
 		return NULL;
 	}
@@ -3178,6 +3178,8 @@ const struct otto_l3_config otto_l3_930x_cfg = {
 const struct otto_l3_config otto_l3_931x_cfg = {
 #ifdef CONFIG_NET_DSA_RTL83XX_RTL931X_L3_OFFLOAD
 	.use_l3_tables = true,
+	.max_routes = 4096,
+	.max_host_routes = 4096,
 	.find_slot = otto_l3_931x_find_slot,
 	.get_egress_mac = otto_l3_931x_get_egress_mac,
 	.set_egress_mac = otto_l3_931x_set_egress_mac,
@@ -3235,6 +3237,13 @@ int otto_l3_probe(struct device *dev, struct rtl838x_switch_priv *priv)
 	if (!match)
 		return dev_err_probe(dev, -EINVAL, "No compatible configuration found\n");
 	ctrl->cfg = match->data;
+
+	ctrl->max_routes = ctrl->cfg->max_routes ?: MAX_ROUTES;
+	ctrl->max_host_routes = ctrl->cfg->max_host_routes ?: MAX_HOST_ROUTES;
+	ctrl->route_use_bm = devm_bitmap_zalloc(dev, ctrl->max_routes, GFP_KERNEL);
+	ctrl->host_route_use_bm = devm_bitmap_zalloc(dev, ctrl->max_host_routes, GFP_KERNEL);
+	if (!ctrl->route_use_bm || !ctrl->host_route_use_bm)
+		return -ENOMEM;
 
 	if (ctrl->cfg->setup) {
 		err = ctrl->cfg->setup(ctrl);
