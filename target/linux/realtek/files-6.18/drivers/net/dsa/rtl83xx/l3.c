@@ -1364,11 +1364,11 @@ static void otto_l3_route_update_hw(struct otto_l3_ctrl *ctrl, struct otto_l3_ro
 		  r->nh.port == priv->r->port_ignore;
 	if (no_port && (first || r->attr.action != ROUTE_ACT_TRAP2CPU)) {
 		if (r->attr.type == ROUTE_TYPE_IP4UC)
-			dev_info(ctrl->dev, "no port for %pI4, routing %s in software\n",
-				 &r->gw_ip.s6_addr32[3], otto_l3_route_dst(r, dst, sizeof(dst)));
+			dev_dbg(ctrl->dev, "no port for %pI4, routing %s in software\n",
+				&r->gw_ip.s6_addr32[3], otto_l3_route_dst(r, dst, sizeof(dst)));
 		else
-			dev_info(ctrl->dev, "no port for %pI6c, routing %s in software\n",
-				 &r->gw_ip, otto_l3_route_dst(r, dst, sizeof(dst)));
+			dev_dbg(ctrl->dev, "no port for %pI6c, routing %s in software\n",
+				&r->gw_ip, otto_l3_route_dst(r, dst, sizeof(dst)));
 	}
 
 	trap = no_port || otto_l3_fwd_off(ctrl, r->attr.type);
@@ -1408,7 +1408,7 @@ static void otto_l3_route_update_hw(struct otto_l3_ctrl *ctrl, struct otto_l3_ro
 			return;
 		}
 
-		dev_info(ctrl->dev, "Got slot for route: %d\n", slot);
+		dev_dbg(ctrl->dev, "Got slot for route: %d\n", slot);
 		ctrl->cfg->host_route_write(ctrl, slot, r);
 	} else {
 		if (r->row < 0)
@@ -1439,8 +1439,8 @@ static void otto_l3_route_update_hw(struct otto_l3_ctrl *ctrl, struct otto_l3_ro
 	if (r->pr.id < 0) {
 		r->pr.packet_cntr = rtldsa_packet_cntr_alloc(priv);
 		if (r->pr.packet_cntr >= 0) {
-			dev_info(ctrl->dev, "Using packet counter %d\n",
-				 r->pr.packet_cntr);
+			dev_dbg(ctrl->dev, "Using packet counter %d\n",
+				r->pr.packet_cntr);
 			r->pr.log_sel = true;
 			r->pr.log_data = r->pr.packet_cntr;
 		}
@@ -1482,11 +1482,11 @@ static void otto_l3_route_trap_hw(struct otto_l3_ctrl *ctrl, struct otto_l3_rout
 		return;
 
 	if (r->attr.type == ROUTE_TYPE_IP4UC)
-		dev_info(ctrl->dev, "no valid neighbour for %pI4, routing %s in software\n",
-			 &r->gw_ip.s6_addr32[3], otto_l3_route_dst(r, dst, sizeof(dst)));
+		dev_dbg(ctrl->dev, "no valid neighbour for %pI4, routing %s in software\n",
+			&r->gw_ip.s6_addr32[3], otto_l3_route_dst(r, dst, sizeof(dst)));
 	else
-		dev_info(ctrl->dev, "no valid neighbour for %pI6c, routing %s in software\n",
-			 &r->gw_ip, otto_l3_route_dst(r, dst, sizeof(dst)));
+		dev_dbg(ctrl->dev, "no valid neighbour for %pI6c, routing %s in software\n",
+			&r->gw_ip, otto_l3_route_dst(r, dst, sizeof(dst)));
 
 	if (otto_l3_host_shadowed(ctrl, r))
 		return;
@@ -1605,11 +1605,11 @@ static int otto_l3_port_gw_resolve(struct otto_l3_ctrl *ctrl, struct otto_l3_rou
 		read_lock_bh(&n->lock);
 		mac = ether_addr_to_u64(n->ha);
 		read_unlock_bh(&n->lock);
-		dev_info(ctrl->dev, "resolved mac: %016llx\n", mac);
+		dev_dbg(ctrl->dev, "resolved mac: %016llx\n", mac);
 		otto_l3_route_update_hw(ctrl, r, mac);
 		otto_l3_fib6_flags_report(r);
 	} else {
-		dev_info(ctrl->dev, "need to wait\n");
+		dev_dbg(ctrl->dev, "need to wait\n");
 		neigh_event_send(n, NULL);
 	}
 
@@ -1872,12 +1872,12 @@ static int otto_l3_fib_check_v4(struct otto_l3_ctrl *ctrl,
 	if (nh->fib_nh_gw4)
 		snprintf(gw_message, sizeof(gw_message), "via %pI4 ", &nh->fib_nh_gw4);
 
-	dev_info(ctrl->dev, "%s IPv4 route %pI4/%d %s(VLAN %d, MAC %pM)\n",
-		 event == FIB_EVENT_ENTRY_ADD ? "add" : "delete",
-		 &info->dst, info->dst_len, gw_message, vlan, ndev->dev_addr);
+	dev_dbg(ctrl->dev, "%s IPv4 route %pI4/%d %s(VLAN %d, MAC %pM)\n",
+		event == FIB_EVENT_ENTRY_ADD ? "add" : "delete",
+		&info->dst, info->dst_len, gw_message, vlan, ndev->dev_addr);
 
 	if ((info->type == RTN_BROADCAST) || ipv4_is_loopback(info->dst) || !info->dst) {
-		dev_warn(ctrl->dev, "skip loopback/broadcast addresses and default routes\n");
+		dev_dbg(ctrl->dev, "skip loopback/broadcast addresses and default routes\n");
 		return -EINVAL;
 	}
 
@@ -2091,7 +2091,7 @@ static int otto_l3_fib_add_v4(struct otto_l3_ctrl *ctrl, struct fib_entry_notifi
 				    ROUTE_HOST : ROUTE_PREFIX);
 
 	if (route)
-		dev_info(ctrl->dev, "route hashtable extended for gw %pI4\n", &nh->fib_nh_gw4);
+		dev_dbg(ctrl->dev, "route hashtable extended for gw %pI4\n", &nh->fib_nh_gw4);
 	else {
 		dev_err(ctrl->dev, "could not extend route hashtable for gw %pI4\n",
 			&nh->fib_nh_gw4);
@@ -2222,8 +2222,8 @@ static int otto_l3_fib_del_v4(struct otto_l3_ctrl *ctrl, struct fib_entry_notifi
 	rhl_for_each_entry_rcu(route, tmp, list, linkage) {
 		if (route->attr.type == ROUTE_TYPE_IP4UC &&
 		    route->dst_ip == info->dst && route->prefix_len == info->dst_len) {
-			dev_info(ctrl->dev, "found a route with id %d, nh-id %d\n",
-				 route->id, route->nh.id);
+			dev_dbg(ctrl->dev, "found a route with id %d, nh-id %d\n",
+				route->id, route->nh.id);
 			found = true;
 			break;
 		}
