@@ -1380,8 +1380,10 @@ static void otto_l3_route_update_hw(struct otto_l3_ctrl *ctrl, struct otto_l3_ro
 	r->nh.port = priv->r->port_ignore;
 	r->nh.id = r->id;
 
-	/* Do we need to explicitly add a DMAC entry with the route's nh index? */
-	if (ctrl->cfg->set_egress_mac)
+	/* Do we need to explicitly add a DMAC entry with the route's nh index?
+	 * The source MACs start where the DMAC slots end.
+	 */
+	if (ctrl->cfg->set_egress_mac && r->id < L3_EGRESS_DMACS)
 		ctrl->cfg->set_egress_mac(ctrl, r->id, mac);
 
 	/* Update ROUTING table: map gateway-mac and switch-mac id to route id */
