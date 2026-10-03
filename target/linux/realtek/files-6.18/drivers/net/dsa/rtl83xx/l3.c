@@ -1751,7 +1751,7 @@ static void otto_l3_route_free(struct otto_l3_ctrl *ctrl, struct otto_l3_route *
 		kfree(s);
 
 	if (r->is_host_route)
-		clear_bit(r->id - MAX_ROUTES, ctrl->host_route_use_bm);
+		clear_bit(r->id - ctrl->max_routes, ctrl->host_route_use_bm);
 	else
 		clear_bit(r->id, ctrl->route_use_bm);
 
@@ -1861,7 +1861,7 @@ static struct otto_l3_route *otto_l3_route_alloc(struct otto_l3_ctrl *ctrl,
 {
 	bool host = kind == ROUTE_HOST;
 	unsigned long *use_bm = host ? ctrl->host_route_use_bm : ctrl->route_use_bm;
-	int size = host ? MAX_HOST_ROUTES : MAX_ROUTES;
+	int size = host ? ctrl->max_host_routes : ctrl->max_routes;
 	struct otto_l3_route *r;
 	int idx;
 
@@ -1885,7 +1885,7 @@ static struct otto_l3_route *otto_l3_route_alloc(struct otto_l3_ctrl *ctrl,
 	/* We require a unique route ID irrespective of whether it is a prefix or host
 	 * route (on RTL93xx) as we use this ID to associate a DMAC and next-hop entry
 	 */
-	r->id = host ? idx + MAX_ROUTES : idx;
+	r->id = host ? idx + ctrl->max_routes : idx;
 	r->row = -1;	/* no row until placed; a host route never has one */
 	r->gw_ip = *gw;
 	r->pr.id = -1; /* We still need to allocate a rule in HW */
@@ -4053,6 +4053,8 @@ const struct otto_l3_config otto_l3_930x_cfg = {
 
 const struct otto_l3_config otto_l3_931x_cfg = {
 	.use_l3_tables = true,
+	.max_routes = 4096,
+	.max_host_routes = 4096,
 	.find_slot = otto_l3_931x_find_slot,
 	.get_egress_mac = otto_l3_931x_get_egress_mac,
 	.set_egress_mac = otto_l3_931x_set_egress_mac,
@@ -4203,6 +4205,13 @@ int otto_l3_probe(struct device *dev, struct rtl838x_switch_priv *priv)
 	if (!match)
 		return dev_err_probe(dev, -EINVAL, "No compatible configuration found\n");
 	ctrl->cfg = match->data;
+
+	ctrl->max_routes = ctrl->cfg->max_routes ?: MAX_ROUTES;
+	ctrl->max_host_routes = ctrl->cfg->max_host_routes ?: MAX_HOST_ROUTES;
+	ctrl->route_use_bm = devm_bitmap_zalloc(dev, ctrl->max_routes, GFP_KERNEL);
+	ctrl->host_route_use_bm = devm_bitmap_zalloc(dev, ctrl->max_host_routes, GFP_KERNEL);
+	if (!ctrl->route_use_bm || !ctrl->host_route_use_bm)
+		return -ENOMEM;
 
 	if (ctrl->cfg->setup) {
 		err = ctrl->cfg->setup(ctrl);
