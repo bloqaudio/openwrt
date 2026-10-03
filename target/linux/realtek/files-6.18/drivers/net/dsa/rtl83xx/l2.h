@@ -61,6 +61,7 @@ enum rtldsa_flood_type {
 int otto_l2_nexthop_add(struct rtl838x_switch_priv *priv, struct otto_l3_nexthop *nh,
 			bool require_existing);
 int otto_l2_nexthop_del(struct rtl838x_switch_priv *priv, struct otto_l3_nexthop *nh);
+bool otto_l2_nexthop_current(struct rtl838x_switch_priv *priv, struct otto_l3_nexthop *nh);
 
 u64 otto_l2_838x_hash_seed(u64 mac, u32 vid);
 u32 otto_l2_838x_hash_key(struct rtl838x_switch_priv *priv, u64 seed);
