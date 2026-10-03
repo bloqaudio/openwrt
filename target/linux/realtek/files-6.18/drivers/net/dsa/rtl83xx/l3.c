@@ -3947,7 +3947,8 @@ static int otto_l3_fib_notifier(struct notifier_block *this, unsigned long event
 			 */
 			fib_info_hold(fib_work->fen_info.fi);
 			INIT_WORK(&fib_work->work, otto_l3_fib_event_work_do);
-		} else if (info->family == AF_INET6 && IS_REACHABLE(CONFIG_IPV6)) {
+		} else if (info->family == AF_INET6 && IS_REACHABLE(CONFIG_IPV6) &&
+			   (!ctrl->cfg->use_l3_tables || ctrl->cfg->v6_slot_to_row)) {
 			struct fib6_entry_notifier_info *fen6_info = ptr;
 
 			if (!otto_l3_fib_table_ok(ctrl, event, fen6_info->rt->fib6_table->tb6_id)) {
@@ -4028,6 +4029,12 @@ static int otto_l3_netevent_notifier(struct notifier_block *this, unsigned long 
 		if (n->tbl != &arp_tbl && !otto_l3_is_nd_tbl(n->tbl))
 			return NOTIFY_DONE;
 
+		/* L3 tables without an IPv6 row layout take no IPv6 route, so
+		 * none waits on an ndisc neighbour.
+		 */
+		if (otto_l3_is_nd_tbl(n->tbl) && ctrl->cfg->use_l3_tables &&
+		    !ctrl->cfg->v6_slot_to_row)
+			return NOTIFY_DONE;
 		dev = n->dev;
 
 		/* Every route here comes from init_net, the only namespace the FIB
@@ -5360,7 +5367,8 @@ int otto_l3_probe(struct device *dev, struct rtl838x_switch_priv *priv)
 	/* Before the notifiers, so no destination is dropped in the window
 	 * where the tables are live and the routes have not arrived yet.
 	 */
-	if (ctrl->cfg->use_l3_tables && otto_l3_add_catch_all(ctrl, ROUTE_TYPE_IP6UC))
+	if (ctrl->cfg->use_l3_tables && ctrl->cfg->v6_slot_to_row &&
+	    otto_l3_add_catch_all(ctrl, ROUTE_TYPE_IP6UC))
 		dev_err(dev, "no row for the IPv6 catch-all, destinations without one will be dropped\n");
 
 	if (ctrl->cfg->use_l3_tables && otto_l3_add_catch_all(ctrl, ROUTE_TYPE_IP4UC))
