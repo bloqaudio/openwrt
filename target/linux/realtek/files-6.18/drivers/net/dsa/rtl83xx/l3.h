@@ -135,6 +135,9 @@ struct otto_l3_config {
 	 * through the egress interface of a next hop instead.
 	 */
 	bool smac_per_route;
+	/* Every route id names a next hop, so both pools share the next hop table */
+	int max_routes;
+	int max_host_routes;
 	int (*find_slot)(struct otto_l3_ctrl *ctrl, struct otto_l3_route *rt, bool must_exist);
 	void (*get_egress_intf)(struct otto_l3_ctrl *ctrl, int idx, struct otto_l3_intf *intf);
 	void (*set_egress_intf)(struct otto_l3_ctrl *ctrl, int idx, struct otto_l3_intf *intf);
@@ -181,8 +184,10 @@ struct otto_l3_ctrl {
 	bool resync_wanted;
 	struct list_head routes_list;
 	struct list_head rmac_devs;	/* devices router MACs follow */
-	unsigned long route_use_bm[MAX_ROUTES / 32];
-	unsigned long host_route_use_bm[MAX_HOST_ROUTES / 32];
+	int max_routes;
+	int max_host_routes;
+	unsigned long *route_use_bm;
+	unsigned long *host_route_use_bm;
 	struct otto_l3_intf interfaces[MAX_SMACS];
 	unsigned int intf_refs[MAX_SMACS];	/* routes holding each */
 	struct otto_l3_dmac *dmacs;		/* what each DMAC entry holds */

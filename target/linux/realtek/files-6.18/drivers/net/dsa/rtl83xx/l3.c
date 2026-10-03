@@ -1552,7 +1552,8 @@ static int otto_l3_route_place(struct otto_l3_ctrl *ctrl, struct otto_l3_route *
 	row = FIRST_PREFIX_ROW + below;
 	last = FIRST_PREFIX_ROW + rows;
 
-	if (last >= MAX_ROUTES || (v6_rows && otto_l3_v6_row(ctrl, v6_rows - 1) <= last)) {
+	if (last >= ctrl->max_routes ||
+	    (v6_rows && otto_l3_v6_row(ctrl, v6_rows - 1) <= last)) {
 		dev_err(ctrl->dev, "prefix route table full, %d IPv4 and %d IPv6 routes\n",
 			rows, v6_rows);
 		return -1;
@@ -2622,7 +2623,7 @@ static void otto_l3_route_free(struct otto_l3_ctrl *ctrl, struct otto_l3_route *
 	 * are stale
 	 */
 	if (r->is_host_route)
-		clear_bit(r->id - MAX_ROUTES, ctrl->host_route_use_bm);
+		clear_bit(r->id - ctrl->max_routes, ctrl->host_route_use_bm);
 	else if (!ctrl->prefix_rows_stale)
 		clear_bit(r->id, ctrl->route_use_bm);
 
@@ -2755,7 +2756,7 @@ static struct otto_l3_route *otto_l3_route_alloc(struct otto_l3_ctrl *ctrl,
 {
 	bool host = kind == ROUTE_HOST;
 	unsigned long *use_bm = host ? ctrl->host_route_use_bm : ctrl->route_use_bm;
-	int size = host ? MAX_HOST_ROUTES : MAX_ROUTES;
+	int size = host ? ctrl->max_host_routes : ctrl->max_routes;
 	struct otto_l3_route *r;
 	int idx;
 
@@ -2779,7 +2780,7 @@ static struct otto_l3_route *otto_l3_route_alloc(struct otto_l3_ctrl *ctrl,
 	/* We require a unique route ID irrespective of whether it is a prefix or host
 	 * route (on RTL93xx) as we use this ID to associate a next-hop entry
 	 */
-	r->id = host ? idx + MAX_ROUTES : idx;
+	r->id = host ? idx + ctrl->max_routes : idx;
 	r->row = -1;	/* no row until placed; a host route never has one */
 	r->gw_ip = *gw;
 	r->pr.packet_cntr = -1;
@@ -5138,6 +5139,8 @@ const struct otto_l3_config otto_l3_930x_cfg = {
 
 const struct otto_l3_config otto_l3_931x_cfg = {
 	.use_l3_tables = true,
+	.max_routes = 4096,
+	.max_host_routes = 4096,
 	.find_slot = otto_l3_931x_find_slot,
 	.get_smac = otto_l3_931x_get_smac,
 	.set_smac = otto_l3_931x_set_smac,
@@ -5305,6 +5308,13 @@ int otto_l3_probe(struct device *dev, struct otto_dsa_priv *priv)
 		if (!ctrl->dmacs || !ctrl->dmac_refs)
 			return -ENOMEM;
 	}
+
+	ctrl->max_routes = ctrl->cfg->max_routes ?: MAX_ROUTES;
+	ctrl->max_host_routes = ctrl->cfg->max_host_routes ?: MAX_HOST_ROUTES;
+	ctrl->route_use_bm = devm_bitmap_zalloc(dev, ctrl->max_routes, GFP_KERNEL);
+	ctrl->host_route_use_bm = devm_bitmap_zalloc(dev, ctrl->max_host_routes, GFP_KERNEL);
+	if (!ctrl->route_use_bm || !ctrl->host_route_use_bm)
+		return -ENOMEM;
 
 	if (ctrl->cfg->setup) {
 		err = ctrl->cfg->setup(ctrl);
