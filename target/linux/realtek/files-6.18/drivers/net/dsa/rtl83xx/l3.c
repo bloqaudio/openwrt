@@ -4918,6 +4918,86 @@ static int otto_l3_931x_find_slot(struct otto_l3_ctrl *ctrl, struct otto_l3_rout
 	return -1;
 }
 
+/* An IPv6 entry is three rows: the first holds the top word of the destination
+ * and the result, the next two 48 bits each of the rest.
+ */
+static u64 otto_l3_931x_ip6_chunk(const struct in6_addr *ip6, int k)
+{
+	const u8 *d = &ip6->s6_addr[4 + (k - 1) * 6];
+	u64 v = 0;
+
+	for (int i = 0; i < 6; i++)
+		v = (v << 8) | d[i];
+
+	return v;
+}
+
+static void otto_l3_931x_ip6_chunk_set(struct in6_addr *ip6, int k, u64 v)
+{
+	u8 *d = &ip6->s6_addr[4 + (k - 1) * 6];
+
+	for (int i = 5; i >= 0; i--, v >>= 8)
+		d[i] = v;
+}
+
+static int otto_l3_931x_route_read6(int idx, const u32 data[6], struct otto_l3_route *rt)
+{
+	struct in6_addr mask = {};
+	u32 row[6];
+	int err;
+
+	rt->dst_ip6.s6_addr32[0] = cpu_to_be32(((data[0] & 0xfffff) << 12) | (data[1] >> 20));
+	mask.s6_addr32[0] = cpu_to_be32(data[2]);
+
+	for (int k = 1; k < 3; k++) {
+		err = otto_table_read(RTL9310_TBL_L3_PREFIX_ROUTE_IPUC,
+				      otto_l3_931x_row_addr(idx + k), &row);
+		if (err)
+			return err;
+		otto_l3_931x_ip6_chunk_set(&rt->dst_ip6, k,
+					   ((u64)(row[0] & 0x0fffffff) << 20) | (row[1] >> 12));
+		otto_l3_931x_ip6_chunk_set(&mask, k, ((u64)(row[1] & 0xff) << 40) |
+					   ((u64)row[2] << 8) | (row[3] >> 24));
+	}
+
+	rt->prefix_len = 0;
+	for (int i = 0; i < 4; i++)
+		rt->prefix_len += hweight32(mask.s6_addr32[i]);
+
+	return 0;
+}
+
+static void otto_l3_931x_route_write6(struct otto_l3_route *rt, int idx, u32 data[6])
+{
+	struct in6_addr mask;
+	u32 ip, row[6];
+	u64 m;
+
+	ipv6_addr_prefix(&mask, &(struct in6_addr){ .s6_addr32 = { ~0, ~0, ~0, ~0 } },
+			 rt->prefix_len);
+	ip = be32_to_cpu(rt->dst_ip6.s6_addr32[0]);
+
+	data[0] = BIT(31) | (ROUTE_TYPE_IP6UC << 28) | (ip >> 12);
+	data[1] = ((ip & 0xfff) << 20) | BIT(10) | (0x3 << 8) | 0xff;
+	data[2] = be32_to_cpu(mask.s6_addr32[0]);
+	data[3] |= rt->prefix_len == 128 ? BIT(22) : 0;
+	data[3] |= rt->prefix_len == 0 ? BIT(21) : 0;
+
+	for (int k = 1; k < 3; k++) {
+		u64 c = otto_l3_931x_ip6_chunk(&rt->dst_ip6, k);
+
+		m = otto_l3_931x_ip6_chunk(&mask, k);
+		row[0] = BIT(31) | (ROUTE_TYPE_IP6UC << 28) | ((c >> 20) & 0x0fffffff);
+		row[1] = ((c & 0xfffff) << 12) | BIT(10) | (0x3 << 8) | ((m >> 40) & 0xff);
+		row[2] = m >> 8;
+		row[3] = m << 24;
+		row[4] = 0;
+		row[5] = 0;
+		otto_table_write(RTL9310_TBL_L3_PREFIX_ROUTE_IPUC,
+				 otto_l3_931x_row_addr(idx + k), &row);
+	}
+}
+
 static int otto_l3_931x_route_read(struct otto_l3_ctrl *ctrl, int idx, struct otto_l3_route *rt)
 {
 	u32 data[6];
@@ -4932,11 +5012,24 @@ static int otto_l3_931x_route_read(struct otto_l3_ctrl *ctrl, int idx, struct ot
 		return 0;
 
 	rt->attr.type = (data[0] >> 28) & 0x3;
-	if (rt->attr.type != ROUTE_TYPE_IP4UC)
+	switch (rt->attr.type) {
+	case ROUTE_TYPE_IP4UC:
+		rt->dst_ip = ((data[0] & 0xfffff) << 12) | (data[1] >> 20);
+		rt->prefix_len = inet_mask_len(data[2]);
+		break;
+	case ROUTE_TYPE_IP6UC:
+		if (idx % 3) {
+			rt->attr.valid = false;
+			return 0;
+		}
+		err = otto_l3_931x_route_read6(idx, data, rt);
+		if (err)
+			return err;
+		break;
+	default:
 		return 0;
+	}
 
-	rt->dst_ip = ((data[0] & 0xfffff) << 12) | (data[1] >> 20);
-	rt->prefix_len = inet_mask_len(data[2]);
 	rt->attr.dst_null = !!(data[3] & BIT(20));
 	rt->attr.action = (data[3] >> 17) & 0x7;
 	rt->nh.id = (data[3] >> 3) & 0x1fff;
@@ -4981,14 +5074,29 @@ static void otto_l3_931x_route_encode(u32 data[6], u32 ip, int prefix_len)
 static int otto_l3_931x_route_write(struct otto_l3_ctrl *ctrl, int idx, struct otto_l3_route *rt)
 {
 	u32 data[6] = {};
+	int err;
 
-	if (rt->attr.type != ROUTE_TYPE_IP4UC) {
+	if (rt->attr.type != ROUTE_TYPE_IP4UC && rt->attr.type != ROUTE_TYPE_IP6UC) {
 		dev_warn(ctrl->dev, "route type not supported\n");
 		return -EOPNOTSUPP;
 	}
 
+	/* The first row decides whether the entry matches */
+	if (!rt->attr.valid && rt->attr.type == ROUTE_TYPE_IP6UC) {
+		for (int k = 0; k < 3; k++) {
+			err = otto_table_write(RTL9310_TBL_L3_PREFIX_ROUTE_IPUC,
+					       otto_l3_931x_row_addr(idx + k), &data);
+			if (err)
+				return err;
+		}
+		return 0;
+	}
+
 	if (rt->attr.valid) {
-		otto_l3_931x_route_encode(data, rt->dst_ip, rt->prefix_len);
+		if (rt->attr.type == ROUTE_TYPE_IP6UC)
+			otto_l3_931x_route_write6(rt, idx, data);
+		else
+			otto_l3_931x_route_encode(data, rt->dst_ip, rt->prefix_len);
 		data[3] |= rt->attr.dst_null ? BIT(20) : 0;
 		data[3] |= (rt->attr.action & 0x7) << 17;
 		data[3] |= (rt->nh.id & 0x1fff) << 3;
@@ -5007,14 +5115,23 @@ static int otto_l3_931x_route_lookup_hw(struct otto_l3_ctrl *ctrl, struct otto_l
 	u32 v;
 	int row;
 
-	if (rt->attr.type != ROUTE_TYPE_IP4UC)
+	if (rt->attr.type != ROUTE_TYPE_IP4UC && rt->attr.type != ROUTE_TYPE_IP6UC)
 		return -1;
 
 	sw_w32_mask(GENMASK(24, 0), rt->attr.type << 22, RTL931X_L3_HW_LU_KEY_CTRL);
-	sw_w32(0, RTL931X_L3_HW_LU_KEY_DIP_CTRL);
-	sw_w32(0, RTL931X_L3_HW_LU_KEY_DIP_CTRL + 4);
-	sw_w32(0, RTL931X_L3_HW_LU_KEY_DIP_CTRL + 8);
-	sw_w32(rt->dst_ip & inet_make_mask(rt->prefix_len), RTL931X_L3_HW_LU_KEY_DIP_CTRL + 12);
+	if (rt->attr.type == ROUTE_TYPE_IP6UC) {
+		struct in6_addr key;
+
+		ipv6_addr_prefix(&key, &rt->dst_ip6, rt->prefix_len);
+		for (int i = 0; i < 4; i++)
+			sw_w32(be32_to_cpu(key.s6_addr32[i]), RTL931X_L3_HW_LU_KEY_DIP_CTRL + i * 4);
+	} else {
+		sw_w32(0, RTL931X_L3_HW_LU_KEY_DIP_CTRL);
+		sw_w32(0, RTL931X_L3_HW_LU_KEY_DIP_CTRL + 4);
+		sw_w32(0, RTL931X_L3_HW_LU_KEY_DIP_CTRL + 8);
+		sw_w32(rt->dst_ip & inet_make_mask(rt->prefix_len),
+		       RTL931X_L3_HW_LU_KEY_DIP_CTRL + 12);
+	}
 
 	sw_w32_mask(BIT(15), BIT(15), RTL931X_L3_HW_LU_CTRL);
 	if (readx_poll_timeout(sw_r32, RTL931X_L3_HW_LU_CTRL, v, !(v & BIT(15)),
@@ -5027,6 +5144,18 @@ static int otto_l3_931x_route_lookup_hw(struct otto_l3_ctrl *ctrl, struct otto_l
 	row = otto_l3_931x_addr_row(v & 0x3fff);
 
 	return row < OTTO_L3_931X_CATCH_ALL6_ROW ? row : -1;
+}
+
+#define OTTO_L3_931X_FIRST_V6_ROW	(OTTO_L3_931X_CATCH_ALL6_ROW - 3)
+
+static int otto_l3_931x_v6_slot_to_row(struct otto_l3_ctrl *ctrl, int slot)
+{
+	return OTTO_L3_931X_FIRST_V6_ROW - (slot / 2) * 6 - (slot % 2) * V6_PREFIX_ROWS;
+}
+
+static int otto_l3_931x_v6_row_to_slot(struct otto_l3_ctrl *ctrl, int row)
+{
+	return 2 * (OTTO_L3_931X_FIRST_V6_ROW / 6 - row / 6) + (row % 6 ? 0 : 1);
 }
 
 /* Returns -EAGAIN when no row was written and the table is as it was, and -EIO
@@ -5178,6 +5307,7 @@ const struct otto_l3_config otto_l3_930x_cfg = {
 
 const struct otto_l3_config otto_l3_931x_cfg = {
 	.use_l3_tables = true,
+	.v6_move_rows = 3,
 	.max_routes = 4096,
 	.max_host_routes = 4096,
 	.find_slot = otto_l3_931x_find_slot,
@@ -5190,6 +5320,8 @@ const struct otto_l3_config otto_l3_931x_cfg = {
 	.set_nexthop = otto_l3_931x_set_nexthop,
 	.route_lookup_hw = otto_l3_931x_route_lookup_hw,
 	.route_rows_move = otto_l3_931x_route_rows_move,
+	.v6_slot_to_row = otto_l3_931x_v6_slot_to_row,
+	.v6_row_to_slot = otto_l3_931x_v6_row_to_slot,
 	.route_matches = otto_l3_931x_route_matches,
 	.route_write = otto_l3_931x_route_write,
 	.setup = otto_l3_931x_setup,
