@@ -117,6 +117,8 @@ struct otto_l3_config {
 	 */
 	bool use_l3_tables;
 	bool l2_names_dmac;
+	/* The IPv6 rows are placed in the RTL930x prefix table geometry */
+	bool ip6_routes;
 	/* Every route id names a next hop, so both pools share the next hop table */
 	int max_routes;
 	int max_host_routes;
