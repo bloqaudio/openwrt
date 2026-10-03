@@ -1265,7 +1265,10 @@ static int otto_l3_nexthop_update(struct otto_l3_ctrl *ctrl, u8 type, int ifinde
 	return 0;
 }
 
-static int otto_l3_port_ipv4_resolve(struct otto_l3_ctrl *ctrl,
+/* Every route through a gateway that is already resolved is in hardware, so
+ * only the new one is programmed.
+ */
+static int otto_l3_port_ipv4_resolve(struct otto_l3_ctrl *ctrl, struct otto_l3_route *r,
 				     struct net_device *dev, __be32 ip_addr)
 {
 	struct neighbour *n = neigh_lookup(&arp_tbl, &ip_addr, dev);
@@ -1283,12 +1286,11 @@ static int otto_l3_port_ipv4_resolve(struct otto_l3_ctrl *ctrl,
 	 * resolve the neigh.
 	 */
 	if (n->nud_state & NUD_VALID) {
-		struct in6_addr gw;
-
+		read_lock_bh(&n->lock);
 		mac = ether_addr_to_u64(n->ha);
+		read_unlock_bh(&n->lock);
 		dev_info(ctrl->dev, "resolved mac: %016llx\n", mac);
-		ipv6_addr_set_v4mapped(ip_addr, &gw);
-		otto_l3_nexthop_update(ctrl, ROUTE_TYPE_IP4UC, dev->ifindex, &gw, mac, true);
+		otto_l3_route_update_hw(ctrl, r, mac);
 	} else {
 		dev_info(ctrl->dev, "need to wait\n");
 		neigh_event_send(n, NULL);
@@ -1762,7 +1764,7 @@ static int otto_l3_fib_add_v4(struct otto_l3_ctrl *ctrl, struct fib_entry_notifi
 
 	/* We need to resolve the mac address of the GW */
 	if (nh->fib_nh_gw4)
-		otto_l3_port_ipv4_resolve(ctrl, ndev, nh->fib_nh_gw4);
+		otto_l3_port_ipv4_resolve(ctrl, route, ndev, nh->fib_nh_gw4);
 
 	return 0;
 
