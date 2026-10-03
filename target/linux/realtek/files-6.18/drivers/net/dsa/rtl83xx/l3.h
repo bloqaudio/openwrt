@@ -114,8 +114,13 @@ struct otto_l3_config {
 	 * need a PIE rule to match the destination and point at the next hop.
 	 */
 	bool use_l3_tables;
-	/* The IPv6 rows are placed in the RTL930x prefix table geometry */
 	bool ip6_routes;
+	/* IPv6 rows start at row 0 or 3 of each group and run downwards from
+	 * the first; a move of one entry copies that many rows
+	 */
+	int v6_first_row;
+	int v6_group_rows;
+	int v6_move_rows;
 	/* Every route id names a next hop, so both pools share the next hop table */
 	int max_routes;
 	int max_host_routes;
@@ -150,6 +155,9 @@ struct otto_l3_ctrl {
 	struct list_head routes_list;
 	int max_routes;
 	int max_host_routes;
+	int v6_first_row;
+	int v6_group_rows;
+	int v6_move_rows;
 	unsigned long *route_use_bm;
 	unsigned long *host_route_use_bm;
 	struct otto_l3_intf interfaces[MAX_SMACS];
