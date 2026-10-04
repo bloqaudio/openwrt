@@ -55,7 +55,7 @@ enum rtldsa_flood_type {
 #define RTL931X_MC_PMASK_ALL_PORTS (GENMASK_ULL(RTL931X_CPU_PORT, 0))
 #define MC_PMASK_ALL_PORTS_IDX	((MAX_MC_PMASKS - 1))
 
-#define RTLDSA_L2_L3_REFCOUNT_MAX	0x7f
+#define RTLDSA_L2_L3_REFCOUNT_MAX	0x7fff
 
 u64 rtl838x_l2_hash_seed(u64 mac, u32 vid);
 u32 rtl838x_l2_hash_key(struct rtl838x_switch_priv *priv, u64 seed);
