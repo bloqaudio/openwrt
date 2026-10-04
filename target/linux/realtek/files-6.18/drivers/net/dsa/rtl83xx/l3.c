@@ -1410,6 +1410,7 @@ static void otto_l3_route_update_hw(struct otto_l3_ctrl *ctrl, struct otto_l3_ro
 
 		dev_dbg(ctrl->dev, "Got slot for route: %d\n", slot);
 		ctrl->cfg->host_route_write(ctrl, slot, r);
+		r->slot = slot;
 	} else {
 		if (r->row < 0)
 			r->row = otto_l3_route_place(ctrl, r);
@@ -3111,6 +3112,55 @@ out_free:
 	otto_l3_route_free(ctrl, r);
 }
 
+static void otto_l3_neigh_used(struct otto_l3_route *r)
+{
+	struct neighbour *n = NULL;
+	struct net_device *dev;
+
+	dev = dev_get_by_index(&init_net, r->gw_ifindex);
+	if (!dev)
+		return;
+
+	if (r->attr.type == ROUTE_TYPE_IP4UC)
+		n = neigh_lookup(&arp_tbl, &r->gw_ip.s6_addr32[3], dev);
+	else if (IS_REACHABLE(CONFIG_IPV6))
+		n = neigh_lookup(&nd_tbl, &r->gw_ip, dev);
+
+	if (n) {
+		neigh_event_send(n, NULL);
+		neigh_release(n);
+	}
+
+	dev_put(dev);
+}
+
+static void otto_l3_activity_work_do(struct work_struct *work)
+{
+	struct otto_l3_ctrl *ctrl = container_of(to_delayed_work(work), struct otto_l3_ctrl,
+						 activity_work);
+	struct otto_l3_route *r;
+
+	list_for_each_entry(r, &ctrl->routes_list, list) {
+		if (!r->gw_ifindex)
+			continue;
+
+		if (r->neigh) {
+			if (!r->hw_forward || !ctrl->cfg->host_route_hit_clear ||
+			    !ctrl->cfg->host_route_hit_clear(ctrl, r->slot))
+				continue;
+		} else if (ipv6_addr_any(&r->gw_ip) ||
+			   (r->attr.type == ROUTE_TYPE_IP4UC && !r->gw_ip.s6_addr32[3])) {
+			continue;
+		}
+
+		otto_l3_neigh_used(r);
+	}
+
+	/* A longer interval lets a neighbour in use go stale between passes */
+	queue_delayed_work(ctrl->priv->wq, &ctrl->activity_work,
+			   max_t(unsigned long, NEIGH_VAR(&arp_tbl.parms, DELAY_PROBE_TIME), HZ));
+}
+
 static void otto_l3_net_event_work_do(struct work_struct *work)
 {
 	struct otto_l3_net_event_work *net_work =
@@ -3959,6 +4009,21 @@ static void otto_l3_931x_host_route_write(struct otto_l3_ctrl *ctrl, int idx,
 	otto_table_write(RTL9310_TBL_L3_HOST_ROUTE_IPUC, otto_l3_931x_row_addr(idx), &data);
 }
 
+static bool otto_l3_931x_host_route_hit_clear(struct otto_l3_ctrl *ctrl, int idx)
+{
+	int addr = otto_l3_931x_row_addr(idx);
+	u32 data[4];
+
+	otto_table_read(RTL9310_TBL_L3_HOST_ROUTE_IPUC, addr, &data);
+	if (!(data[0] & BIT(31)) || !(data[3] & BIT(15)))
+		return false;
+
+	data[3] &= ~BIT(15);
+	otto_table_write(RTL9310_TBL_L3_HOST_ROUTE_IPUC, addr, &data);
+
+	return true;
+}
+
 static int otto_l3_931x_find_slot(struct otto_l3_ctrl *ctrl, struct otto_l3_route *rt,
 				  bool must_exist)
 {
@@ -4329,6 +4394,7 @@ const struct otto_l3_config otto_l3_931x_cfg = {
 	.set_egress_mac = otto_l3_931x_set_egress_mac,
 	.set_egress_intf = otto_l3_931x_set_egress_intf,
 	.host_route_write = otto_l3_931x_host_route_write,
+	.host_route_hit_clear = otto_l3_931x_host_route_hit_clear,
 	.get_router_mac = otto_l3_931x_get_router_mac,
 	.set_router_mac = otto_l3_931x_set_router_mac,
 	.set_nexthop = otto_l3_931x_set_nexthop,
@@ -4354,6 +4420,8 @@ void otto_l3_remove(struct rtl838x_switch_priv *priv)
 
 	/* A replay would register the FIB notifier again */
 	disable_delayed_work_sync(&ctrl->resync_work);
+
+	cancel_delayed_work_sync(&ctrl->activity_work);
 
 	if (ctrl->ne_nb.notifier_call) {
 		unregister_netevent_notifier(&ctrl->ne_nb);
@@ -4503,6 +4571,7 @@ int otto_l3_probe(struct device *dev, struct rtl838x_switch_priv *priv)
 	}
 
 	INIT_LIST_HEAD(&ctrl->routes_list);
+	INIT_DELAYED_WORK(&ctrl->activity_work, otto_l3_activity_work_do);
 
 	/* Before the notifiers, so no destination is dropped in the window
 	 * where the tables are live and the routes have not arrived yet.
@@ -4546,6 +4615,9 @@ int otto_l3_probe(struct device *dev, struct rtl838x_switch_priv *priv)
 
 	if (ctrl->cfg->dbgfs_init)
 		ctrl->cfg->dbgfs_init(ctrl);
+
+	if (ctrl->cfg->use_l3_tables)
+		queue_delayed_work(priv->wq, &ctrl->activity_work, HZ);
 
 	return 0;
 }
