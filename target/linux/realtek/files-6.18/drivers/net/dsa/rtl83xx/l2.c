@@ -161,9 +161,6 @@ int otto_l2_find_cam_entry(struct otto_dsa_priv *priv, u64 seed,
 	return idx;
 }
 
-/* RTL931x hashes its second block into rows the fib_entries count does not
- * reach, so an index can fall outside the map and is simply not tracked.
- */
 struct rtldsa_l2_uc *otto_l2_uc_lookup(struct otto_dsa_priv *priv, int idx)
 {
 	if (idx < 0 || idx >= priv->r->fib_entries)
