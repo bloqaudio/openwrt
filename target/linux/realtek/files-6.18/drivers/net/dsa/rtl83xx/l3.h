@@ -86,6 +86,7 @@ struct otto_l3_route {
 	bool is_host_route;
 	int id;				/* ID number of this route */
 	int row;			/* Row it occupies in the prefix route table */
+	int slot;			/* Host table slot, valid while hw_forward */
 	unsigned int members;		/* FIB entries a trap row stands for */
 	struct rhlist_head linkage;
 	struct list_head list;		/* all routes, for lookups by destination */

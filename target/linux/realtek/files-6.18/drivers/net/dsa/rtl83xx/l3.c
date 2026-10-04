@@ -1317,6 +1317,7 @@ static void otto_l3_route_update_hw(struct otto_l3_ctrl *ctrl, struct otto_l3_ro
 
 		dev_dbg(ctrl->dev, "Got slot for route: %d\n", slot);
 		ctrl->cfg->host_route_write(ctrl, slot, r);
+		r->slot = slot;
 	} else {
 		if (r->row < 0)
 			r->row = otto_l3_route_place(ctrl, r);
@@ -2693,18 +2694,14 @@ static void otto_l3_activity_work_do(struct work_struct *work)
 	struct otto_l3_ctrl *ctrl = container_of(to_delayed_work(work), struct otto_l3_ctrl,
 						 activity_work);
 	struct otto_l3_route *r;
-	int slot;
 
 	list_for_each_entry(r, &ctrl->routes_list, list) {
 		if (!r->gw_ifindex)
 			continue;
 
 		if (r->neigh) {
-			if (!r->hw_forward || !ctrl->cfg->host_route_hit_clear)
-				continue;
-
-			slot = ctrl->cfg->find_slot(ctrl, r, true);
-			if (slot < 0 || !ctrl->cfg->host_route_hit_clear(ctrl, slot))
+			if (!r->hw_forward || !ctrl->cfg->host_route_hit_clear ||
+			    !ctrl->cfg->host_route_hit_clear(ctrl, r->slot))
 				continue;
 		} else if (ipv6_addr_any(&r->gw_ip) ||
 			   (r->attr.type == ROUTE_TYPE_IP4UC && !r->gw_ip.s6_addr32[3])) {
