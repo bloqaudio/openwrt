@@ -91,6 +91,7 @@ struct otto_l3_route {
 	bool replaced;			/* torn down for a route to the same destination */
 	int id;				/* ID number of this route */
 	int row;			/* Row it occupies in the prefix route table */
+	int slot;			/* Host table slot, valid while hw_forward */
 	unsigned int members;		/* FIB entries a trap row stands for */
 	struct list_head srcs;		/* source-specific routes a trap row stands for */
 	bool srcs_incomplete;		/* a source could not be tracked */
@@ -131,6 +132,7 @@ struct otto_l3_config {
 	u64 (*get_egress_mac)(struct otto_l3_ctrl *ctrl, u32 idx);
 	void (*set_egress_mac)(struct otto_l3_ctrl *ctrl, u32 idx, u64 mac);
 	void (*host_route_write)(struct otto_l3_ctrl *ctrl, int idx, struct otto_l3_route *rt);
+	bool (*host_route_hit_clear)(struct otto_l3_ctrl *ctrl, int idx);
 	void (*get_router_mac)(struct otto_l3_ctrl *ctrl, u32 idx, struct otto_l3_router_mac *m);
 	void (*set_router_mac)(struct otto_l3_ctrl *ctrl, u32 idx, struct otto_l3_router_mac *m);
 	void (*get_nexthop)(struct otto_l3_ctrl *ctrl, int idx, u16 *dmac_id, u16 *interface);
@@ -152,6 +154,7 @@ struct otto_l3_ctrl {
 	struct delayed_work resync_work;
 	unsigned int resync_delay;
 	bool resync_wanted;
+	struct delayed_work activity_work;
 	struct rhltable routes;
 	struct list_head routes_list;
 	int max_routes;
