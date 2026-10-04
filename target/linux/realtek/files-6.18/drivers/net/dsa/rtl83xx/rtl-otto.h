@@ -668,9 +668,6 @@ void rtldsa_93xx_prepare_lag_fdb(struct rtl838x_l2_entry *e, int lag_group);
 int rtldsa_find_l2_hash_entry(struct rtl838x_switch_priv *priv, u64 seed,
 			      bool must_exist, struct rtl838x_l2_entry *e);
 
-/* RTL931x hashes its second block into rows the fib_entries count does not
- * reach, so an index can fall outside the map and is simply not tracked.
- */
 static inline struct rtldsa_l2_uc *rtldsa_l2_uc_lookup(struct rtl838x_switch_priv *priv,
 						      int idx)
 {
