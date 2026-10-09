@@ -1622,7 +1622,7 @@ out:
 
 static void otto_l3_dmac_put(struct otto_l3_ctrl *ctrl, int idx)
 {
-	if (!ctrl->cfg->set_egress_mac || idx < 0)
+	if (!ctrl->cfg->l2_names_dmac || idx < 0)
 		return;
 
 	mutex_lock(ctrl->lock);
@@ -1640,7 +1640,7 @@ static void otto_l3_route_update_hw(struct otto_l3_ctrl *ctrl, struct otto_l3_ro
 	int old_dmac = r->nh.dmac_id;
 	bool first = !r->nh.mac;
 	bool no_port, trap;
-	int dmac = r->id;
+	int dmac = ctrl->cfg->use_l3_tables ? 0 : r->id;
 
 	if (otto_l3_row_frozen(ctrl, r))
 		return;
@@ -1664,7 +1664,7 @@ static void otto_l3_route_update_hw(struct otto_l3_ctrl *ctrl, struct otto_l3_ro
 		otto_l3_route_rewrite(ctrl, r);
 	}
 
-	if (ctrl->cfg->set_egress_mac) {
+	if (ctrl->cfg->l2_names_dmac) {
 		dmac = otto_l3_dmac_get(ctrl, mac);
 		if (dmac < 0) {
 			dev_err(ctrl->dev, "no DMAC entry for %016llx: %d\n", mac, dmac);
@@ -4002,6 +4002,7 @@ const struct otto_l3_config otto_l3_839x_cfg = {
 
 const struct otto_l3_config otto_l3_930x_cfg = {
 	.use_l3_tables = true,
+	.l2_names_dmac = true,
 	.find_slot = otto_l3_930x_find_slot,
 	.get_egress_intf = otto_l3_930x_get_egress_intf,
 	.get_egress_mac = otto_l3_930x_get_egress_mac,
@@ -4168,7 +4169,7 @@ int otto_l3_probe(struct device *dev, struct rtl838x_switch_priv *priv)
 		return dev_err_probe(dev, -EINVAL, "No compatible configuration found\n");
 	ctrl->cfg = match->data;
 
-	if (ctrl->cfg->set_egress_mac) {
+	if (ctrl->cfg->l2_names_dmac) {
 		ctrl->dmacs = devm_kcalloc(dev, MAX_DMACS, sizeof(*ctrl->dmacs), GFP_KERNEL);
 		ctrl->dmac_refs = devm_kcalloc(dev, MAX_DMACS, sizeof(*ctrl->dmac_refs),
 					       GFP_KERNEL);

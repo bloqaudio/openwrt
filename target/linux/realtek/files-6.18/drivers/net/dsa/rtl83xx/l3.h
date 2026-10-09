@@ -110,6 +110,7 @@ struct otto_l3_config {
 	 * need a PIE rule to match the destination and point at the next hop.
 	 */
 	bool use_l3_tables;
+	bool l2_names_dmac;
 	int (*find_slot)(struct otto_l3_ctrl *ctrl, struct otto_l3_route *rt, bool must_exist);
 	void (*get_egress_intf)(struct otto_l3_ctrl *ctrl, int idx, struct otto_l3_intf *intf);
 	void (*set_egress_intf)(struct otto_l3_ctrl *ctrl, int idx, struct otto_l3_intf *intf);
