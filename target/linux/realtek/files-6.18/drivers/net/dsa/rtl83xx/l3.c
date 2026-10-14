@@ -1530,7 +1530,7 @@ static int otto_l3_route_place(struct otto_l3_ctrl *ctrl, struct otto_l3_route *
 		 */
 		for (int s = rows - 1; s >= rows - below; s--) {
 			err = ctrl->cfg->route_rows_move(ctrl, otto_l3_v6_row(ctrl, s + 1),
-							 otto_l3_v6_row(ctrl, s), V6_MOVE_ROWS);
+							 otto_l3_v6_row(ctrl, s), ctrl->v6_move_rows);
 			if (err) {
 				if (err == -EIO || s < rows - 1)
 					otto_l3_rows_stale(ctrl, r, otto_l3_v6_row(ctrl, s));
@@ -1604,7 +1604,7 @@ static void otto_l3_route_compact(struct otto_l3_ctrl *ctrl, struct otto_l3_rout
 
 		for (int s = slot + 1; s < rows; s++)
 			if (ctrl->cfg->route_rows_move(ctrl, otto_l3_v6_row(ctrl, s - 1),
-						       otto_l3_v6_row(ctrl, s), V6_MOVE_ROWS)) {
+						       otto_l3_v6_row(ctrl, s), ctrl->v6_move_rows)) {
 				otto_l3_rows_stale(ctrl, r, otto_l3_v6_row(ctrl, s));
 				return;
 			}
@@ -5350,6 +5350,7 @@ int otto_l3_probe(struct device *dev, struct otto_dsa_priv *priv)
 
 	ctrl->max_routes = ctrl->cfg->max_routes ?: MAX_ROUTES;
 	ctrl->max_host_routes = ctrl->cfg->max_host_routes ?: MAX_HOST_ROUTES;
+	ctrl->v6_move_rows = ctrl->cfg->v6_move_rows ?: V6_MOVE_ROWS;
 	ctrl->route_use_bm = devm_bitmap_zalloc(dev, ctrl->max_routes, GFP_KERNEL);
 	ctrl->host_route_use_bm = devm_bitmap_zalloc(dev, ctrl->max_host_routes, GFP_KERNEL);
 	if (!ctrl->route_use_bm || !ctrl->host_route_use_bm)
