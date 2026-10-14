@@ -138,6 +138,7 @@ struct otto_l3_config {
 	/* Every route id names a next hop, so both pools share the next hop table */
 	int max_routes;
 	int max_host_routes;
+	int v6_move_rows;
 	int (*find_slot)(struct otto_l3_ctrl *ctrl, struct otto_l3_route *rt, bool must_exist);
 	void (*get_egress_intf)(struct otto_l3_ctrl *ctrl, int idx, struct otto_l3_intf *intf);
 	void (*set_egress_intf)(struct otto_l3_ctrl *ctrl, int idx, struct otto_l3_intf *intf);
@@ -186,6 +187,7 @@ struct otto_l3_ctrl {
 	struct list_head rmac_devs;	/* devices router MACs follow */
 	int max_routes;
 	int max_host_routes;
+	int v6_move_rows;
 	unsigned long *route_use_bm;
 	unsigned long *host_route_use_bm;
 	struct otto_l3_intf interfaces[MAX_SMACS];
