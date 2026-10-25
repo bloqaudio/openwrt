@@ -22,6 +22,7 @@
 #define RTPCS_RXCAL_POLL_MS			500
 #define RTPCS_RXCAL_MAX_TRIES			3
 #define RTPCS_RXCAL_RETRY_MS			1000
+#define RTPCS_RXCAL_STABLE_MS			250
 #define RTPCS_RXCAL_XSG_MAX_ERR_DELTA		100
 #define RTPCS_RXCAL_XSG_ERR_SATURATION		0xffff00
 #define RTPCS_RXMON_POLL_MS			500
@@ -206,6 +207,10 @@ enum rtpcs_page {
 
 #define TGR_STD_1_REG00			0x00
 #define  RTL93XX_10GBASE_R_T_RX_LINK	BIT(12)
+
+#define TGR_STD_1_REG01			0x01
+#define  RTL93XX_10GBASE_R_BLOCK_LOCK	BIT(15)
+#define  RTL93XX_10GBASE_R_HI_BER	BIT(14)
 
 /* PAGE_TGR_PRO_0 */
 
@@ -1605,6 +1610,28 @@ static int rtpcs_93xx_sds_10gr_link_status(struct rtpcs_serdes *sds)
 		return link;
 
 	return (link & RTL93XX_10GBASE_R_T_RX_LINK) == RTL93XX_10GBASE_R_T_RX_LINK;
+}
+
+static int rtpcs_93xx_sds_10gr_link_stable(struct rtpcs_serdes *sds)
+{
+	int link, sts;
+
+	link = rtpcs_93xx_sds_10gr_link_status(sds);
+	if (link <= 0)
+		return link;
+
+	/* The first read returns the state latched before the link came up. */
+	sts = rtpcs_sds_read(sds, PAGE_TGR_STD_1, TGR_STD_1_REG01);
+	if (sts < 0)
+		return sts;
+
+	msleep(RTPCS_RXCAL_STABLE_MS);
+
+	sts = rtpcs_sds_read(sds, PAGE_TGR_STD_1, TGR_STD_1_REG01);
+	if (sts < 0)
+		return sts;
+
+	return (sts & RTL93XX_10GBASE_R_BLOCK_LOCK) && !(sts & RTL93XX_10GBASE_R_HI_BER);
 }
 
 static int rtpcs_93xx_sds_set_autoneg(struct rtpcs_serdes *sds, unsigned int neg_mode,
@@ -3177,6 +3204,13 @@ static void rtpcs_930x_rx_cali_work_handler(struct work_struct *work)
 		goto unlock;
 	}
 
+	if (sds->hw_mode == RTPCS_SDS_MODE_10GBASER &&
+	    rtpcs_93xx_sds_10gr_link_stable(sds) > 0) {
+		dev_dbg(sds->ctrl->dev, "SerDes %u: RX link stable, calibration skipped\n",
+			sds->id);
+		goto terminate;
+	}
+
 	attempt_start = jiffies;
 	sds->rxcal_tries++;
 	dev_dbg(sds->ctrl->dev, "SerDes %u: RX calibration attempt %u/%u\n",
@@ -4399,6 +4433,13 @@ static void rtpcs_931x_rx_cali_work_handler(struct work_struct *work)
 		goto unlock;
 	}
 
+	if (sds->hw_mode == RTPCS_SDS_MODE_10GBASER &&
+	    rtpcs_93xx_sds_10gr_link_stable(sds) > 0) {
+		dev_dbg(sds->ctrl->dev, "SerDes %u: RX link stable, calibration skipped\n",
+			sds->id);
+		goto done;
+	}
+
 	sds->rxcal_tries++;
 	if (sds->hw_mode != RTPCS_SDS_MODE_XSGMII)
 		rtpcs_931x_sds_reset_leq_dfe(sds);
@@ -4438,6 +4479,7 @@ static void rtpcs_931x_rx_cali_work_handler(struct work_struct *work)
 		dev_warn(sds->ctrl->dev, "SerDes %u: RX calibration did not pass after %u attempts: %d\n",
 			 sds->id, sds->rxcal_tries, ret);
 	}
+done:
 	sds->rxcal_pending = false;
 	if (sds->hw_mode == RTPCS_SDS_MODE_10GBASER) {
 		sds->rxmon_down = 0;
