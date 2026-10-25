@@ -578,6 +578,8 @@ struct rtpcs_serdes {
 	struct delayed_work cali_work;
 	bool rxcal_pending;
 	u8 rxcal_tries;
+	/* Odd while an RX calibration attempt runs. */
+	u32 rxcal_seq;
 	struct delayed_work linkmon_work;
 	bool rxmon_active;
 	u8 rxmon_down;
@@ -1632,6 +1634,20 @@ static int rtpcs_93xx_sds_10gr_link_stable(struct rtpcs_serdes *sds)
 		return sts;
 
 	return (sts & RTL93XX_10GBASE_R_BLOCK_LOCK) && !(sts & RTL93XX_10GBASE_R_HI_BER);
+}
+
+static void rtpcs_93xx_sds_rxcal_begin(struct rtpcs_serdes *sds)
+{
+	WRITE_ONCE(sds->rxcal_seq, sds->rxcal_seq + 1);
+}
+
+static void rtpcs_93xx_sds_rxcal_end(struct rtpcs_serdes *sds)
+{
+	WRITE_ONCE(sds->rxcal_seq, sds->rxcal_seq + 1);
+
+	for (int i = 0; i < RTPCS_MAX_LINKS_PER_SDS; i++)
+		if (sds->link[i])
+			phylink_pcs_change(&sds->link[i]->pcs, true);
 }
 
 static int rtpcs_93xx_sds_set_autoneg(struct rtpcs_serdes *sds, unsigned int neg_mode,
@@ -3215,6 +3231,7 @@ static void rtpcs_930x_rx_cali_work_handler(struct work_struct *work)
 	sds->rxcal_tries++;
 	dev_dbg(sds->ctrl->dev, "SerDes %u: RX calibration attempt %u/%u\n",
 		sds->id, sds->rxcal_tries, RTPCS_RXCAL_MAX_TRIES);
+	rtpcs_93xx_sds_rxcal_begin(sds);
 	rtpcs_930x_sds_rxcal_init(sds, sds->hw_mode);
 	rtpcs_930x_sds_rxcal_fgcal(sds);
 	rtpcs_930x_sds_rxcal_vth_tap0_adapt_lock(sds);
@@ -3231,6 +3248,7 @@ static void rtpcs_930x_rx_cali_work_handler(struct work_struct *work)
 		if (latch_sts < 0) {
 			dev_err(sds->ctrl->dev, "SerDes %u: RX latch read failed: %d\n",
 				sds->id, latch_sts);
+			rtpcs_93xx_sds_rxcal_end(sds);
 			goto terminate;
 		}
 		if (!latch_sts) {
@@ -3244,6 +3262,7 @@ static void rtpcs_930x_rx_cali_work_handler(struct work_struct *work)
 
 	msleep(50);
 	calib_failed = rtpcs_930x_sds_check_calibration(sds, sds->hw_mode);
+	rtpcs_93xx_sds_rxcal_end(sds);
 	dev_dbg(sds->ctrl->dev, "SerDes %u: RX calibration attempt %u/%u %s after %u ms\n",
 		sds->id, sds->rxcal_tries, RTPCS_RXCAL_MAX_TRIES,
 		calib_failed ? "failed" : "passed",
@@ -4441,6 +4460,7 @@ static void rtpcs_931x_rx_cali_work_handler(struct work_struct *work)
 	}
 
 	sds->rxcal_tries++;
+	rtpcs_93xx_sds_rxcal_begin(sds);
 	if (sds->hw_mode != RTPCS_SDS_MODE_XSGMII)
 		rtpcs_931x_sds_reset_leq_dfe(sds);
 
@@ -4462,9 +4482,11 @@ static void rtpcs_931x_rx_cali_work_handler(struct work_struct *work)
 
 	default:
 		sds->rxcal_pending = false;
+		rtpcs_93xx_sds_rxcal_end(sds);
 		/* TODO: DAC RX calibration */
 		goto unlock;
 	}
+	rtpcs_93xx_sds_rxcal_end(sds);
 
 	dev_dbg(sds->ctrl->dev, "SerDes %u: RX calibration attempt %u/%u returned %d\n",
 		sds->id, sds->rxcal_tries, RTPCS_RXCAL_MAX_TRIES, ret);
@@ -5072,6 +5094,7 @@ static void rtpcs_pcs_get_state(struct phylink_pcs *pcs, unsigned int neg_mode,
 	struct rtpcs_link *link = rtpcs_phylink_pcs_to_link(pcs);
 	struct rtpcs_ctrl *ctrl = link->ctrl;
 	struct rtpcs_serdes *sds = link->sds;
+	u32 rxcal_seq;
 
 	state->link = 0;
 	/* Forced SGMII parameters are supplied by phylink out of band. */
@@ -5082,7 +5105,20 @@ static void rtpcs_pcs_get_state(struct phylink_pcs *pcs, unsigned int neg_mode,
 		state->pause &= ~(MLO_PAUSE_RX | MLO_PAUSE_TX);
 	}
 
+	/*
+	 * A link change reported during an RX calibration would make phylink
+	 * take the link down again after reading it up.
+	 */
+	rxcal_seq = READ_ONCE(sds->rxcal_seq);
+	if (rxcal_seq & 1)
+		return;
+
 	mutex_lock(&ctrl->lock);
+	if (sds->rxcal_seq != rxcal_seq) {
+		mutex_unlock(&ctrl->lock);
+		return;
+	}
+
 	switch (sds->hw_mode) {
 	case RTPCS_SDS_MODE_SGMII:
 	case RTPCS_SDS_MODE_1000BASEX:
