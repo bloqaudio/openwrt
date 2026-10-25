@@ -23,6 +23,7 @@
 #define RTPCS_RXCAL_POLL_MS			500
 #define RTPCS_RXCAL_MAX_TRIES			3
 #define RTPCS_RXCAL_RETRY_MS			1000
+#define RTPCS_RXCAL_STABLE_MS			250
 #define RTPCS_RXCAL_XSG_MAX_ERR_DELTA		100
 #define RTPCS_RXCAL_XSG_ERR_SATURATION		0xffff00
 #define RTPCS_RXMON_POLL_MS			500
@@ -212,6 +213,10 @@ enum rtpcs_page {
 
 #define TGR_STD_1_REG00			0x00
 #define  RTL93XX_10GBASE_R_T_RX_LINK	BIT(12)
+
+#define TGR_STD_1_REG01			0x01
+#define  RTL93XX_10GBASE_R_BLOCK_LOCK	BIT(15)
+#define  RTL93XX_10GBASE_R_HI_BER	BIT(14)
 
 /* PAGE_TGR_PRO_0 */
 
@@ -1630,6 +1635,28 @@ static int rtpcs_93xx_sds_10gr_link_status(struct rtpcs_serdes *sds, bool *latch
 	return (link & RTL93XX_10GBASE_R_T_RX_LINK) == RTL93XX_10GBASE_R_T_RX_LINK;
 }
 
+static int rtpcs_93xx_sds_10gr_link_stable(struct rtpcs_serdes *sds)
+{
+	int link, sts;
+
+	link = rtpcs_93xx_sds_10gr_link_status(sds, NULL);
+	if (link <= 0)
+		return link;
+
+	/* The first read returns the state latched before the link came up. */
+	sts = rtpcs_sds_read(sds, PAGE_TGR_STD_1, TGR_STD_1_REG01);
+	if (sts < 0)
+		return sts;
+
+	msleep(RTPCS_RXCAL_STABLE_MS);
+
+	sts = rtpcs_sds_read(sds, PAGE_TGR_STD_1, TGR_STD_1_REG01);
+	if (sts < 0)
+		return sts;
+
+	return (sts & RTL93XX_10GBASE_R_BLOCK_LOCK) && !(sts & RTL93XX_10GBASE_R_HI_BER);
+}
+
 /* Caller holds ctrl->lock to serialize mode changes and SerDes access. */
 static int rtpcs_93xx_sds_rx_link_status(struct rtpcs_serdes *sds)
 {
@@ -2101,6 +2128,17 @@ static void rtpcs_93xx_rx_cali_work_handler(struct work_struct *work)
 				    sds->id, ret);
 	if (ret <= 0) {
 		schedule_delayed_work(&sds->cali_work, msecs_to_jiffies(RTPCS_RXCAL_POLL_MS));
+		goto unlock;
+	}
+
+	if (sds->hw_mode == RTPCS_SDS_MODE_10GBASER &&
+	    rtpcs_93xx_sds_10gr_link_stable(sds) > 0) {
+		dev_dbg(sds->ctrl->dev, "SerDes %u: RX link stable, calibration skipped\n",
+			sds->id);
+		rtpcs_93xx_sds_arm_linkmon(sds);
+		for (int i = 0; i < RTPCS_MAX_LINKS_PER_SDS; i++)
+			if (sds->link[i])
+				phylink_pcs_change(&sds->link[i]->pcs, true);
 		goto unlock;
 	}
 
