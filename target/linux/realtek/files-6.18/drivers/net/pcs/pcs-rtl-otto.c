@@ -3331,7 +3331,7 @@ static int rtpcs_930x_sds_rx_calibrate(struct rtpcs_serdes *sds)
 				sds->id, ret);
 			return ret;
 		}
-		if (latch_sts) {
+		if (!latch_sts) {
 			dev_dbg(sds->ctrl->dev, "SerDes %u: RX calibration repeating VTH/TAP0 adaptation\n",
 				sds->id);
 			rtpcs_930x_sds_rxeq_dfe_disable(sds);
