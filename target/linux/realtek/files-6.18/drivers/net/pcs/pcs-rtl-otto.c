@@ -3233,7 +3233,7 @@ static void rtpcs_930x_rx_cali_work_handler(struct work_struct *work)
 				sds->id, latch_sts);
 			goto terminate;
 		}
-		if (latch_sts) {
+		if (!latch_sts) {
 			dev_dbg(sds->ctrl->dev, "SerDes %u: RX calibration repeating VTH/TAP0 adaptation\n",
 				sds->id);
 			rtpcs_930x_sds_rxeq_dfe_disable(sds);
